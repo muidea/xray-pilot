@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.1-rc.1"
+edition = "2024"
+license = "MIT"
+rust-version = "1.89"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4", "serde"] }
+tokio = { version = "1", features = ["full"] }
+fs2 = "0.4"
+tempfile = "3"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_IO", "Win32_Storage_FileSystem", "Win32_Networking_WinInet"] }
+xray-model = { path = "crates/xray-model" }
+xray-config = { path = "crates/xray-config" }
+xray-runtime = { path = "crates/xray-runtime" }
+windows-integration = { path = "crates/windows-integration" }
+xray-supervisor = { path = "crates/xray-supervisor" }
+
+[profile.release]
+lto = "thin"
+strip = true

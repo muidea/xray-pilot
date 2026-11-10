@@ -1,0 +1,9 @@
+/target/
+*.log
+*.exe
+*.pdb
+.DS_Store
+
+.test-core/
+__pycache__/
+/dist/

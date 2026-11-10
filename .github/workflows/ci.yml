@@ -1,0 +1,59 @@
+name: Rust checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Lint
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Regression tests
+        run: cargo test --workspace --locked -- --test-threads=4
+      - name: Download and verify official test Core
+        run: python scripts/fetch-test-core.py --github-env
+      - name: Official Core smoke test (uses a fake system proxy)
+        run: cargo test -p xray-supervisor --test real_core --locked -- --ignored
+      - name: Controlled upstream and file-lock acceptance (fake system proxy)
+        run: cargo test -p xray-supervisor --test acceptance_edges --locked -- --ignored
+      - name: Official Core proxy lease evidence recovery (fake system proxy)
+        run: cargo test -p xray-supervisor --lib official_global_lease_loss_keeps_diagnostics_and_can_be_repaired --locked -- --ignored
+      - name: Windows candidate publication recovery
+        if: runner.os == 'Windows'
+        run: cargo test -p xray-supervisor --lib official_candidate_and_history_publications_recover_on_windows --locked -- --ignored
+      - name: Windows shared restart budget with official Core
+        if: runner.os == 'Windows'
+        run: cargo test -p xray-supervisor --lib official_failed_starts_and_successful_restarts_share_budget_on_windows --locked -- --ignored
+      - name: Release binaries
+        run: cargo build --workspace --release --locked
+      - name: Windows IPC and Job recovery smoke
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/windows-smoke.ps1 -BinaryDir ./target/release -CorePath $env:XRAY_TEST_CORE
+      - name: Windows stalled clients and official Core supervision
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/windows-ipc-audit.ps1 -BinaryDir ./target/release -CorePath $env:XRAY_TEST_CORE
+      - name: Package Windows binaries and user documentation
+        if: runner.os == 'Windows'
+        run: python scripts/package-windows.py --binary-dir target/release
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: xray-pilot-windows-x64
+          path: |
+            dist/xray-pilot-*-windows-x64.zip
+            dist/SHA256SUMS

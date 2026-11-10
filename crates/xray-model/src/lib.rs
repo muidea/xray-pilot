@@ -1,0 +1,281 @@
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::{fmt, path::PathBuf};
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Error {
+    pub code: String,
+    pub message: String,
+}
+impl Error {
+    pub fn new(code: &str, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+impl std::error::Error for Error {}
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        Self::new("IO_ERROR", e.to_string())
+    }
+}
+impl From<serde_json::Error> for Error {
+    fn from(e: serde_json::Error) -> Self {
+        Self::new("CONFIG_PARSE_FAILED", e.to_string())
+    }
+}
+
+pub fn id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+pub fn hash(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+pub fn canonical_hash<T: Serialize>(value: &T) -> Result<String> {
+    fn sorted(value: Value) -> Value {
+        match value {
+            Value::Object(map) => {
+                let ordered: std::collections::BTreeMap<_, _> =
+                    map.into_iter().map(|(k, v)| (k, sorted(v))).collect();
+                Value::Object(ordered.into_iter().collect())
+            }
+            Value::Array(a) => Value::Array(a.into_iter().map(sorted).collect()),
+            other => other,
+        }
+    }
+    Ok(hash(&serde_json::to_vec(&sorted(serde_json::to_value(
+        value,
+    )?))?))
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ProxyMode {
+    #[default]
+    Direct,
+    Global,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProxySnapshot {
+    pub flags: u32,
+    pub server: String,
+    pub bypass: String,
+    pub pac_url: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ResourceFile {
+    pub source: PathBuf,
+    pub relative_path: PathBuf,
+    pub sha256: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Resources {
+    pub id: String,
+    pub root: PathBuf,
+    pub files: Vec<ResourceFile>,
+    pub complete: bool,
+    pub notes: Vec<String>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CoreIdentity {
+    pub path: PathBuf,
+    pub sha256: String,
+    pub version: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Candidate {
+    pub id: String,
+    pub digest: String,
+    pub profile_id: String,
+    pub base_revision: String,
+    pub revision: String,
+    pub config_path: PathBuf,
+    pub core: CoreIdentity,
+    pub resources: Resources,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Generation {
+    pub id: String,
+    pub transaction_id: String,
+    pub request_id: String,
+    pub candidate: Candidate,
+    pub proxy_mode: ProxyMode,
+    pub http_inbound_tag: String,
+    pub running: bool,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Profile {
+    pub id: String,
+    pub json: String,
+    pub revision: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProfileSummary {
+    pub id: String,
+    pub revision: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProfilePage {
+    pub items: Vec<ProfileSummary>,
+    pub next_after: Option<String>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Settings {
+    pub core_path: PathBuf,
+    pub connect_on_start: bool,
+    pub start_on_logon: bool,
+}
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            core_path: PathBuf::new(),
+            connect_on_start: false,
+            start_on_logon: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "operation", content = "payload")]
+pub enum Command {
+    GetStatus,
+    ListProfiles,
+    ListProfileSummaries {
+        after: Option<String>,
+        limit: usize,
+    },
+    GetProfile {
+        profile_id: String,
+    },
+    ListHistory {
+        profile_id: String,
+    },
+    StageHistory {
+        generation_id: String,
+        expected_revision: String,
+    },
+    CreateProfile {
+        profile_id: String,
+        json: String,
+    },
+    DeleteProfile {
+        profile_id: String,
+        expected_revision: String,
+    },
+    ValidateDraft {
+        profile_id: String,
+        expected_revision: String,
+        json: String,
+        core_path: PathBuf,
+        asset_root: PathBuf,
+    },
+    ApplyProfile {
+        candidate_id: String,
+        candidate_digest: String,
+        proxy_mode: ProxyMode,
+        http_inbound_tag: String,
+    },
+    StopCore,
+    RestartCore,
+    SetProxyMode {
+        mode: ProxyMode,
+        http_inbound_tag: String,
+    },
+    SaveSettings {
+        settings: Settings,
+    },
+    GetSettings,
+    GetLogs,
+    GetOperation {
+        request_id: String,
+    },
+    GetOperationDetails {
+        request_id: String,
+        expected_hash: String,
+        offset: usize,
+        limit: usize,
+    },
+    TestRoute {
+        profile_id: String,
+        context: RouteContext,
+    },
+    Shutdown,
+}
+impl Command {
+    pub fn is_write(&self) -> bool {
+        !matches!(
+            self,
+            Self::GetStatus
+                | Self::ListProfiles
+                | Self::ListProfileSummaries { .. }
+                | Self::GetProfile { .. }
+                | Self::ListHistory { .. }
+                | Self::GetSettings
+                | Self::GetLogs
+                | Self::GetOperation { .. }
+                | Self::GetOperationDetails { .. }
+                | Self::TestRoute { .. }
+        )
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Request {
+    pub protocol_version: u32,
+    pub request_id: String,
+    pub expected_generation: Option<String>,
+    pub command: Command,
+}
+impl Request {
+    pub fn new(command: Command, expected_generation: Option<String>) -> Self {
+        Self {
+            protocol_version: 1,
+            request_id: id(),
+            expected_generation,
+            command,
+        }
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Response {
+    pub request_id: String,
+    pub result: Result<Value>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Status {
+    pub generation: Option<Generation>,
+    pub core_state: String,
+    pub proxy_state: String,
+    pub runtime_instance_id: Option<String>,
+    pub supervisor_epoch: String,
+    pub last_error: Option<Error>,
+    pub recovery_required: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RouteContext {
+    pub host: String,
+    pub port: Option<u16>,
+    pub inbound_tag: Option<String>,
+    pub network: Option<String>,
+    pub target_ip: Option<String>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RouteResult {
+    pub kind: String,
+    pub match_state: String,
+    pub rule_index: Option<usize>,
+    pub expected_outbound: Option<String>,
+    pub actual_outbound: String,
+    pub reason: String,
+}
