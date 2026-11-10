@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <title>Xray Pilot</title>
+  <desc>A pale X and mint connection path on a rounded deep teal tile.</desc>
+  <rect x="12" y="12" width="232" height="232" rx="60" fill="#102c2e" stroke="#458f82" stroke-width="6"/>
+  <path d="M76 76 180 180" fill="none" stroke="#edfff8" stroke-width="28" stroke-linecap="round"/>
+  <path d="M76 180 180 76" fill="none" stroke="#61dcba" stroke-width="28" stroke-linecap="round"/>
+  <circle cx="180" cy="76" r="19" fill="#8af2ce"/>
+</svg>

@@ -36,9 +36,6 @@ impl App {
                         .size(21.0)
                         .color(accent(ui)),
                 );
-                if !compact {
-                    ui.label(RichText::new("本机连接管理").small().weak());
-                }
                 ui.add_space(27.0);
                 for (page, title, short) in [
                     (Page::Overview, "总览", "总览"),
@@ -65,9 +62,6 @@ impl App {
                                 .small()
                                 .weak(),
                         );
-                        ui.separator();
-                        ui.label("本机工作空间");
-                        ui.label(RichText::new("配置与日志保存在数据目录").small().weak());
                     }
                 });
             });
@@ -117,58 +111,55 @@ impl App {
                                 ctx,
                             );
                         }
-                        ui.label(
-                            RichText::new(if self.ui.connected {
-                                "后台已连接"
-                            } else {
-                                "后台连接中断"
-                            })
-                            .small()
-                            .color(if self.ui.connected {
-                                accent(ui)
-                            } else {
-                                ui.visuals().warn_fg_color
-                            }),
-                        );
                     });
                 });
             });
-        egui::TopBottomPanel::bottom("feedback")
-            .frame(
-                egui::Frame::new()
-                    .fill(ctx.style().visuals.window_fill())
-                    .inner_margin(egui::Margin::symmetric(20, 10)),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    if self.busy || self.dependency_job.is_some() {
-                        ui.spinner();
-                    }
-                    if self.shutdown_requested {
-                        ui.label(if !self.ui.connected || self.ui.uncertain.is_some() {
-                            "正在确认后台连接与原操作结果，确认后将安全退出。"
+        let has_message = !self.message.trim().is_empty()
+            && !matches!(self.message.as_str(), "后台已连接。" | "正在连接后台…");
+        if has_message || self.busy || self.shutdown_requested || self.dependency_job.is_some() {
+            egui::TopBottomPanel::bottom("feedback")
+                .frame(
+                    egui::Frame::new()
+                        .fill(ctx.style().visuals.window_fill())
+                        .inner_margin(egui::Margin::symmetric(20, 10)),
+                )
+                .show(ctx, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        if self.busy || self.dependency_job.is_some() {
+                            ui.spinner();
+                        }
+                        if self.shutdown_requested {
+                            ui.label(if !self.ui.connected || self.ui.uncertain.is_some() {
+                                "正在确认后台连接与原操作结果，确认后将安全退出。"
+                            } else {
+                                "完成当前操作后，将停止 Core、恢复代理并退出。"
+                            });
+                        } else if self.busy {
+                            ui.label("操作正在执行，仍可浏览页面与日志。");
                         } else {
-                            "完成当前操作后，将停止 Core、恢复代理并退出。"
-                        });
-                    } else if self.busy {
-                        ui.label("操作正在执行，仍可浏览页面与日志。");
-                    } else {
-                        ui.menu_button("完整消息", |ui| {
-                            ui.set_width((ctx.content_rect().width() - 100.0).clamp(280.0, 680.0));
-                            if ui.button("复制完整消息").clicked() {
-                                ui.ctx().copy_text(self.message.clone());
-                            }
-                            egui::ScrollArea::vertical()
-                                .id_salt("feedback-message")
-                                .max_height((ctx.content_rect().height() * 0.4).clamp(100.0, 400.0))
-                                .show(ui, |ui| {
-                                    ui.add(egui::Label::new(&self.message).wrap());
-                                });
-                        });
-                        ui.add(egui::Label::new(RichText::new(&self.message).small()).truncate());
-                    }
+                            ui.menu_button("完整消息", |ui| {
+                                ui.set_width(
+                                    (ctx.content_rect().width() - 100.0).clamp(280.0, 680.0),
+                                );
+                                if ui.button("复制完整消息").clicked() {
+                                    ui.ctx().copy_text(self.message.clone());
+                                }
+                                egui::ScrollArea::vertical()
+                                    .id_salt("feedback-message")
+                                    .max_height(
+                                        (ctx.content_rect().height() * 0.4).clamp(100.0, 400.0),
+                                    )
+                                    .show(ui, |ui| {
+                                        ui.add(egui::Label::new(&self.message).wrap());
+                                    });
+                            });
+                            ui.add(
+                                egui::Label::new(RichText::new(&self.message).small()).truncate(),
+                            );
+                        }
+                    });
                 });
-            });
+        }
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()

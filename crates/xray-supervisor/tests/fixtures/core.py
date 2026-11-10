@@ -10,6 +10,7 @@ if sys.argv[1] == "version":
     sys.exit(0)
 config = json.load(open(sys.argv[sys.argv.index("-config") + 1], encoding="utf-8"))
 if config.get("fixtureReject"):
+    print("sensitive-core-diagnostic-marker", file=sys.stderr)
     sys.exit(23)
 if "-test" in sys.argv:
     sys.exit(0)

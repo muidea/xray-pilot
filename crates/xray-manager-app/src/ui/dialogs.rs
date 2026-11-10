@@ -78,11 +78,59 @@ impl App {
                 Dialog::Create => self.create_dialog_contents(ui),
                 Dialog::Rename(profile) => self.rename_dialog_contents(ui, profile),
                 Dialog::Confirm(action) => self.confirm_dialog_contents(ui, action, ctx),
+                Dialog::UnsavedExit(kind) => self.unsaved_exit_dialog_contents(ui, *kind),
             }
         });
         if response.inner && !response.should_close() {
             self.ui.dialog = Some(dialog);
         }
+    }
+    fn unsaved_exit_dialog_contents(&mut self, ui: &mut egui::Ui, kind: ExitKind) -> bool {
+        ui.heading("草稿未保存，暂未退出");
+        egui::ScrollArea::vertical()
+            .id_salt("unsaved-exit-body")
+            .max_height((ui.ctx().content_rect().height() - 240.0).max(100.0))
+            .show(ui, |ui| {
+                ui.label("部分修改尚未写入磁盘。返回后仍可编辑；导出可在其他可写目录保留副本。");
+                let mut profiles: Vec<_> = self.ui.pending_draft_writes.iter().collect();
+                profiles.sort();
+                for profile in profiles {
+                    line(ui, "未保存配置", self.ui.workspace.name(profile));
+                }
+            });
+        ui.separator();
+        let mut keep_open = true;
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("返回编辑").clicked() {
+                keep_open = false;
+            }
+            if ui.button("重试保存并退出").clicked() {
+                self.request_exit(kind);
+                if matches!(kind, ExitKind::Shutdown) {
+                    self.advance_shutdown();
+                }
+                keep_open = false;
+            }
+            #[cfg(windows)]
+            if ui.button("导出未保存草稿…").clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter("JSON", &["json"])
+                    .set_file_name("xray-pilot-unsaved-drafts.json")
+                    .save_file()
+            {
+                self.export_unsaved_drafts(&path);
+            }
+            #[cfg(not(windows))]
+            if ui.button("复制未保存草稿").clicked() {
+                ui.ctx()
+                    .copy_text(serde_json::to_string_pretty(&self.unsaved_drafts_json()).unwrap());
+            }
+        });
+        if ui.button("放弃未保存修改并退出").clicked() {
+            self.discard_unsaved_and_exit(kind);
+            keep_open = false;
+        }
+        keep_open
     }
     fn confirm_dialog_contents(
         &mut self,
@@ -242,7 +290,7 @@ impl App {
         })
         .inner
     }
-    pub(super) fn execute_action(&mut self, action: Action, ctx: &egui::Context) {
+    pub(in crate::app) fn execute_action(&mut self, action: Action, ctx: &egui::Context) {
         match action {
             Action::Switch(id) => self.switch_profile(id),
             Action::Discard(profile) => {
@@ -281,13 +329,11 @@ impl App {
             }),
             Action::GuiExit => {
                 if !self.busy && !self.shutdown_requested && self.ui.uncertain.is_none() {
-                    self.stash_draft();
-                    self.exit = true;
+                    self.request_exit(ExitKind::Gui);
                 }
             }
             Action::Shutdown => {
-                self.stash_draft();
-                self.shutdown_requested = true;
+                self.request_exit(ExitKind::Shutdown);
                 if !self.ui.connected || self.ui.uncertain.is_some() {
                     self.message = "退出请求已保留，请先恢复连接并查询原操作结果。".into();
                 }

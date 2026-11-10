@@ -500,6 +500,22 @@ impl<B: ProxyBackend> Supervisor<B> {
                 "Operation result could not be persisted; no further changes allowed",
             ));
         }
+        // Only newly completed runtime work supersedes a previous runtime error.
+        // Reads and replayed successes do not prove recovery; an Ok response can
+        // also carry a committed transition whose cleanup still needs recovery.
+        if result.is_ok()
+            && !self.blocked
+            && matches!(
+                op.request.command,
+                Command::ApplyProfile { .. }
+                    | Command::SetProxyMode { .. }
+                    | Command::RestartCore
+                    | Command::StopCore
+                    | Command::Shutdown
+            )
+        {
+            self.last_error = None;
+        }
         result
     }
     async fn execute(&mut self, op: &Operation) -> Result<Value> {
@@ -544,7 +560,7 @@ impl<B: ProxyBackend> Supervisor<B> {
                 candidate.digest.clear();
                 candidate.digest = canonical_hash(&candidate)?;
                 let path = self.store.root.join("candidates").join(&candidate.id);
-                xray_runtime::validate(&candidate).await?;
+                xray_runtime::validate_with_logs(&candidate, &self.logs).await?;
                 let success = json!({"json":fs::read_to_string(&candidate.config_path)?,"candidate":candidate});
                 self.publish_effect(
                     op,
@@ -637,7 +653,7 @@ impl<B: ProxyBackend> Supervisor<B> {
                 };
                 candidate.digest = canonical_hash(&candidate)?;
                 resources::verify(&candidate.resources)?;
-                xray_runtime::validate(&candidate).await?;
+                xray_runtime::validate_with_logs(&candidate, &self.logs).await?;
                 self.publish_effect(
                     op,
                     path.join("candidate.json"),
@@ -795,7 +811,7 @@ impl<B: ProxyBackend> Supervisor<B> {
             ));
         }
         if running {
-            xray_runtime::validate(&candidate).await?;
+            xray_runtime::validate_with_logs(&candidate, &self.logs).await?;
         }
         let target = if running && mode == ProxyMode::Global {
             Some(global(xray_runtime::http_endpoint(

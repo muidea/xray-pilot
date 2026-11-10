@@ -37,32 +37,37 @@ async fn receive<R: AsyncRead + Unpin, T: serde::de::DeserializeOwned>(io: &mut 
     io.read_exact(&mut bytes).await?;
     Ok(serde_json::from_slice(&bytes)?)
 }
-async fn send<W: AsyncWrite + Unpin, T: serde::Serialize>(io: &mut W, value: &T) -> Result<()> {
-    let bytes = serde_json::to_vec(value)?;
+async fn send_frame<W: AsyncWrite + Unpin>(io: &mut W, bytes: &[u8]) -> Result<()> {
     if bytes.len() > MAX_MESSAGE {
         return Err(Error::new("IPC_MESSAGE_TOO_LARGE", "Message exceeds 8 MiB"));
     }
     io.write_u32_le(bytes.len() as u32).await?;
-    io.write_all(&bytes).await?;
+    io.write_all(bytes).await?;
     io.flush().await?;
     Ok(())
 }
-// Serialize the fallback before writing any frame bytes, so oversized responses never become EOF.
-async fn send_response<W: AsyncWrite + Unpin>(io: &mut W, response: &Response) -> Result<()> {
-    if serde_json::to_vec(response)?.len() > MAX_MESSAGE {
-        return send(
-            io,
-            &Response {
-                request_id: response.request_id.clone(),
-                result: Err(Error::new(
-                    "IPC_MESSAGE_TOO_LARGE",
-                    "Response exceeds 8 MiB; a write may already have committed. Query its request ID; use paged summaries or operation details",
-                )),
-            },
-        )
-        .await;
-    }
-    send(io, response).await
+async fn send<W: AsyncWrite + Unpin, T: serde::Serialize>(io: &mut W, value: &T) -> Result<()> {
+    send_frame(io, &serde_json::to_vec(value)?).await
+}
+// Encode exactly once, off the async workers. The admission slot remains held
+// until encoding finishes, even if the connection's I/O timeout cancels its wait.
+async fn send_response<W: AsyncWrite + Unpin>(
+    io: &mut W,
+    response: Response,
+    slot: std::sync::Arc<tokio::sync::OwnedSemaphorePermit>,
+) -> Result<()> {
+    let bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+        let _slot = slot;
+        let bytes = serde_json::to_vec(&response)?;
+        if bytes.len() <= MAX_MESSAGE { return Ok(bytes); }
+        // Serialize the fallback before writing any header; oversized replies are never EOF.
+        Ok(serde_json::to_vec(&Response {
+            request_id: response.request_id,
+            result: Err(Error::new("IPC_MESSAGE_TOO_LARGE",
+                "Response exceeds 8 MiB; a write may already have committed. Query its request ID; use paged summaries or operation details")),
+        })?)
+    }).await.map_err(|_| Error::new("IPC_SERIALIZATION_FAILED", "Response encoding failed"))??;
+    send_frame(io, &bytes).await
 }
 pub async fn call(root: &Path, request: &Request) -> Result<Response> {
     let root = std::fs::canonicalize(root)?;
@@ -155,6 +160,7 @@ pub async fn serve(root: &Path) -> Result<()> {
 async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
     io: &mut S,
     dispatch: tokio::sync::mpsc::Sender<Dispatch>,
+    slot: std::sync::Arc<tokio::sync::OwnedSemaphorePermit>,
 ) {
     let Ok(Ok(request)) = tokio::time::timeout(IO_TIMEOUT, receive::<_, Request>(io)).await else {
         return;
@@ -178,7 +184,7 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
         },
     };
     if matches!(
-        tokio::time::timeout(IO_TIMEOUT, send_response(io, &response)).await,
+        tokio::time::timeout(IO_TIMEOUT, send_response(io, response, slot)).await,
         Ok(Ok(()))
     ) {
         #[cfg(windows)]
@@ -255,13 +261,13 @@ async fn serve_supervisor<B: windows_integration::ProxyBackend + 'static>(
                 };
                 let dispatch = tx.clone();
                 connections.spawn(async move {
-                    let _permit = permit;
+                    let slot = std::sync::Arc::new(permit);
                     #[cfg(windows)]
                     {
                         use std::os::windows::io::AsRawHandle;
                         if verify_peer(io.as_raw_handle(), true).is_err() { return; }
                     }
-                    connection(&mut io, dispatch).await;
+                    connection(&mut io, dispatch, slot.clone()).await;
                     #[cfg(windows)]
                     let _ = io.disconnect();
                 });

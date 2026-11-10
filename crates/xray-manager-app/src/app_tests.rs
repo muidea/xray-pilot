@@ -554,6 +554,83 @@ fn fail_request(h: &mut Harness, request: Request, code: &str) {
 }
 
 #[test]
+fn successful_runtime_operations_refresh_request_errors_and_keep_event_history() {
+    for action in ["apply", "proxy", "restart", "stop"] {
+        let mut h = Harness::new();
+        h.app.ui.settings_loaded = true;
+        h.app.ui.profiles_loaded = true;
+        let g = generation(&h.app);
+        h.app.status = Some(status(Some(g.clone())));
+        let failed = h.send(Command::SetProxyMode {
+            mode: ProxyMode::Global,
+            http_inbound_tag: "http-in".into(),
+        });
+        fail_request(&mut h, failed, "PROXY_ENDPOINT_INVALID");
+        let poll = h.send(Command::GetStatus);
+        let mut before = status(Some(g.clone()));
+        before.last_error = Some(Error::new("PROXY_ENDPOINT_INVALID", "Old endpoint"));
+        h.reply(poll, before);
+        assert!(h.app.ui.failure.is_some());
+        let logs = h.send(Command::GetLogs);
+        h.reply(logs, Vec::<String>::new());
+        assert!(
+            h.app.ui.failure.is_some(),
+            "reads must not dismiss the error"
+        );
+
+        let command = match action {
+            "apply" => {
+                let c = candidate(&h.app, &h.app.editor);
+                h.app.accept_candidate(c.clone());
+                apply(&c)
+            }
+            "proxy" => Command::SetProxyMode {
+                mode: ProxyMode::Global,
+                http_inbound_tag: "http-in".into(),
+            },
+            "restart" => Command::RestartCore,
+            _ => Command::StopCore,
+        };
+        let request = h.send(command);
+        h.reply(request, &g);
+        assert!(h.app.ui.failure.is_none(), "{action}");
+        assert!(h.app.failed_request.is_none(), "{action}");
+        let poll = h.send(Command::GetStatus);
+        h.reply(poll, status(Some(g)));
+        assert!(h.app.status.as_ref().unwrap().last_error.is_none());
+        assert!(h.app.log_rows().iter().any(|(level, message)| {
+            level == "错误" && message.contains("PROXY_ENDPOINT_INVALID")
+        }));
+    }
+}
+
+#[test]
+fn successful_runtime_request_preserves_local_persistence_failure() {
+    for action in ["apply", "proxy"] {
+        let mut h = Harness::new();
+        let g = generation(&h.app);
+        h.app.status = Some(status(Some(g.clone())));
+        let command = if action == "apply" {
+            let c = candidate(&h.app, &h.app.editor);
+            h.app.accept_candidate(c.clone());
+            apply(&c)
+        } else {
+            Command::SetProxyMode {
+                mode: ProxyMode::Global,
+                http_inbound_tag: "http-in".into(),
+            }
+        };
+        let request = h.send(command);
+        h.app.fail(
+            Error::new("IO_ERROR", "Local draft write failed"),
+            String::new(),
+        );
+        h.reply(request, &g);
+        assert!(h.app.ui.failure.is_some(), "{action}");
+    }
+}
+
+#[test]
 fn profile_drafts_survive_switching_without_changing_the_runtime() {
     let mut h = Harness::new();
     let g = generation(&h.app);
@@ -649,7 +726,8 @@ fn disconnected_backend_preserves_last_status_and_blocks_mutations() {
     let poll = h.send(Command::GetStatus);
     h.reply(poll, status(Some(g)));
     assert!(h.app.ui.connected);
-    assert_eq!(h.app.message, "后台已连接。");
+    assert!(h.app.message.is_empty());
+    assert!(h.app.ui.failure.is_none());
 }
 
 #[test]
@@ -817,4 +895,163 @@ fn incomplete_import_opens_field_advice_without_replacing_runtime_or_source() {
         g.id
     );
     assert!(!h.requests.try_iter().any(|r| r.command.is_write()));
+}
+
+#[test]
+fn initial_settings_read_and_status_retry_preserve_the_user_draft() {
+    for change in ["core", "assets", "login", "connect", "reverted"] {
+        let mut h = Harness::new();
+        let read = h.send(Command::GetSettings);
+        match change {
+            "core" => h.app.core_path = "chosen-core".into(),
+            "assets" => h.app.asset_root = "chosen-assets".into(),
+            "login" => h.app.settings.start_on_logon = true,
+            "connect" => h.app.settings.connect_on_start = true,
+            _ => {
+                h.app.settings.start_on_logon = true;
+                h.app.settings_edited();
+                h.app.settings.start_on_logon = false;
+            }
+        }
+        h.app.settings_edited();
+        let expected = h.app.settings_context();
+        h.reply(read, stored_settings());
+        assert!(h.app.ui.settings_loaded, "{change}");
+        assert_eq!(
+            h.app.ui.saved_settings.as_ref().unwrap().core_path,
+            stored_settings().core_path
+        );
+        let poll = h.send(Command::GetStatus);
+        h.reply(poll, status(None));
+        assert!(
+            !h.requests
+                .try_iter()
+                .any(|r| matches!(r.command, Command::GetSettings))
+        );
+        assert!(h.app.settings_context() == expected, "{change}");
+        // Even an explicit later read must preserve the unsaved draft.
+        let retry = h.send(Command::GetSettings);
+        let expected = h.app.settings_context();
+        h.reply(retry, stored_settings());
+        assert!(h.app.settings_context() == expected, "{change}");
+        h.app.settings.core_path = h.app.core_path.clone().into();
+        let save = h.send(Command::SaveSettings {
+            settings: h.app.settings.clone(),
+        });
+        if change == "assets" {
+            let saved_request = save.clone();
+            fail_request(&mut h, save, "IPC_TIMEOUT");
+            let query = h.send(Command::GetOperation {
+                request_id: saved_request.request_id.clone(),
+            });
+            h.reply(
+                query,
+                serde_json::json!({"request": saved_request, "response": {
+                    "request_id": saved_request.request_id, "result": {"Ok": {"saved":true}}
+                }}),
+            );
+        } else {
+            h.reply(save, serde_json::json!({"saved":true}));
+        }
+        assert!(!h.app.ui.settings_dirty);
+    }
+}
+
+#[test]
+fn automatic_settings_retry_after_failure_preserves_edits_and_save_protects_new_edits() {
+    let mut h = Harness::new();
+    let read = h.send(Command::GetSettings);
+    h.responses
+        .send((
+            read.command,
+            Response {
+                request_id: read.request_id,
+                result: Err(Error::new("CONNECTION_LOST", "disconnected")),
+            },
+        ))
+        .unwrap();
+    h.app.receive();
+    h.app.core_path = "chosen-core".into();
+    h.app.settings_edited();
+    let poll = h.send(Command::GetStatus);
+    h.reply(poll, status(None));
+    let retry = h
+        .requests
+        .try_iter()
+        .find(|r| matches!(r.command, Command::GetSettings))
+        .unwrap();
+    h.reply(retry, stored_settings());
+    assert_eq!(h.app.core_path, "chosen-core");
+    assert!(h.app.ui.settings_loaded);
+    h.app.settings.core_path = h.app.core_path.clone().into();
+    let save = h.send(Command::SaveSettings {
+        settings: h.app.settings.clone(),
+    });
+    h.app.core_path = "newer-core".into();
+    h.app.settings_edited();
+    h.reply(save, serde_json::json!({"saved":true}));
+    assert!(h.app.ui.settings_dirty);
+    let read = h.send(Command::GetSettings);
+    h.reply(read, stored_settings());
+    assert_eq!(h.app.core_path, "newer-core");
+}
+
+#[test]
+fn background_apply_persists_the_new_draft_base_for_response_and_result_query() {
+    for query in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let mut h = Harness::new();
+        h.app.root = root.path().into();
+        h.app.ui.persistence = true;
+        h.app.editor = "{\"s\":1}".into();
+        let applied_json = h.app.editor.clone();
+        let c = candidate(&h.app, &applied_json);
+        h.app.accept_candidate(c.clone());
+        let g = generation(&h.app);
+        let applying = h.send(apply(&c));
+        h.app.editor = "{\"s\":2}".into();
+        h.app.draft_edited();
+        let switching = h.send(Command::GetProfile {
+            profile_id: "b".into(),
+        });
+        h.reply(switching, profile("b", "{}"));
+        if query {
+            h.responses
+                .send((
+                    applying.command.clone(),
+                    Response {
+                        request_id: applying.request_id.clone(),
+                        result: Err(Error::new("IPC_TIMEOUT", "query original request")),
+                    },
+                ))
+                .unwrap();
+            h.app.receive();
+            let lookup = h.send(Command::GetOperation {
+                request_id: applying.request_id.clone(),
+            });
+            h.reply(
+                lookup,
+                serde_json::json!({"request": applying, "response": {
+                    "request_id": applying.request_id, "result": {"Ok": g}
+                }}),
+            );
+        } else {
+            h.reply(applying, g);
+        }
+        let disk = crate::workspace::Draft::load(root.path(), "p")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            disk.base_revision,
+            hash(applied_json.as_bytes()),
+            "query={query}"
+        );
+        assert_eq!(disk.json, "{\"s\":2}");
+        let mut reopened = Harness::empty();
+        reopened.app.root = root.path().into();
+        reopened.app.ui.persistence = true;
+        reopened.app.load(profile("p", &applied_json));
+        assert_eq!(reopened.app.editor, "{\"s\":2}");
+        assert!(!reopened.app.has_draft_conflict(), "query={query}");
+    }
 }

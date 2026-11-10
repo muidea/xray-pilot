@@ -82,6 +82,13 @@ pub async fn version(path: &Path) -> Result<String> {
     Ok(line.chars().take(200).collect())
 }
 pub async fn validate(candidate: &Candidate) -> Result<()> {
+    validate_inner(candidate, None).await
+}
+/// Diagnostics remain in bounded session logs; persistent operation errors stay generic.
+pub async fn validate_with_logs(candidate: &Candidate, logs: &Logs) -> Result<()> {
+    validate_inner(candidate, Some(logs)).await
+}
+async fn validate_inner(candidate: &Candidate, logs: Option<&Logs>) -> Result<()> {
     verify_core(&candidate.core)?;
     let mut cmd = command(&candidate.core.path);
     cmd.args(["run", "-test", "-config"])
@@ -92,10 +99,26 @@ pub async fn validate(candidate: &Candidate) -> Result<()> {
     let result = output(cmd).await?;
     if !result.status.success() {
         // Core diagnostics may contain native configuration secrets: keep raw output in memory only.
+        if let Some(logs) = logs {
+            for (source, bytes) in [("stdout", &result.stdout), ("stderr", &result.stderr)] {
+                for chunk in bytes[..bytes.len().min(16 * 1024)].chunks(1024) {
+                    log(
+                        logs,
+                        format!(
+                            "ERROR Core -test {source}: {}",
+                            String::from_utf8_lossy(chunk)
+                        ),
+                    );
+                }
+                if bytes.len() > 16 * 1024 {
+                    log(logs, format!("ERROR Core -test {source}: [诊断已截断]"));
+                }
+            }
+        }
         return Err(Error::new(
             "CORE_VALIDATION_FAILED",
             format!(
-                "Core rejected candidate (exit {:?}); check the JSON and target Core version",
+                "Core rejected candidate (exit {:?}); see session logs for diagnostics and check the JSON and target Core version",
                 result.status.code()
             ),
         ));

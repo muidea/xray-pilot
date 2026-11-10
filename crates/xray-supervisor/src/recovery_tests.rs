@@ -293,7 +293,13 @@ async fn safety_stop_preserves_an_unrecorded_previous_commit() {
     assert_eq!(s.store.profile("p").unwrap().json, json);
 }
 
-async fn failing_candidate(s: &mut Supervisor<FakeProxy>, core: &Path) -> Candidate {
+async fn failing_candidate(s: &mut Supervisor<FakeProxy>) -> Candidate {
+    use std::os::unix::fs::PermissionsExt;
+    // This tests rollback after an immediate exit, not Python startup under load.
+    // A delayed Python interpreter can outlive Direct's 250 ms observation window.
+    let core = s.store.root.join("immediate-exit-core");
+    fs::write(&core, b"#!/bin/sh\ncase \"$1\" in version) echo 'Xray immediate-exit-fixture'; exit 0;; esac\n[ \"$2\" = '-test' ] && exit 0\nexit 24\n").unwrap();
+    fs::set_permissions(&core, fs::Permissions::from_mode(0o700)).unwrap();
     let p = s.store.profile("p").unwrap();
     serde_json::from_value(
         send(
@@ -302,7 +308,7 @@ async fn failing_candidate(s: &mut Supervisor<FakeProxy>, core: &Path) -> Candid
                 profile_id: "p".into(),
                 expected_revision: p.revision,
                 json: r#"{"outbounds":[{"protocol":"freedom"}],"fixtureFailStart":true}"#.into(),
-                core_path: core.into(),
+                core_path: core,
                 asset_root: s.store.root.clone(),
             },
         )
@@ -314,7 +320,7 @@ async fn failing_candidate(s: &mut Supervisor<FakeProxy>, core: &Path) -> Candid
 #[tokio::test]
 async fn failed_apply_restores_actual_running_or_stopped_state() {
     for running in [true, false] {
-        let (tmp, s, proxy, c) = setup().await;
+        let (tmp, s, proxy, _c) = setup().await;
         let mut s = if running {
             s
         } else {
@@ -324,7 +330,7 @@ async fn failed_apply_restores_actual_running_or_stopped_state() {
                 .unwrap()
         };
         assert_eq!(s.core.is_some(), running);
-        let c = failing_candidate(&mut s, &c.core.path).await;
+        let c = failing_candidate(&mut s).await;
         assert_eq!(
             send(&mut s, apply(&c)).await.unwrap_err().code,
             "CORE_START_FAILED"
@@ -386,7 +392,7 @@ async fn unresolved_asset_recovery_remains_pending_until_repair() {
 #[tokio::test]
 async fn failed_rollback_settlement_blocks_new_commits_until_restart() {
     let (tmp, mut s, proxy, good) = setup().await;
-    let bad = failing_candidate(&mut s, &good.core.path).await;
+    let bad = failing_candidate(&mut s).await;
     s.fail_settlement = true;
     let request = Request::new(apply(&bad), s.generation.as_ref().map(|g| g.id.clone()));
     assert_eq!(
@@ -716,4 +722,48 @@ async fn mixed_failed_and_successful_restarts_never_get_a_second_budget() {
     assert!(s.retry.is_none());
     drop(s);
     drop(tmp);
+}
+
+#[tokio::test]
+async fn failed_core_validation_keeps_raw_diagnostics_in_session_logs_only() {
+    let (_tmp, mut s, _proxy, good) = setup().await;
+    let p = s.store.profile("p").unwrap();
+    let request = Request::new(
+        Command::ValidateDraft {
+            profile_id: "p".into(),
+            expected_revision: p.revision,
+            json: r#"{"outbounds":[{"protocol":"freedom"}],"fixtureReject":true}"#.into(),
+            core_path: good.core.path,
+            asset_root: s.store.root.clone(),
+        },
+        s.generation.as_ref().map(|g| g.id.clone()),
+    );
+    let result = s.handle(request.clone()).await.result.unwrap_err();
+    assert_eq!(result.code, "CORE_VALIDATION_FAILED");
+    assert!(!result.message.contains("sensitive-core-diagnostic-marker"));
+    let logs = send(&mut s, Command::GetLogs).await.unwrap();
+    assert!(
+        logs.to_string()
+            .contains("sensitive-core-diagnostic-marker")
+    );
+    let operation = send(
+        &mut s,
+        Command::GetOperation {
+            request_id: request.request_id,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        !operation
+            .to_string()
+            .contains("sensitive-core-diagnostic-marker")
+    );
+    for file in std::fs::read_dir(s.store.root.join("runtime/operations")).unwrap() {
+        assert!(
+            !std::fs::read_to_string(file.unwrap().path())
+                .unwrap()
+                .contains("sensitive-core-diagnostic-marker")
+        );
+    }
 }

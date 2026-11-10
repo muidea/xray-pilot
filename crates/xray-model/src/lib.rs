@@ -273,6 +273,8 @@ pub struct Status {
     pub proxy_state: String,
     pub runtime_instance_id: Option<String>,
     pub supervisor_epoch: String,
+    /// Latest error; fresh successful runtime work clears it once recovery is healthy.
+    /// Status reads and historical operation replay do not acknowledge this error.
     pub last_error: Option<Error>,
     pub recovery_required: bool,
 }

@@ -82,6 +82,64 @@ async fn official_core_validation_apply_dedup_release_and_stop() {
     }).await).unwrap();
     assert!(metadata.resources.files.is_empty());
     assert!(!metadata.resources.complete);
+    // Official diagnostic output is available in session logs, not the persistent error.
+    let rejected = Request::new(
+        Command::ValidateDraft {
+            profile_id: "p".into(),
+            expected_revision: candidate.base_revision.clone(),
+            json: r#"{"outbounds":[{"tag":"direct","protocol":"invalid-validation-protocol"}]}"#
+                .into(),
+            core_path: candidate.core.path.clone(),
+            asset_root: root.clone(),
+        },
+        None,
+    );
+    let error = s.handle(rejected.clone()).await.result.unwrap_err();
+    assert_eq!(error.code, "CORE_VALIDATION_FAILED");
+    assert!(!error.message.contains("unknown config id"));
+    let logs = send(&mut s, Command::GetLogs).await;
+    assert!(
+        logs.as_array()
+            .unwrap()
+            .iter()
+            .any(|line| line.as_str().unwrap().contains("ERROR Core -test"))
+    );
+    // A legal Core configuration may still be ineligible for system proxy takeover.
+    let mut wildcard: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&candidate.config_path).unwrap()).unwrap();
+    wildcard["inbounds"][0]["listen"] = "0.0.0.0".into();
+    let invalid: Candidate = serde_json::from_value(
+        send(
+            &mut s,
+            Command::ValidateDraft {
+                profile_id: "p".into(),
+                expected_revision: candidate.base_revision.clone(),
+                json: wildcard.to_string(),
+                core_path: candidate.core.path.clone(),
+                asset_root: root.clone(),
+            },
+        )
+        .await,
+    )
+    .unwrap();
+    let failed = Request::new(
+        Command::ApplyProfile {
+            candidate_id: invalid.id,
+            candidate_digest: invalid.digest,
+            proxy_mode: ProxyMode::Global,
+            http_inbound_tag: "http-in".into(),
+        },
+        None,
+    );
+    assert_eq!(
+        s.handle(failed.clone()).await.result.unwrap_err().code,
+        "PROXY_ENDPOINT_INVALID"
+    );
+    assert_eq!(
+        send(&mut s, Command::GetStatus).await["last_error"]["code"],
+        "PROXY_ENDPOINT_INVALID"
+    );
+    assert_eq!(proxy.read().unwrap(), original);
     let request = Request::new(
         Command::ApplyProfile {
             candidate_id: candidate.id,
@@ -92,6 +150,19 @@ async fn official_core_validation_apply_dedup_release_and_stop() {
         None,
     );
     let response = s.handle(request.clone()).await.result.unwrap();
+    assert!(send(&mut s, Command::GetStatus).await["last_error"].is_null());
+    let failure_record = send(
+        &mut s,
+        Command::GetOperation {
+            request_id: failed.request_id,
+        },
+    )
+    .await;
+    assert_eq!(
+        failure_record["response"]["result"]["Err"]["code"],
+        "PROXY_ENDPOINT_INVALID"
+    );
+    assert!(send(&mut s, Command::GetStatus).await["last_error"].is_null());
     assert_ne!(proxy.read().unwrap(), original);
     assert_eq!(s.handle(request).await.result.unwrap(), response);
     let context = RouteContext {

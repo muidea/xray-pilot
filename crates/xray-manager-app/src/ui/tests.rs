@@ -126,6 +126,7 @@ fn native_pages_and_dialogs_render_in_both_themes_at_supported_sizes() {
             for dialog in [
                 Dialog::Confirm(Action::Stop),
                 Dialog::Confirm(Action::Shutdown),
+                Dialog::UnsavedExit(ExitKind::Shutdown),
                 Dialog::Rename("work".into()),
                 Dialog::Create,
             ] {
@@ -1594,4 +1595,124 @@ fn every_confirmation_dialog_keeps_actions_visible_with_long_native_names() {
             }
         }
     }
+}
+
+fn block_draft_writes(app: &mut App) -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("config")).unwrap();
+    std::fs::write(root.path().join("config/editor-drafts"), "blocked").unwrap();
+    app.root = root.path().into();
+    app.ui.persistence = true;
+    app.editor = "{\"unsaved\":true}".into();
+    app.draft_edited();
+    root
+}
+
+#[test]
+fn all_normal_exit_entries_block_on_draft_failure_and_allow_retry_or_explicit_discard() {
+    for entry in ["tray-gui", "tray-quit", "menu-gui", "menu-quit", "window"] {
+        for discard in [false, true] {
+            let mut app = app();
+            let root = block_draft_writes(&mut app);
+            let ctx = egui::Context::default();
+            match entry {
+                "tray-gui" => app.tray_action("exit-gui", &ctx),
+                "tray-quit" => app.tray_action("quit", &ctx),
+                "menu-gui" => app.execute_action(Action::GuiExit, &ctx),
+                "menu-quit" => app.execute_action(Action::Shutdown, &ctx),
+                _ => app.request_exit(ExitKind::Gui),
+            }
+            app.advance_shutdown();
+            assert!(!app.exit, "{entry}");
+            assert!(!app.shutdown_requested, "{entry}");
+            assert!(
+                matches!(app.ui.dialog, Some(Dialog::UnsavedExit(_))),
+                "{entry}"
+            );
+            assert!(app.ui.draft_dirty_since.is_some());
+            assert!(app.ui.pending_draft_writes.contains("work"));
+            let export = tempfile::tempdir().unwrap();
+            assert!(app.export_unsaved_drafts(&export.path().join("drafts.json")));
+            let value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(export.path().join("drafts.json")).unwrap())
+                    .unwrap();
+            assert_eq!(value["drafts"]["work"]["json"], app.editor);
+            assert!(!app.exit, "export alone must not exit");
+            let kind = if entry.ends_with("quit") {
+                ExitKind::Shutdown
+            } else {
+                ExitKind::Gui
+            };
+            if discard {
+                app.discard_unsaved_and_exit(kind);
+            } else {
+                std::fs::remove_file(root.path().join("config/editor-drafts")).unwrap();
+                app.request_exit(kind);
+                app.advance_shutdown();
+                assert!(app.ui.pending_draft_writes.is_empty());
+                assert!(app.ui.draft_dirty_since.is_none());
+                assert_eq!(
+                    Draft::load(root.path(), "work").unwrap().unwrap().json,
+                    app.editor
+                );
+                assert!(app.ui.failure.is_none());
+            }
+            if matches!(kind, ExitKind::Gui) {
+                assert!(app.exit);
+            } else {
+                assert!(app.shutdown_requested);
+            }
+        }
+    }
+}
+
+#[test]
+fn background_draft_write_failures_are_retried_even_after_switching_profiles() {
+    let mut app = app();
+    let root = tempfile::tempdir().unwrap();
+    app.root = root.path().into();
+    app.ui.persistence = true;
+    app.editor = "{\"s\":2}".into();
+    assert!(app.stash_draft());
+    app.load(Profile {
+        id: "other".into(),
+        json: "{}".into(),
+        revision: hash(b"{}"),
+    });
+    let path = root.path().join("config/editor-drafts/work.json");
+    let before = std::fs::read(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    app.applied_draft("work", Some("{\"s\":1}"));
+    assert!(app.ui.pending_draft_writes.contains("work"));
+    assert!(app.ui.draft_dirty_since.is_some());
+    assert!(!app.drafts_ready_for_exit(ExitKind::Gui));
+    assert_eq!(app.ui.drafts["work"].json, "{\"s\":2}");
+    std::fs::remove_dir(&path).unwrap();
+    std::fs::write(&path, before).unwrap();
+    app.ui.draft_dirty_since = Some(Instant::now() - Duration::from_secs(2));
+    app.flush_draft_if_due();
+    assert!(app.ui.pending_draft_writes.is_empty());
+    assert!(app.ui.failure.is_none());
+    assert!(app.ui.dialog.is_none());
+    assert!(app.message.is_empty());
+    assert_eq!(
+        Draft::load(root.path(), "work")
+            .unwrap()
+            .unwrap()
+            .base_revision,
+        hash(b"{\"s\":1}")
+    );
+}
+
+#[test]
+fn explicit_discard_does_not_authorize_later_edits_to_be_lost() {
+    let mut app = app();
+    let _root = block_draft_writes(&mut app);
+    assert!(!app.stash_draft());
+    app.discard_unsaved_and_exit(ExitKind::Shutdown);
+    app.editor = "{\"newer\":true}".into();
+    app.draft_edited();
+    assert!(!app.drafts_ready_for_exit(ExitKind::Gui));
+    assert!(!app.exit);
 }

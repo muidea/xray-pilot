@@ -103,7 +103,9 @@ cargo build --release --workspace --locked
 python scripts/package-windows.py --binary-dir target/release
 ```
 
-输出位于 dist：版本命名的 Windows x64 zip 以及 SHA256SUMS。包内包含三个程序、README、版本及源码提交标识、文档、示例和 Windows 验证脚本；不包含 Core 或用户数据。脚本会逐文件核对压缩包内容。正式发布前应使用干净的、与构建输入相同的源码提交，脚本将当前 HEAD 写入 VERSION.txt。
+输出位于 dist，统一使用 `xray-pilot-<版本>-windows-x64.zip`，以及 SHA256SUMS。验证版本通过版本号中的 `rc.N` 区分，例如下一验证版本可使用 `xray-pilot-0.1.1-rc.4-windows-x64.zip`；正式版本例如 `xray-pilot-0.1.1-windows-x64.zip`。文件名不再附加界面名称、验证用途或时间戳。包内包含三个程序、README、版本及源码提交标识、文档、示例和 Windows 验证脚本；不包含 Core 或用户数据。脚本会逐文件核对压缩包内容。正式发布前应使用干净的、与构建输入相同的源码提交，脚本将当前 HEAD 写入 VERSION.txt。
+
+对外提供内容不同的验证包时，应递增预发布版本，同步更新 Cargo.toml 与 Cargo.lock，并重新构建。已发布的版本不复用为不同内容的新包；当前已发布 rc.3，新一轮交付应从 rc.4 起。脚本拒绝覆盖输出目录中的同名包；同版本重复验证构建可使用独立的 `--output-dir`。
 
 仅提供本地验证时，可显式打包尚未提交的当前源码；先构建，再执行：
 
@@ -111,7 +113,7 @@ python scripts/package-windows.py --binary-dir target/release
 python scripts/package-windows.py --binary-dir target/release --validation
 ```
 
-验证包与其他版本包一样直接放在 dist 目录，使用独立的 `ui-validation-时间戳` 文件名，附中文验证说明与源码文件指纹清单，VERSION.txt 标明本地验证和源码修改状态，不覆盖既有发布包。包内 `验证说明.md` 来自 [验证指南](validation-guide.md)，修改验证步骤时维护此文档。SHA256SUMS 汇总同目录中的所有 zip。Windows GNU 交叉构建时将 `--binary-dir` 改为 `target/x86_64-pc-windows-gnu/release`。此模式不提交源码、不创建标签，也不上传发布。
+`--validation` 使用相同的正式命名规则，附中文验证说明与源码文件指纹清单；验证用途、源码修改状态和构建时间仅记录在 VERSION.txt 与 SOURCE-MANIFEST.json 中。包内 `验证说明.md` 来自 [验证指南](validation-guide.md)，修改验证步骤时维护此文档。SHA256SUMS 汇总同目录中的所有 zip。Windows GNU 交叉构建时将 `--binary-dir` 改为 `target/x86_64-pc-windows-gnu/release`。此模式不提交源码、不创建标签，也不上传发布。
 
 自动依赖部署与完整性/修复验收：
 
@@ -128,3 +130,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows-portable-c
 ```
 
 `windows-smoke.ps1 -Gui` 现在通过真实托盘弹出菜单的文本解析菜单 ID，并投递同一原生菜单命令，验证隐藏窗口重开、隐藏/可见窗口的仅退 GUI、后台隐藏启动后的完整退出。运行过程使用 Direct，不改真实 WinINet。
+
+## 程序图标资源
+
+矢量源、PNG 与多尺寸 ICO 位于 `crates/xray-manager-app/assets`。普通构建直接使用已提交资源；Windows 构建会通过 winresource 嵌入 EXE 图标，MSVC 使用 Windows SDK，交叉编译 GNU 使用 MinGW windres。调整图形时安装 ImageMagick，执行 `python scripts/generate-icons.py` 重新生成资源。接入与尺寸说明见 [程序图标](ui-icon.md)。

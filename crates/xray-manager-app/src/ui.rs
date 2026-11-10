@@ -52,7 +52,7 @@ enum SettingsTab {
     Storage,
 }
 #[derive(Clone)]
-enum Action {
+pub(super) enum Action {
     Switch(String),
     Discard(String),
     Delete { profile: String, revision: String },
@@ -64,7 +64,13 @@ enum Action {
     History(String),
     AdoptDraft(String),
 }
+#[derive(Clone, Copy)]
+pub(super) enum ExitKind {
+    Gui,
+    Shutdown,
+}
 enum Dialog {
+    UnsavedExit(ExitKind),
     Confirm(Action),
     Create,
     Rename(String),
@@ -96,6 +102,7 @@ pub(super) struct UiState {
     pub settings_loaded: bool,
     pub profiles_loaded: bool,
     pub saved_settings: Option<Settings>,
+    pub settings_dirty: bool,
     pub persistence: bool,
     pub workspace_valid: bool,
     unreadable_drafts: std::collections::HashSet<String>,
@@ -109,6 +116,8 @@ pub(super) struct UiState {
     pub(super) drafts: HashMap<String, Draft>,
     pub(super) profile_cache: HashMap<String, Profile>,
     draft_dirty_since: Option<Instant>,
+    pending_draft_writes: std::collections::HashSet<String>,
+    discarded_draft_state: Option<String>,
     draft_conflict: bool,
     dialog: Option<Dialog>,
     new_name: String,
@@ -143,6 +152,7 @@ impl Default for UiState {
             settings_loaded: false,
             profiles_loaded: false,
             saved_settings: None,
+            settings_dirty: false,
             persistence: false,
             workspace_valid: true,
             unreadable_drafts: Default::default(),
@@ -156,6 +166,8 @@ impl Default for UiState {
             drafts: HashMap::new(),
             profile_cache: HashMap::new(),
             draft_dirty_since: None,
+            pending_draft_writes: Default::default(),
+            discarded_draft_state: None,
             draft_conflict: false,
             dialog: None,
             new_name: String::new(),
@@ -384,6 +396,9 @@ fn error_advice(code: &str) -> &'static str {
         "CORE_VALIDATION_FAILED" | "CONFIG_PARSE_FAILED" | "STATIC_VALIDATION_FAILED" => {
             "配置检查未通过，请修正 JSON 或资源路径后重试。"
         }
+        "DRAFT_SAVE_FAILED" | "DRAFT_RECOVERY_REQUIRED" => {
+            "草稿尚未写入磁盘，修改仍保留在界面中。请检查数据目录权限，或先导出草稿。"
+        }
         "PROFILE_IN_USE" => "该配置仍由上次应用版本引用，请先应用另一份配置后再删除。",
         "DEPENDENCY_INSTALL_FAILED" => {
             "依赖安装失败，请检查网络和官方版本号；已有运行版本不会自动替换。"
@@ -408,7 +423,7 @@ impl App {
         if !self.ui.connected {
             self.add_event("信息", "后台已连接", String::new());
             if self.ui.uncertain.is_none() {
-                self.message = "后台已连接。".into();
+                self.message.clear();
             }
         }
         self.ui.connected = true;
@@ -466,6 +481,33 @@ impl App {
         );
         self.ui.failure = Some(Failure { error, request });
     }
+    pub(super) fn clear_request_failure(&mut self) {
+        // A successful backend request cannot repair local draft/settings IO.
+        // Events and the backend operation record retain the failed request.
+        if self
+            .ui
+            .failure
+            .as_ref()
+            .is_some_and(|failure| !failure.request.is_empty())
+        {
+            self.ui.failure = None;
+        }
+        self.failed_request = None;
+    }
+    pub(super) fn accept_saved_settings(&mut self, settings: Settings, assets: String) {
+        self.ui
+            .workspace
+            .asset_roots
+            .insert(settings.core_path.display().to_string(), assets.clone());
+        self.ui.settings_loaded = true;
+        self.ui.settings_dirty = self.core_path != settings.core_path.display().to_string()
+            || self.asset_root != assets
+            || self.settings.start_on_logon != settings.start_on_logon
+            || self.settings.connect_on_start != settings.connect_on_start;
+        self.finish_setup_save(&settings);
+        self.ui.saved_settings = Some(settings);
+        self.save_workspace();
+    }
     pub(super) fn save_workspace(&mut self) {
         if !self.ui.workspace_valid {
             self.message =
@@ -483,42 +525,144 @@ impl App {
         self.invalidate_candidate();
         self.ui.draft_dirty_since = Some(Instant::now());
     }
-    pub(super) fn stash_draft(&mut self) {
-        if self.profile_id.is_empty() || self.ui.deleted_profiles.contains(&self.profile_id) {
+    /// Snapshot the visible editor and retry every pending write, including other profiles.
+    pub(super) fn stash_draft(&mut self) -> bool {
+        if !self.profile_id.is_empty() && !self.ui.deleted_profiles.contains(&self.profile_id) {
+            let dirty = self.editor != self.saved_json || self.ui.draft_conflict;
+            if dirty {
+                let base_revision = if self.ui.draft_conflict {
+                    self.ui
+                        .drafts
+                        .get(&self.profile_id)
+                        .map(|d| d.base_revision.clone())
+                        .unwrap_or_else(|| self.revision.clone())
+                } else {
+                    self.revision.clone()
+                };
+                self.ui.drafts.insert(
+                    self.profile_id.clone(),
+                    Draft {
+                        base_revision,
+                        json: self.editor.clone(),
+                    },
+                );
+                self.ui.pending_draft_writes.insert(self.profile_id.clone());
+            } else if !self.ui.unreadable_drafts.contains(&self.profile_id) {
+                self.ui.drafts.remove(&self.profile_id);
+                self.ui.pending_draft_writes.insert(self.profile_id.clone());
+            }
+        }
+        self.flush_pending_drafts()
+    }
+    fn flush_pending_drafts(&mut self) -> bool {
+        let pending: Vec<_> = self.ui.pending_draft_writes.iter().cloned().collect();
+        for profile in pending {
+            let result = if !self.ui.persistence {
+                Ok(())
+            } else if self.ui.unreadable_drafts.contains(&profile) {
+                Err(Error::new(
+                    "DRAFT_RECOVERY_REQUIRED",
+                    "原草稿无法读取，请先导出当前修改，或明确选择保留 / 放弃草稿。",
+                ))
+            } else if let Some(draft) = self.ui.drafts.get(&profile) {
+                draft.save(&self.root, &profile)
+            } else {
+                Draft::remove(&self.root, &profile)
+            };
+            match result {
+                Ok(()) => {
+                    self.ui.pending_draft_writes.remove(&profile);
+                }
+                Err(error) => self.fail(
+                    Error::new(
+                        "DRAFT_SAVE_FAILED",
+                        format!(
+                            "配置 {} 的草稿未保存：{error}",
+                            self.ui.workspace.name(&profile)
+                        ),
+                    ),
+                    String::new(),
+                ),
+            }
+        }
+        let saved = self.ui.pending_draft_writes.is_empty();
+        if saved
+            && self
+                .ui
+                .failure
+                .as_ref()
+                .is_some_and(|f| f.error.code == "DRAFT_SAVE_FAILED")
+        {
+            self.ui.failure = None;
+            self.message.clear();
+        }
+        if saved && matches!(self.ui.dialog, Some(Dialog::UnsavedExit(_))) {
+            self.ui.dialog = None;
+        }
+        self.ui.draft_dirty_since = if saved { None } else { Some(Instant::now()) };
+        saved
+    }
+    fn draft_state(&self) -> String {
+        let drafts: std::collections::BTreeMap<_, _> = self.ui.drafts.iter().collect();
+        hash(
+            &serde_json::to_vec(&(&self.profile_id, &self.editor, &self.revision, drafts)).unwrap(),
+        )
+    }
+    pub(super) fn request_exit(&mut self, kind: ExitKind) {
+        if self.exit
+            || (matches!(kind, ExitKind::Gui)
+                && (self.busy || self.shutdown_requested || self.ui.uncertain.is_some()))
+        {
             return;
         }
-        let dirty = self.editor != self.saved_json || self.ui.draft_conflict;
-        if dirty {
-            let base_revision = if self.ui.draft_conflict {
-                self.ui
-                    .drafts
-                    .get(&self.profile_id)
-                    .map(|d| d.base_revision.clone())
-                    .unwrap_or_else(|| self.revision.clone())
-            } else {
-                self.revision.clone()
-            };
-            let draft = Draft {
-                base_revision,
-                json: self.editor.clone(),
-            };
-            if self.ui.persistence
-                && !self.ui.unreadable_drafts.contains(&self.profile_id)
-                && let Err(error) = draft.save(&self.root, &self.profile_id)
-            {
-                self.fail(error, String::new());
+        if matches!(kind, ExitKind::Shutdown) {
+            self.shutdown_requested = true;
+        } else if self.drafts_ready_for_exit(kind) {
+            self.exit = true;
+        }
+    }
+    pub(super) fn drafts_ready_for_exit(&mut self, kind: ExitKind) -> bool {
+        if self.ui.discarded_draft_state.as_ref() == Some(&self.draft_state()) || self.stash_draft()
+        {
+            return true;
+        }
+        self.shutdown_requested = false;
+        self.ui.dialog = Some(Dialog::UnsavedExit(kind));
+        self.message = "草稿未保存，已取消退出。请重试保存、导出或明确放弃未保存修改。".into();
+        if let Some(wakeup) = &self.wakeup {
+            wakeup.reveal();
+        }
+        false
+    }
+    fn discard_unsaved_and_exit(&mut self, kind: ExitKind) {
+        // Consent only applies to this exact editor/draft state. Later edits need a new save gate.
+        self.ui.discarded_draft_state = Some(self.draft_state());
+        self.request_exit(kind);
+    }
+    fn unsaved_drafts_json(&self) -> serde_json::Value {
+        let drafts: std::collections::BTreeMap<_, _> = self
+            .ui
+            .pending_draft_writes
+            .iter()
+            .map(|profile| (profile, self.ui.drafts.get(profile)))
+            .collect();
+        serde_json::json!({"format": "xray-pilot-unsaved-drafts-v1", "drafts": drafts})
+    }
+    #[cfg(any(windows, test))]
+    fn export_unsaved_drafts(&mut self, destination: &std::path::Path) -> bool {
+        match xray_config::write_json(destination, &self.unsaved_drafts_json()) {
+            Ok(()) => {
+                self.message = format!(
+                    "未保存草稿已导出到 {}；可返回编辑或重试保存。",
+                    display_path(destination)
+                );
+                true
             }
-            self.ui.drafts.insert(self.profile_id.clone(), draft);
-        } else {
-            self.ui.drafts.remove(&self.profile_id);
-            if self.ui.persistence
-                && !self.ui.unreadable_drafts.contains(&self.profile_id)
-                && let Err(error) = Draft::remove(&self.root, &self.profile_id)
-            {
+            Err(error) => {
                 self.fail(error, String::new());
+                false
             }
         }
-        self.ui.draft_dirty_since = None;
     }
     pub(super) fn flush_draft_if_due(&mut self) {
         if self
@@ -608,14 +752,11 @@ impl App {
         } else if let Some(draft) = self.ui.drafts.get_mut(profile_id) {
             if draft.json == json {
                 self.ui.drafts.remove(profile_id);
-                if self.ui.persistence
-                    && let Err(error) = Draft::remove(&self.root, profile_id)
-                {
-                    self.fail(error, String::new());
-                }
             } else {
                 draft.base_revision = revision;
             }
+            self.ui.pending_draft_writes.insert(profile_id.into());
+            self.flush_pending_drafts();
         }
         self.ui.profile_cache.insert(
             profile_id.into(),
@@ -646,8 +787,16 @@ impl App {
     pub(super) fn imported_profile(&mut self, profile: Profile) {
         let needs_review = xray_config::parse_document(profile.json.as_bytes())
             .is_ok_and(|value| !xray_config::inspect_config(&value).is_empty());
+        if self
+            .ui
+            .failure
+            .as_ref()
+            .is_some_and(|f| f.error.code == "STATIC_VALIDATION_FAILED")
+        {
+            self.ui.failure = None;
+        }
         self.load(profile);
-        self.ui.failure = None;
+        self.clear_request_failure();
         if needs_review {
             self.ui.page = Page::Profiles;
             self.ui.profile_tab = ProfileTab::Summary;
@@ -735,7 +884,7 @@ impl App {
             || summary_state == Some("Succeeded");
         self.failed_request = None;
         if success {
-            self.ui.failure = None;
+            self.clear_request_failure();
             match uncertain.command {
                 Command::ApplyProfile { .. } => {
                     // The captured JSON, rather than today's selected editor, was applied.
@@ -755,16 +904,11 @@ impl App {
                 }
                 Command::DeleteProfile { profile_id, .. } => self.profile_deleted(&profile_id),
                 Command::SaveSettings { settings } => {
-                    self.ui
-                        .workspace
-                        .asset_roots
-                        .insert(settings.core_path.display().to_string(), uncertain.assets);
-                    self.finish_setup_save(&settings);
-                    self.ui.saved_settings = Some(settings);
-                    self.save_workspace();
+                    self.accept_saved_settings(settings, uncertain.assets);
                 }
                 Command::Shutdown => {
-                    self.exit = true;
+                    self.shutdown_requested = false;
+                    self.request_exit(ExitKind::Gui);
                 }
                 _ => {
                     self.invalidate_candidate();

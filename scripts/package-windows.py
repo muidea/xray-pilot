@@ -45,7 +45,7 @@ def main():
     parser.add_argument("--output-dir", type=Path, default=Path("dist"))
     parser.add_argument(
         "--validation", action="store_true",
-        help="Package a local source snapshot, including uncommitted changes; not a release",
+        help="Include validation instructions and source fingerprints; allow uncommitted source",
     )
     args = parser.parse_args()
     root = Path(__file__).resolve().parent.parent
@@ -86,8 +86,12 @@ def main():
             parser.error(f"Missing package input: {source}")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     now = datetime.now(timezone.utc)
-    suffix = f"-ui-validation-{now:%Y%m%d-%H%M%S}" if args.validation else ""
-    package = args.output_dir / f"xray-pilot-{version}{suffix}-windows-x64.zip"
+    package = args.output_dir / f"xray-pilot-{version}-windows-x64.zip"
+    if package.exists():
+        parser.error(
+            f"Package already exists: {package}. "
+            "Use a new version for changed contents or a separate output directory."
+        )
     metadata = f"version={version}\nsource_commit={revision}\nplatform=windows-x64\n"
     extra = {}
     if args.validation:
@@ -115,7 +119,7 @@ def main():
         ).encode("utf-8")
         extra["验证说明.md"] = (root / "docs/validation-guide.md").read_bytes()
     extra["VERSION.txt"] = metadata.encode("utf-8")
-    with zipfile.ZipFile(package, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+    with zipfile.ZipFile(package, "x", zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
         for source, name in files:
             archive.write(source, f"xray-pilot/{name}")
         for name, data in extra.items():

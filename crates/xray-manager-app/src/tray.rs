@@ -34,21 +34,11 @@ impl Tray {
             menu.append(&item)?;
             items.push((item, key));
         }
-        let mut pixels = vec![0; 32 * 32 * 4];
-        for y in 0usize..32 {
-            for x in 0usize..32 {
-                let i = (y * 32 + x) * 4;
-                let cross = x.abs_diff(y) < 4 || x.abs_diff(31 - y) < 4;
-                pixels[i] = if cross { 240 } else { 35 };
-                pixels[i + 1] = if cross { 245 } else { 90 };
-                pixels[i + 2] = if cross { 255 } else { 155 };
-                pixels[i + 3] = 255;
-            }
-        }
+        let image = crate::icon::tray();
         let icon = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_tooltip("Xray Pilot")
-            .with_icon(Icon::from_rgba(pixels, 32, 32)?)
+            .with_icon(Icon::from_rgba(image.rgba, image.width, image.height)?)
             .build()?;
         let (tx, actions) = std::sync::mpsc::channel();
         let ids: Vec<_> = items

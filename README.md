@@ -2,27 +2,19 @@
 
 Xray Pilot 是 Windows 上的 Xray 配置与运行管理工具。你可以导入原生 JSON、检查配置、预览修改、启动 Core，并通过托盘管理系统代理。
 
-当前为 **0.1.1-rc.3 验证版（Pre-release）**，主要面向 Windows x64。支持 Global / Direct、配置历史和登录自启；PAC、TUN、Windows 服务部署及自动更新尚未提供。完整验收仍在进行，见 [已知限制](#已知限制)。
+当前为 **0.1.1-rc.4 验证版（Pre-release）**，主要面向 Windows x64。支持 Global / Direct、配置历史和登录自启；PAC、TUN、Windows 服务部署及自动更新尚未提供。完整验收仍在进行，见 [已知限制](#已知限制)。
 
 ## 界面版本说明
 
-本文界面操作对应当前源码的新界面：**总览 / 配置 / 诊断 / 日志 / 设置**。新界面目前提供本地验证包，尚未公开发布；下方发布页中的 rc.3 包仍使用英文旧界面，主要入口对照如下。
+本版采用 **总览 / 配置 / 诊断 / 日志 / 设置** 五页界面，支持浅色、深色和跟随系统。托盘、任务栏及标题栏使用统一图标。
 
-使用本地验证包时，请先阅读包内的 `验证说明.md`；对应步骤也见 [验证指南](docs/validation-guide.md)。新界面的实现及验证范围见 [界面实现说明](docs/ui-implementation.md)。
-
-| 当前源码 | 已发布 rc.3 |
-| --- | --- |
-| 配置 | Profiles / JSON |
-| 设置 → Core 与依赖 | Settings → Managed Xray dependencies |
-| 检查并预览 → 确认应用 | Validate candidate / preview changes → Apply validated configuration |
-| 诊断 / 日志 | Routing diagnostics / Logs |
-| 退出程序（停止 Core 并恢复代理） | Exit and restore proxy |
+验证步骤见包内 `验证说明.md` 和 [验证指南](docs/validation-guide.md)。验证包统一使用 `xray-pilot-<版本>-windows-x64.zip`，以 `rc.N` 区分轮次。
 
 ## 安装
 
 ### 1. 准备程序
 
-从 [v0.1.1-rc.3 发布页](https://github.com/muidea/xray-pilot/releases/tag/v0.1.1-rc.3) 下载 [Windows x64 程序包](https://github.com/muidea/xray-pilot/releases/download/v0.1.1-rc.3/xray-pilot-0.1.1-rc.3-windows-x64.zip) 和 [SHA256SUMS](https://github.com/muidea/xray-pilot/releases/download/v0.1.1-rc.3/SHA256SUMS)，完整解压到固定位置，例如 `D:\Apps\xray-pilot`。这是供验证的预发布版；验证步骤见 [版本说明](docs/releases/v0.1.1-rc.3.md)。
+从 [v0.1.1-rc.4 发布页](https://github.com/muidea/xray-pilot/releases/tag/v0.1.1-rc.4) 下载 [Windows x64 程序包](https://github.com/muidea/xray-pilot/releases/download/v0.1.1-rc.4/xray-pilot-0.1.1-rc.4-windows-x64.zip) 和 [SHA256SUMS](https://github.com/muidea/xray-pilot/releases/download/v0.1.1-rc.4/SHA256SUMS)，完整解压到固定位置，例如 `D:\Apps\xray-pilot`。这是供验证的预发布版；验证步骤见 [版本说明](docs/releases/v0.1.1-rc.4.md)。
 
 获取仓库源码后，也可按 [源码构建说明](docs/development.md#从源码构建) 自行构建。
 
@@ -42,7 +34,7 @@ Xray Pilot 是 Windows 上的 Xray 配置与运行管理工具。你可以导入
 如需核对下载文件，在 PowerShell 中运行，并与随包提供的 `SHA256SUMS` 比较：
 
 ```powershell
-Get-FileHash .\xray-pilot-0.1.1-rc.3-windows-x64.zip -Algorithm SHA256
+Get-FileHash .\xray-pilot-0.1.1-rc.4-windows-x64.zip -Algorithm SHA256
 ```
 
 ### 2. 选择数据目录并启动
@@ -232,6 +224,8 @@ curl.exe --proxy http://127.0.0.1:10809 --head https://example.com
 ```
 
 底部状态栏显示消息摘要；长消息可点击 **完整消息** 滚动查看，并用 **复制完整消息** 保留全文。错误卡片中的详情和请求身份可独立展开查看。
+
+修正配置后，成功应用、切换代理或启停 Core 会刷新旧的运行请求错误提示；尚未完成的恢复问题继续显示。历史失败记录仍可在日志和原请求查询中查看。
 
 日志可能包含目标地址或认证信息，分享前请检查内容。
 

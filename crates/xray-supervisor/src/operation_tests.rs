@@ -23,6 +23,58 @@ async fn call(s: &mut Supervisor<FakeProxy>, command: Command) -> Result<Value> 
     .await
     .result
 }
+
+#[tokio::test]
+async fn new_runtime_success_clears_error_without_erasing_operation_history() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Supervisor::with_backend(tmp.path(), FakeProxy)
+        .await
+        .unwrap();
+    let old_success = Request::new(Command::StopCore, None);
+    s.handle(old_success.clone()).await.result.unwrap();
+    let failed = Request::new(Command::RestartCore, None);
+    let error = s.handle(failed.clone()).await.result.unwrap_err();
+    assert_eq!(error.code, "NO_ACTIVE_PROFILE");
+
+    for command in [Command::GetStatus, Command::GetLogs, create("unrelated")] {
+        call(&mut s, command).await.unwrap();
+        assert_eq!(s.status().last_error.as_ref().unwrap().code, error.code);
+    }
+    // A historical success is not evidence that the current failure was fixed.
+    s.handle(old_success).await.result.unwrap();
+    assert_eq!(s.status().last_error.as_ref().unwrap().code, error.code);
+
+    call(&mut s, Command::StopCore).await.unwrap();
+    assert!(s.status().last_error.is_none());
+    let operation = call(
+        &mut s,
+        Command::GetOperation {
+            request_id: failed.request_id,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(operation["response"]["result"]["Err"]["code"], error.code);
+    assert!(s.status().last_error.is_none());
+}
+
+#[tokio::test]
+async fn successful_safety_stop_keeps_unresolved_recovery_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Supervisor::with_backend(tmp.path(), FakeProxy)
+        .await
+        .unwrap();
+    s.blocked = true;
+    s.last_error = Some(Error::new(
+        "RECOVERY_REQUIRED",
+        "Unresolved recovery fixture",
+    ));
+    call(&mut s, Command::StopCore).await.unwrap();
+    let status = s.status();
+    assert!(status.recovery_required);
+    assert_eq!(status.last_error.unwrap().code, "RECOVERY_REQUIRED");
+}
+
 #[tokio::test]
 async fn profile_publication_is_recovered_on_both_sides_of_commit() {
     for delete in [false, true] {

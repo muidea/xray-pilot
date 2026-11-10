@@ -110,6 +110,8 @@ impl App {
         let (tx, requests) = mpsc::sync_channel::<Request>(MAX_PENDING);
         let (responses, rx) = mpsc::channel();
         let worker_root = root.clone();
+        #[cfg(windows)]
+        crate::icon::configure_taskbar(cc);
         let wakeup = crate::wakeup::Wakeup::new(cc);
         let worker_wakeup = wakeup.clone();
         std::thread::spawn(move || {
@@ -290,6 +292,7 @@ impl App {
     }
     fn settings_edited(&mut self) {
         self.settings_edit_epoch = self.settings_edit_epoch.wrapping_add(1);
+        self.ui.settings_dirty = true;
         self.invalidate_candidate();
     }
     fn candidate_matches(&self) -> bool {
@@ -405,7 +408,7 @@ impl App {
         let request_id = request.request_id.clone();
         match self.tx.try_send(request) {
             Ok(()) => {
-                if settings_read {
+                if settings_read || settings_write {
                     self.settings_epoch = self.settings_epoch.wrapping_add(1);
                 }
                 if settings_write {
@@ -447,7 +450,7 @@ impl App {
             if pending
                 .settings_context
                 .as_ref()
-                .is_some_and(|context| *context != self.settings_context())
+                .is_some_and(|context| context.epoch != self.settings_epoch)
             {
                 continue;
             }
@@ -615,24 +618,31 @@ impl App {
                     }
                     Command::GetSettings => {
                         if let Ok(s) = serde_json::from_value::<Settings>(value) {
-                            self.core_path = s.core_path.display().to_string();
-                            self.asset_root = self
-                                .ui
-                                .workspace
-                                .asset_roots
-                                .get(&self.core_path)
-                                .cloned()
-                                .unwrap_or_else(|| {
-                                    s.core_path
-                                        .parent()
-                                        .filter(|p| !p.as_os_str().is_empty())
-                                        .unwrap_or(&self.root)
-                                        .display()
-                                        .to_string()
-                                });
+                            // A read updates the saved baseline even when editing superseded it.
+                            // Completing initial loading prevents status polling from retrying forever.
+                            let can_replace_draft = !self.ui.settings_dirty
+                                && pending.settings_context.as_ref()
+                                    == Some(&self.settings_context());
                             self.ui.saved_settings = Some(s.clone());
                             self.ui.settings_loaded = true;
-                            self.settings = s;
+                            if can_replace_draft {
+                                self.core_path = s.core_path.display().to_string();
+                                self.asset_root = self
+                                    .ui
+                                    .workspace
+                                    .asset_roots
+                                    .get(&self.core_path)
+                                    .cloned()
+                                    .unwrap_or_else(|| {
+                                        s.core_path
+                                            .parent()
+                                            .filter(|p| !p.as_os_str().is_empty())
+                                            .unwrap_or(&self.root)
+                                            .display()
+                                            .to_string()
+                                    });
+                                self.settings = s;
+                            }
 
                             self.start_dependencies("Status", "", None);
                         }
@@ -668,7 +678,10 @@ impl App {
                                 serde_json::to_string_pretty(&value).unwrap_or_default();
                         }
                     }
-                    Command::Shutdown => self.exit = true,
+                    Command::Shutdown => {
+                        self.shutdown_requested = false;
+                        self.request_exit(ui::ExitKind::Gui);
+                    }
                     Command::CreateProfile { .. } => {
                         if let Ok(profile) = serde_json::from_value(value) {
                             self.imported_profile(profile);
@@ -680,7 +693,7 @@ impl App {
                             &pending.context.profile,
                             pending.submitted_json.as_deref(),
                         );
-                        self.ui.failure = None;
+                        self.clear_request_failure();
                         self.ui.onboarding = false;
                         self.add_event("信息", "配置已应用", response.request_id.clone());
                         self.message = "配置已应用，正在读取最新运行状态。".into();
@@ -694,16 +707,16 @@ impl App {
                         }
                     }
                     Command::SaveSettings { settings } => {
-                        self.ui.saved_settings = Some(settings.clone());
-                        self.ui
-                            .workspace
-                            .asset_roots
-                            .insert(settings.core_path.display().to_string(), pending.asset_root);
-                        self.save_workspace();
-                        self.ui.settings_loaded = true;
-                        self.finish_setup_save(&settings);
+                        self.accept_saved_settings(settings, pending.asset_root);
                         self.message = "设置已保存；运行中的 Core 保持原版本。".into();
                         self.add_event("信息", "设置已保存", response.request_id);
+                        self.send(Command::GetStatus);
+                    }
+                    Command::StopCore | Command::RestartCore | Command::SetProxyMode { .. } => {
+                        self.clear_request_failure();
+                        let label = ui::command_name(&command);
+                        self.message = format!("{label}已完成，正在刷新状态。");
+                        self.add_event("信息", format!("{label}已完成"), response.request_id);
                         self.send(Command::GetStatus);
                     }
                     _ => {
@@ -807,12 +820,11 @@ impl App {
             }
             "exit-gui" => {
                 if !self.busy && !self.shutdown_requested && self.ui.uncertain.is_none() {
-                    self.stash_draft();
-                    self.exit = true;
+                    self.request_exit(ui::ExitKind::Gui);
                 }
             }
             "quit" => {
-                self.shutdown_requested = true;
+                self.request_exit(ui::ExitKind::Shutdown);
                 if (!self.ui.connected || self.ui.uncertain.is_some())
                     && let Some(wakeup) = &self.wakeup
                 {
@@ -846,6 +858,7 @@ impl App {
             && !self.exit
             && self.ui.connected
             && self.ui.uncertain.is_none()
+            && self.drafts_ready_for_exit(ui::ExitKind::Shutdown)
         {
             self.send(Command::Shutdown);
         }
@@ -853,7 +866,9 @@ impl App {
 }
 impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.stash_draft();
+        if !self.exit {
+            self.stash_draft();
+        }
         if let Some(wakeup) = &self.wakeup {
             wakeup.close();
         }
@@ -897,6 +912,15 @@ impl eframe::App for App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             }
+        }
+        #[cfg(windows)]
+        let close_exits = self.tray.is_none();
+        #[cfg(not(windows))]
+        let close_exits = true;
+        if close_exits && ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.request_exit(ui::ExitKind::Gui);
+            ctx.request_repaint();
         }
         if self.last_poll.elapsed() > Duration::from_secs(2)
             && !self.busy
