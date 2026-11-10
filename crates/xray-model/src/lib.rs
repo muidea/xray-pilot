@@ -125,6 +125,12 @@ pub struct ProfileSummary {
     pub id: String,
     pub revision: String,
 }
+/// Frozen JSON from a specific committed generation, independent of editor drafts.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RuntimeConfig {
+    pub generation_id: String,
+    pub json: String,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProfilePage {
     pub items: Vec<ProfileSummary>,
@@ -150,6 +156,9 @@ impl Default for Settings {
 #[serde(tag = "operation", content = "payload")]
 pub enum Command {
     GetStatus,
+    GetRuntimeConfig {
+        generation_id: String,
+    },
     ListProfiles,
     ListProfileSummaries {
         after: Option<String>,
@@ -210,6 +219,10 @@ pub enum Command {
         profile_id: String,
         context: RouteContext,
     },
+    TestRunningRoute {
+        generation_id: String,
+        context: RouteContext,
+    },
     Shutdown,
 }
 impl Command {
@@ -217,6 +230,7 @@ impl Command {
         !matches!(
             self,
             Self::GetStatus
+                | Self::GetRuntimeConfig { .. }
                 | Self::ListProfiles
                 | Self::ListProfileSummaries { .. }
                 | Self::GetProfile { .. }
@@ -226,6 +240,7 @@ impl Command {
                 | Self::GetOperation { .. }
                 | Self::GetOperationDetails { .. }
                 | Self::TestRoute { .. }
+                | Self::TestRunningRoute { .. }
         )
     }
 }

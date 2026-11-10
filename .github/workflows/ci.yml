@@ -27,6 +27,8 @@ jobs:
         run: python scripts/fetch-test-core.py --github-env
       - name: Official Core smoke test (uses a fake system proxy)
         run: cargo test -p xray-supervisor --test real_core --locked -- --ignored
+      - name: Native API configuration import and validation (does not start Core)
+        run: cargo test -p xray-supervisor --test config_import --locked -- --ignored
       - name: Windows official dependency deployment and repair
         if: runner.os == 'Windows'
         shell: pwsh

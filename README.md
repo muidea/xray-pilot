@@ -4,6 +4,20 @@ Xray Pilot 是 Windows 上的 Xray 配置与运行管理工具。你可以导入
 
 当前为 **0.1.1-rc.3 验证版（Pre-release）**，主要面向 Windows x64。支持 Global / Direct、配置历史和登录自启；PAC、TUN、Windows 服务部署及自动更新尚未提供。完整验收仍在进行，见 [已知限制](#已知限制)。
 
+## 界面版本说明
+
+本文界面操作对应当前源码的新界面：**总览 / 配置 / 诊断 / 日志 / 设置**。新界面目前提供本地验证包，尚未公开发布；下方发布页中的 rc.3 包仍使用英文旧界面，主要入口对照如下。
+
+使用本地验证包时，请先阅读包内的 `验证说明.md`；对应步骤也见 [验证指南](docs/validation-guide.md)。新界面的实现及验证范围见 [界面实现说明](docs/ui-implementation.md)。
+
+| 当前源码 | 已发布 rc.3 |
+| --- | --- |
+| 配置 | Profiles / JSON |
+| 设置 → Core 与依赖 | Settings → Managed Xray dependencies |
+| 检查并预览 → 确认应用 | Validate candidate / preview changes → Apply validated configuration |
+| 诊断 / 日志 | Routing diagnostics / Logs |
+| 退出程序（停止 Core 并恢复代理） | Exit and restore proxy |
+
 ## 安装
 
 ### 1. 准备程序
@@ -39,19 +53,19 @@ Get-FileHash .\xray-pilot-0.1.1-rc.3-windows-x64.zip -Algorithm SHA256
 .\xray-manager.exe --data-dir "D:\Xray Pilot Data"
 ```
 
-后续启动和诊断都应使用同一数据目录。可创建带上述参数的快捷方式。首次没有 Core 设置时会打开 Settings，准备官方依赖。
+后续启动和诊断都应使用同一数据目录。可创建带上述参数的快捷方式。首次使用会进入设置向导，依次准备官方依赖、添加配置、检查并确认启动。
 
 安装目录应可写；若目录受保护，请解压到可写位置或指定 `--data-dir`。旧版默认使用 `%LOCALAPPDATA%\XrayManager`，升级后如需继续使用旧数据，请显式指定旧目录，例如 `--data-dir "$env:LOCALAPPDATA\XrayManager"`；程序不会自动迁移或合并数据。启用过登录自启的安装仍绑定其原数据目录，请保持入口参数一致。
 
 ### 3. 自动准备官方依赖
 
-在 **Settings → Managed Xray dependencies** 保留推荐的官方版本 `v26.11.9`，点击 **Download / repair official Core**。程序会从 [XTLS/Xray-core 官方发布页](https://github.com/XTLS/Xray-core/releases) 对应版本下载 Windows x64 包及官方 `.dgst`，核对 SHA-256 后安装 `xray.exe`、`geoip.dat`、`geosite.dat`。
+在 **设置 → Core 与依赖** 保留推荐的官方版本 `v26.11.9`，点击 **下载 / 修复官方依赖**。程序会从 [XTLS/Xray-core 官方发布页](https://github.com/XTLS/Xray-core/releases) 对应版本下载 Windows x64 包及官方 `.dgst`，核对 SHA-256 后安装 `xray.exe`、`geoip.dat`、`geosite.dat`。
 
-安装完成后自动填入 Core 路径与资源目录，点击 **Save settings**。程序包运行和依赖部署使用 Windows x64 自带的 PowerShell；无需安装 Python 或 Rust。
+安装完成后自动填入 Core 路径与资源目录，点击 **保存设置**。程序包运行和依赖部署使用 Windows x64 自带的 PowerShell；无需安装 Python 或 Rust。
 
 依赖保存在当前数据目录的 `dependencies/`：重复安装会校验并复用健康版本，损坏时可再次点击下载/修复；已验证的下载缓存可用于修复。新安装按版本分别保留，修复不会覆盖旧目录。下载失败不会切换已选依赖。
 
-**Check installed dependencies** 可重新核对文件完整性；列表中的 **Use this version** 会校验并选用已有版本。需要更换版本时，输入官方版本号后下载、保存设置，并重新校验和应用配置。安装和选择依赖不会自行重启或替换正在运行的 Core。
+**检查已安装依赖** 可重新核对文件完整性；列表中的 **选用此版本** 会校验并选用已有版本。需要更换版本时，输入官方版本号后下载、保存设置，并重新校验和应用配置。安装和选择依赖不会自行重启或替换正在运行的 Core。
 
 ### 无界面部署与离线安装
 
@@ -70,25 +84,31 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows-dependenci
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows-dependencies.ps1 -Action Install -DataDir "D:\Xray Pilot Data" -CoreVersion v26.11.9 -ArchivePath "D:\Downloads\Xray-windows-64.zip"
 ```
 
-离线包同样需要通过 SHA-256、文件完整性和 Core 版本检查。已有自行从官方获取的 Core 也可在 Settings 手动选择其 `xray.exe` 及资源目录。
+离线包同样需要通过 SHA-256、文件完整性和 Core 版本检查。已有自行从官方获取的 Core 也可在设置中手动选择其 `xray.exe` 及资源目录。
 
 ## 首次配置与连接
 
 ### 1. 设置 Core 和资源目录
 
-打开 **Settings**：
+打开 **设置**：
 
-- 自动安装后，确认 **Official Xray Core executable** 和 **Resource directory** 已填入受管版本路径。
+- 自动安装后，确认 **下次检查 / 应用使用的官方 Core** 和 **资源目录** 已填入受管版本路径。
 - 手动准备 Core 时，选择从官方包解压的 `xray.exe`，资源目录填写 geo 文件及证书等文件所在目录。
-- 点击 **Save settings**。
+- 点击 **保存设置**。
 
 配置中引用的文件路径应相对于资源目录，例如 `certs/server.pem`。当前不接受越界路径或绝对文件依赖路径；遇到提示时需修改 JSON。应用会保存所需文件的副本，之后修改来源文件需重新校验、应用才会生效。
 
-已保存的 Core 路径和自启选项会在重新打开界面后读取。0.1.1-rc.1 已修复此前已有 Profile 时设置显示为默认值的问题。
+已保存的 Core 路径和自启选项会在重新打开界面后读取。
 
 ### 2. 创建或导入配置
 
-打开 **Profiles / JSON**，输入配置名称，再选择 **Create** 或 **Import JSON…**。名称使用英文字母、数字、`-`、`_`，最多 80 个字符。
+打开 **配置**，选择 **新建** 或 **导入**，填写便于识别的显示名称（支持中文）。导入可粘贴 JSON，也可在 Windows 上选择 JSON 文件；程序自动分配内部标识，原生 JSON 不变。
+
+JSON 编辑区提供行号、横向 / 纵向滚动和 **格式化 JSON**，宽高随父容器可用空间调整。配置页放大时显示更多内容，缩小时保留可用编辑面积并支持页面滚动；底部操作与编辑区分开。导入窗口内容较长时滚动中间表单，标题和底部操作按钮保持可见。格式化仅在主动点击时调整排版。
+
+内容是可解析的 JSON 对象时，即使缺少协议、节点参数或路由引用，也可先 **保存待补充配置**；随后在 **配置 → 概览** 查看具体字段位置与补充提示，在 **原始 JSON** 中继续修改。JSON 语法错误需先修正，当前输入会保留。程序保留已有字段，不猜测服务器、认证参数，也不会把缺失的路由目标替换成直连。保存配置不会启动 Core；运行前仍须通过 **检查并预览**，由所选官方 Core 校验。
+
+从文件读取时，默认沿用设置中的资源目录。只有相对文件依赖确实位于配置文件所在目录时，才勾选 **使用配置文件所在目录查找资源**；使用受管官方 geo 文件时通常保持默认。
 
 建议先导入 [examples/local-direct.json](examples/local-direct.json) 完成本机验证。它提供：
 
@@ -104,18 +124,20 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows-dependenci
 
 ### 3. 校验、预览并应用
 
-1. 编辑 JSON，选择 **Proxy mode**。首次验证可先用 **Direct**。
-2. 使用 **Global** 时，将 **HTTP inbound tag** 填为配置中的 HTTP 入站 Tag；示例为 `http-in`。
-3. 点击 **Validate candidate / preview changes**，检查校验结果、依赖提示和修改差异。
-4. 点击 **Apply validated configuration**。修改草稿或校验上下文后需要重新校验。
-5. 确认顶部显示 Core 为 `Running`。校验失败时查看底部错误和 **Logs**，修正后重试。
+1. 在 **配置 → 概览** 选择 **应用后的系统代理方式**，再编辑 JSON。首次验证可先用 **不接管系统代理**。
+2. 选择 **使用本机 HTTP 代理** 时，将 **用于接管代理的 HTTP 入站 Tag** 填为配置中的 HTTP 入站 Tag；示例为 `http-in`。
+3. 点击 **检查并预览**，检查校验结果、依赖提示和修改差异。
+4. 点击 **确认应用**（Core 未运行时为 **确认并启动**）。修改草稿、Core、资源目录或代理上下文后，需要重新检查；预览同时展示运行版本、待应用草稿与冻结资源。
+5. 在 **总览** 确认显示 **Core 运行中**。校验失败时查看底部错误和 **日志**，修正后重试。
 
-两种模式的作用如下：
+预览中的 **资源与自动恢复限制** 表示管理器尚未完整覆盖这些原生字段的自动恢复能力，不等于配置非法。出现此提示时，仍可在 Core 校验通过后手动确认应用，但自动连接、异常重试及自动恢复旧 Core 不可用。顶部显示中文摘要，逐项说明可展开并滚动查看。
+
+两种方式的作用如下（CLI / 接口仍使用 Direct、Global）：
 
 | 模式 | 系统代理与流量行为 |
 | --- | --- |
-| **Direct** | 恢复应用接管前的系统代理设置，Core 仍运行。手动连接 Core 的应用仍按 JSON 的出站和路由转发 |
-| **Global** | 将当前用户的 Windows HTTP/HTTPS 系统代理指向选定的 HTTP 入站。仅使用该系统代理的应用受影响，Core 路由继续生效 |
+| **不接管系统代理（Direct）** | 恢复应用接管前的系统代理设置，Core 仍运行。手动连接 Core 的应用仍按 JSON 的出站和路由转发 |
+| **使用本机 HTTP 代理（Global）** | 将当前用户的 Windows HTTP/HTTPS 系统代理指向选定的 HTTP 入站。仅使用该系统代理的应用受影响，Core 路由继续生效 |
 
 Global 要求 HTTP 入站使用回环地址、固定数值端口且无认证。它不会接管全部设备流量；Core 显示 Running 也不代表远端代理已经可用。
 
@@ -127,37 +149,37 @@ Global 要求 HTTP 入站使用回环地址、固定数值端口且无认证。�
 curl.exe --proxy http://127.0.0.1:10809 --head https://example.com
 ```
 
-按实际端口替换 `10809`。收到网站响应可用于检查这条代理连接；远端出口是否符合预期还需结合自己的上游与网络环境确认。界面中的 **Routing diagnostics** 只做静态预测，不能代替实际连接测试。
+按实际端口替换 `10809`。收到网站响应可用于检查这条代理连接；远端出口是否符合预期还需结合自己的上游与网络环境确认。界面中的 **诊断** 只做静态预测，不能代替实际连接测试。
 
 ## 界面显示风格
 
-在 **Settings → Appearance** 选择 **Follow system**、**Light** 或 **Dark**，分别跟随系统、使用浅色或使用深色。默认跟随系统，修改立即生效并自动保存，重开后保留选择。
+在 **设置 → 外观** 选择 **跟随系统**、**浅色** 或 **深色**，分别跟随系统、使用浅色或使用深色。默认跟随系统，修改立即生效并自动保存，重开后保留选择。
 
 ## 日常使用
 
 | 操作 | 结果 |
 | --- | --- |
 | 关闭窗口 | Windows 下收起到托盘 |
-| 托盘 **Open Xray Pilot** | 重新打开界面 |
-| **Stop Core** | 停止 Core，并尝试恢复应用接管前的系统代理 |
-| **Start / restart** | 启动或重启上次已应用的配置 |
-| **Exit GUI (keep Core)** | 只退出界面，后台 Core 继续运行 |
-| **Exit and restore proxy** | 停止后台、恢复代理并退出界面；如有恢复错误需继续处理 |
+| 托盘 **打开 Xray Pilot** | 重新打开界面 |
+| **停止 Core** | 停止 Core，并尝试恢复应用接管前的系统代理 |
+| **启动 / 重启 Core** | 启动或重启上次已应用的配置 |
+| **仅退出界面，后台继续运行** | 只退出界面，后台 Core 继续运行 |
+| **退出程序（停止 Core 并恢复代理）** | 停止后台、恢复代理并退出界面；如有恢复错误需继续处理 |
 
-只退出界面后，再次打开程序会连接原后台。切换 Profile 后仍需校验并应用，选中名称本身不会切换正在运行的配置。
+只退出界面后，再次打开程序会连接原后台。切换配置后仍需检查并确认应用，选中名称本身不会切换运行版本。各配置的未应用草稿独立保存，重新打开界面可继续编辑；外部配置变化造成版本冲突时，先决定保留草稿内容或放弃草稿，再重新检查。上次已应用配置仍由运行记录引用，需先应用另一份配置后才能删除。
 
-需要回滚时，在 **Committed snapshots / rollback** 中选择 **Preview this snapshot**，检查历史 JSON 和差异，再明确应用。
+需要回滚时，在 **配置 → 历史** 中选择 **载入为草稿**，检查历史 JSON 和差异，再明确应用。
 
 ## 部署与开机使用
 
 ### 当前用户登录自启
 
-在 **Settings** 中分别配置：
+在 **设置 → 启动行为** 中分别配置：
 
-- **Start on Windows login**：登录后启动程序。
-- **Connect on Supervisor startup**：后台启动后连接上次已应用的配置。
+- **登录 Windows 后启动界面**：登录后启动程序。
+- **后台启动后自动连接**：后台启动后连接上次已应用的配置。
 
-勾选后点击 **Save settings**。仅启用登录自启不会自动连接；自动连接需要已有成功应用的配置，且相关文件完整、依赖受支持。实际登录启动仍待完整验收，建议在自己的 Windows 环境中验证登录后的行为。
+勾选后点击 **保存设置**。仅启用登录自启不会自动连接；自动连接需要已有成功应用的配置，且相关文件完整、依赖受支持。实际登录启动仍待完整验收，建议在自己的 Windows 环境中验证登录后的行为。
 
 先将程序放在长期使用的位置，再启用自启。需要移动程序时，先在原位置取消登录自启并保存，再完全退出，移动后重新启用。
 
@@ -182,7 +204,7 @@ curl.exe --proxy http://127.0.0.1:10809 --head https://example.com
 
 ### 备份、更新与移除
 
-备份前先通过 **Exit and restore proxy** 完全退出，再复制整个数据目录。目录包含认证信息和恢复记录，请保存在受控位置。**Export JSON…** 只导出当前编辑器中的配置，不能代替完整备份。
+备份前先通过 **退出程序（停止 Core 并恢复代理）** 完全退出，再复制整个数据目录。目录包含认证信息和恢复记录，请保存在受控位置。**导出 JSON** 只导出当前编辑器中的配置，不能代替完整备份。
 
 更新时，完全退出后替换程序目录中的三个可执行文件，保持数据目录不变；更新前保留原程序与数据备份。跨版本数据迁移尚未完成验收。
 
@@ -193,14 +215,14 @@ curl.exe --proxy http://127.0.0.1:10809 --head https://example.com
 | 现象 | 处理方法 |
 | --- | --- |
 | 官方依赖下载失败 | 检查到 GitHub 的连接，重试或按上面的离线安装步骤准备官方包与 `.dgst` |
-| 受管 Core 或 geo 文件损坏 | 点击 Check installed dependencies 检查，在 Official version 输入对应版本后 Download / repair，保存并重新校验配置 |
+| 受管 Core 或 geo 文件损坏 | 点击 **检查已安装依赖**，输入对应官方版本后 **下载 / 修复官方依赖**，保存并重新校验配置 |
 | Core 路径失效或文件已移动 | 下载/修复受管版本，或重新选择从官方包获取的 `xray.exe`，保存后重新校验配置 |
-| Core 启动失败或端口被占用 | 检查 **Logs** 和配置端口；排查其他代理实例，调整监听端口后重新校验 |
+| Core 启动失败或端口被占用 | 检查 **日志** 和配置端口；排查其他代理实例，调整监听端口后重新校验 |
 | 找不到 geo 文件或证书 | 检查资源来源目录及相对路径；补齐文件后重新校验 |
 | Global 已启用，但部分程序未走代理 | 确认该程序使用 Windows 系统代理；也可手动填写 `127.0.0.1` 和实际 HTTP/SOCKS 端口 |
 | 自动连接被拒绝 | 检查冻结文件是否完整及候选中的依赖提示；未覆盖的配置需显式校验、应用 |
-| 界面连接后台失败 | 确认数据目录一致，尝试 **Reconnect Supervisor**，或用 CLI 查询 `status` |
-| 操作报错，但不确定是否已生效 | 保留界面显示的 request ID，点击 **Query failed request**，或运行下方查询命令 |
+| 界面连接后台失败 | 确认数据目录一致，尝试 **重新连接并读取状态**，或用 CLI 查询 `status` |
+| 操作报错，但不确定是否已生效 | 保留界面显示的 request ID，点击 **查询原操作结果**，或运行下方查询命令 |
 | `PROXY_LEASE_CONFLICT` | 代理设置已被其他程序修改。应用会保留外部设置；先核查当前 Windows 代理及其他代理工具 |
 | `RECOVERY_REQUIRED` / `PROXY_RECOVERY_REQUIRED` | 停止 Core、查询状态并保留整个数据目录；修复可信的原始文件后重启。不要删除租约或历史记录来绕过错误 |
 
@@ -208,6 +230,8 @@ curl.exe --proxy http://127.0.0.1:10809 --head https://example.com
 .\xrayctl.exe --data-dir "D:\Xray Pilot Data" logs
 .\xrayctl.exe --data-dir "D:\Xray Pilot Data" operation REQUEST_ID
 ```
+
+底部状态栏显示消息摘要；长消息可点击 **完整消息** 滚动查看，并用 **复制完整消息** 保留全文。错误卡片中的详情和请求身份可独立展开查看。
 
 日志可能包含目标地址或认证信息，分享前请检查内容。
 
@@ -219,7 +243,7 @@ curl.exe --proxy http://127.0.0.1:10809 --head https://example.com
 
 Linux 可用于 Direct 模式、诊断及开发验证；Windows 的系统代理、托盘和登录自启能力尚未移植。详细进度见：
 
-- [当前遗留项](docs/phase0-2-backlog.md) 与 [C16 修复记录](docs/phase0-2-c16-closeout.md)
+- [当前遗留项](docs/phase0-2-backlog.md)
 - [实现状态](docs/implementation-status.md)
 - [源码构建、测试与高级诊断](docs/development.md)
 - [架构与设计](docs/Xray%20Windows%20Manager架构与实现设计.md)

@@ -22,22 +22,22 @@ pub fn edit(ui: &mut egui::Ui, value: &mut Value, section: &str) -> bool {
                 .get("tag")
                 .and_then(Value::as_str)
                 .or_else(|| entry.get("outboundTag").and_then(Value::as_str))
-                .unwrap_or("native entry")
+                .unwrap_or("原生条目")
                 .to_string();
             ui.push_id(index, |ui| {
+                ui.add(egui::Label::new(format!("{} · {label}", index + 1)).wrap());
                 ui.horizontal(|ui| {
-                    ui.label(format!("{} · {label}", index + 1));
-                    if ui.small_button("↑").clicked() && index > 0 {
+                    if ui.button("↑").clicked() && index > 0 {
                         action = Some((index, 0));
                     }
-                    if ui.small_button("↓").clicked() {
+                    if ui.button("↓").clicked() {
                         action = Some((index, 1));
                     }
-                    if ui.small_button("Delete entry").clicked() {
+                    if ui.button("删除条目").clicked() {
                         action = Some((index, 2));
                     }
                 });
-                egui::CollapsingHeader::new("Native fields")
+                egui::CollapsingHeader::new("原生字段")
                     .id_salt(index)
                     .show(ui, |ui| {
                         changed |= node(ui, entry, 0);
@@ -55,22 +55,36 @@ pub fn edit(ui: &mut egui::Ui, value: &mut Value, section: &str) -> bool {
             }
             changed = true;
         }
-        if ui.button("Add entry").clicked() {
-            array.push(match section{
-            "inbounds"=>json!({"tag":format!("in-{}",array.len()+1),"listen":"127.0.0.1","port":10810+array.len(),"protocol":"socks","settings":{"udp":true}}),
-            "outbounds"=>json!({"tag":format!("out-{}",array.len()+1),"protocol":"freedom","settings":{}}),
-            _=>json!({"type":"field","domain":["full:example.com"],"outboundTag":"direct"}),
-        });
+        if ui.button("添加条目").clicked() {
+            array.push(match section {
+                "inbounds" => json!({
+                    "tag": format!("in-{}", array.len() + 1),
+                    "listen": "127.0.0.1",
+                    "port": 10810 + array.len(),
+                    "protocol": "socks",
+                    "settings": {"udp": true}
+                }),
+                "outbounds" => json!({
+                    "tag": format!("out-{}", array.len() + 1),
+                    "protocol": "freedom",
+                    "settings": {}
+                }),
+                _ => json!({
+                    "type": "field",
+                    "domain": ["full:example.com"],
+                    "outboundTag": "direct"
+                }),
+            });
             changed = true;
         }
     } else {
-        ui.label("Section is not a native array. Use the raw JSON editor to repair it.");
+        ui.label("此字段不是原生数组，请在原始 JSON 中修正。");
     }
     changed
 }
 fn node(ui: &mut egui::Ui, v: &mut Value, depth: usize) -> bool {
     if depth > 12 {
-        ui.label("Use raw JSON for deeper objects");
+        ui.label("深层结构请使用原始 JSON 编辑");
         return false;
     }
     let mut changed = false;
@@ -84,7 +98,11 @@ fn node(ui: &mut egui::Ui, v: &mut Value, depth: usize) -> bool {
                         });
                     } else {
                         ui.horizontal(|ui| {
-                            ui.label(key);
+                            let width = 140.0_f32.min(ui.available_width() * 0.35);
+                            ui.add_sized(
+                                [width, crate::widgets::CONTROL_HEIGHT],
+                                egui::Label::new(key).wrap(),
+                            );
                             changed |= node(ui, value, depth + 1);
                         });
                     }
@@ -96,7 +114,7 @@ fn node(ui: &mut egui::Ui, v: &mut Value, depth: usize) -> bool {
             for (i, value) in a.iter_mut().enumerate() {
                 ui.push_id(i, |ui| {
                     ui.horizontal(|ui| {
-                        if ui.small_button("−").clicked() {
+                        if ui.button("−").clicked() {
                             remove = Some(i);
                         }
                         changed |= node(ui, value, depth + 1);
@@ -107,16 +125,22 @@ fn node(ui: &mut egui::Ui, v: &mut Value, depth: usize) -> bool {
                 a.remove(i);
                 changed = true;
             }
-            if ui.small_button("Add value").clicked() {
+            if ui.button("添加值").clicked() {
                 a.push(json!(""));
                 changed = true;
             }
         }
-        Value::String(s) => changed |= ui.text_edit_singleline(s).changed(),
+        Value::String(s) => {
+            changed |= ui
+                .add(crate::widgets::singleline(s, f32::INFINITY))
+                .changed()
+        }
         Value::Bool(b) => changed |= ui.checkbox(b, "").changed(),
         Value::Number(n) => {
             let mut text = n.to_string();
-            if ui.text_edit_singleline(&mut text).changed()
+            if ui
+                .add(crate::widgets::singleline(&mut text, f32::INFINITY))
+                .changed()
                 && let Ok(number) = text.parse::<serde_json::Number>()
             {
                 *n = number;
@@ -124,7 +148,7 @@ fn node(ui: &mut egui::Ui, v: &mut Value, depth: usize) -> bool {
             }
         }
         Value::Null => {
-            ui.label("null (edit in raw JSON)");
+            ui.label("null（可在原始 JSON 中编辑）");
         }
     }
     changed

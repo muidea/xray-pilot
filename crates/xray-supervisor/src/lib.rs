@@ -19,7 +19,8 @@ use windows_integration::{
     Lease, ProxyBackend, ProxyController, SystemProxy, SystemStartup, global,
 };
 use xray_config::{
-    Store, atomic_write, optional_json, parse_config, read_json, resources, valid_id, write_json,
+    Store, atomic_write, optional_json, parse_config, parse_document, read_json, resources,
+    valid_id, write_json,
 };
 use xray_model::*;
 use xray_runtime::{Logs, ManagedCore};
@@ -306,6 +307,30 @@ impl<B: ProxyBackend> Supervisor<B> {
         }
         Ok(generations.into_values().collect())
     }
+    fn runtime_config(&self, generation_id: &str) -> Result<RuntimeConfig> {
+        let generation = self
+            .generation
+            .as_ref()
+            .filter(|g| g.id == generation_id)
+            .ok_or_else(|| {
+                Error::new(
+                    "GENERATION_CONFLICT",
+                    "Refresh the runtime generation before reading its configuration",
+                )
+            })?;
+        let json = fs::read_to_string(&generation.candidate.config_path)?;
+        if hash(json.as_bytes()) != generation.candidate.revision {
+            return Err(Error::new(
+                "CONFIG_HASH_MISMATCH",
+                "Frozen runtime configuration changed",
+            ));
+        }
+        parse_config(json.as_bytes())?;
+        Ok(RuntimeConfig {
+            generation_id: generation.id.clone(),
+            json,
+        })
+    }
     pub async fn handle(&mut self, request: Request) -> Response {
         let request_id = request.request_id.clone();
         let result = self.dispatch(request).await;
@@ -337,6 +362,9 @@ impl<B: ProxyBackend> Supervisor<B> {
         let caller = self.caller();
         match &request.command {
             Command::GetStatus => return Ok(serde_json::to_value(self.status())?),
+            Command::GetRuntimeConfig { generation_id } => {
+                return Ok(serde_json::to_value(self.runtime_config(generation_id)?)?);
+            }
             Command::ListProfiles => return Ok(serde_json::to_value(self.store.profiles()?)?),
             Command::ListProfileSummaries { after, limit } => {
                 return Ok(serde_json::to_value(
@@ -391,6 +419,22 @@ impl<B: ProxyBackend> Supervisor<B> {
                 let profile = self.store.profile(profile_id)?;
                 return Ok(serde_json::to_value(xray_config::routing::simulate(
                     &parse_config(profile.json.as_bytes())?,
+                    context,
+                ))?);
+            }
+            Command::TestRunningRoute {
+                generation_id,
+                context,
+            } => {
+                if self.core.is_none() {
+                    return Err(Error::new(
+                        "CORE_NOT_RUNNING",
+                        "Start Core before testing the running configuration",
+                    ));
+                }
+                let config = self.runtime_config(generation_id)?;
+                return Ok(serde_json::to_value(xray_config::routing::simulate(
+                    &parse_config(config.json.as_bytes())?,
                     context,
                 ))?);
             }
@@ -511,7 +555,7 @@ impl<B: ProxyBackend> Supervisor<B> {
                 )
             }
             Command::CreateProfile { profile_id, json } => {
-                parse_config(json.as_bytes())?;
+                parse_document(json.as_bytes())?;
                 let path = self.store.profile_path(profile_id)?;
                 if path.exists() {
                     return Err(Error::new("PROFILE_EXISTS", "Profile already exists"));

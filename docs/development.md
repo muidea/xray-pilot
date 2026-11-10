@@ -4,7 +4,7 @@
 
 ## 从源码构建
 
-以下命令均从仓库根目录运行。使用 Rust 1.94（当前本机验证版本及 CI 配置版本）。Windows 推荐安装 Visual Studio C++ Build Tools 及 Windows SDK，使用 MSVC 工具链；本机也完成了 Windows GNU 构建和原生验证，远端 MSVC CI 尚待验收。
+以下命令均从仓库根目录运行。使用 Rust 1.94（当前本机验证版本及 CI 配置版本）。Windows 推荐安装 Visual Studio C++ Build Tools 及 Windows SDK，使用 MSVC 工具链；本机也完成了 Windows GNU 构建和原生验证。已发布 rc.3 的远端 MSVC CI 已通过，本文新界面源码须在提交后单独确认远端 CI 结果。
 
 ```powershell
 cargo build --release --workspace --locked
@@ -12,6 +12,8 @@ cargo build --release --workspace --locked
 ```
 
 Linux GUI 需要图形桌面；系统代理、托盘、文件选择器和登录自启仅实现 Windows 版本。
+
+当前源码已实现用户确认的五页原生界面，流程、草稿资料及新增只读接口见 [界面实现说明](ui-implementation.md)。已发布 rc.3 仍为旧界面，复测新界面请构建当前源码。
 
 ```bash
 cargo run -p xray-manager-app -- --data-dir /absolute/path/to/data
@@ -45,6 +47,8 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked -- --test-threads=4
 ```
 
+GUI 回归默认不生成截图文件。需要复核真实 egui 图元与字体图集时，将测试进程的 `XRAY_UI_CAPTURE_DIR` 指向 `target/ui-captures` 再运行 `cargo test -p xray-manager-app --locked -- --test-threads=4`；PowerShell 可先设置 `$env:XRAY_UI_CAPTURE_DIR = "target/ui-captures"`，完成后运行 `Remove-Item Env:XRAY_UI_CAPTURE_DIR`。输出的 JSON 网格和 RGBA 字体图集属于本地产物，保存在已忽略的 `target/`，不随源码提交。无窗口图元回归不能替代完整原生桌面交互验收。
+
 官方 Core 冒烟测试默认忽略，可选择已有 Core，或运行仅用于开发测试的下载脚本（核对官方 `.dgst` 中 SHA-256）：
 
 ```bash
@@ -53,6 +57,15 @@ XRAY_TEST_CORE=/tmp/xray-test-core/xray cargo test -p xray-supervisor --test rea
 ```
 
 Windows PowerShell 设置 `$env:XRAY_TEST_CORE = "C:\path\to\xray.exe"` 后执行同一测试命令。测试使用模拟系统代理，不修改本机 WinINet 设置。CI 包含 Linux / Windows 构建、回归和官方 Core 冒烟；Windows 原生 Core、Named Pipe、Job 清理及 GUI 关闭/重开已验证；计划任务的创建、外部修改保护及幂等禁用也已验证；真实 WinINet、托盘菜单全部交互、实际登录启动与权限拒绝仍需进一步验收。
+
+API 内部出站的导入 / 冻结 / 官方 Core 校验专项：
+
+```powershell
+$env:XRAY_TEST_CORE = "C:\Tools\Xray\xray.exe"
+cargo test -p xray-supervisor --test config_import --locked -- --ignored
+```
+
+默认使用合成 API 配置，只导入并校验，不启动 Core。可选设置 `XRAY_TEST_CONFIG` 为待核对的原生配置文件，测试只读该文件，使用独立临时数据目录和模拟代理；断言不输出配置内容和 Core 错误正文，避免扩散认证信息。Linux 同样支持这两个环境变量。CI 显式运行合成配置的官方 Core 专项；常规 `config_import` 回归另外覆盖不完整配置原文保存、请求去重及运行检查拒绝。
 
 在 Windows 上可复测真实 Core、IPC、Job 强制退出清理和 GUI 生命周期（使用隔离数据目录与 Direct 模式）：
 
@@ -91,6 +104,14 @@ python scripts/package-windows.py --binary-dir target/release
 ```
 
 输出位于 dist：版本命名的 Windows x64 zip 以及 SHA256SUMS。包内包含三个程序、README、版本及源码提交标识、文档、示例和 Windows 验证脚本；不包含 Core 或用户数据。脚本会逐文件核对压缩包内容。正式发布前应使用干净的、与构建输入相同的源码提交，脚本将当前 HEAD 写入 VERSION.txt。
+
+仅提供本地验证时，可显式打包尚未提交的当前源码；先构建，再执行：
+
+```powershell
+python scripts/package-windows.py --binary-dir target/release --validation
+```
+
+验证包与其他版本包一样直接放在 dist 目录，使用独立的 `ui-validation-时间戳` 文件名，附中文验证说明与源码文件指纹清单，VERSION.txt 标明本地验证和源码修改状态，不覆盖既有发布包。包内 `验证说明.md` 来自 [验证指南](validation-guide.md)，修改验证步骤时维护此文档。SHA256SUMS 汇总同目录中的所有 zip。Windows GNU 交叉构建时将 `--binary-dir` 改为 `target/x86_64-pc-windows-gnu/release`。此模式不提交源码、不创建标签，也不上传发布。
 
 自动依赖部署与完整性/修复验收：
 

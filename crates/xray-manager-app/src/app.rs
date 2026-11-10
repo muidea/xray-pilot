@@ -7,6 +7,10 @@ use std::{
 };
 use xray_model::*;
 
+#[path = "ui.rs"]
+mod ui;
+use ui::{Page, UiState};
+
 const MAX_PENDING: usize = 32;
 #[derive(Clone, PartialEq, Eq)]
 struct EditorContext {
@@ -19,13 +23,15 @@ struct EditorContext {
     assets: String,
     mode: ProxyMode,
     http_tag: String,
+    validation_epoch: u64,
+    runtime_generation: Option<String>,
+    supervisor_epoch: Option<String>,
 }
 impl EditorContext {
     fn same_draft(&self, other: &Self) -> bool {
         self.epoch == other.epoch
             && self.selected == other.selected
             && self.profile == other.profile
-            && self.revision == other.revision
             && self.json_hash == other.json_hash
     }
 }
@@ -34,6 +40,7 @@ struct SettingsContext {
     epoch: u64,
     edit_epoch: u64,
     core: String,
+    assets: String,
     start_on_logon: bool,
     connect_on_start: bool,
 }
@@ -41,6 +48,8 @@ struct Pending {
     context: EditorContext,
     settings_context: Option<SettingsContext>,
     poll: Option<&'static str>,
+    submitted_json: Option<String>,
+    asset_root: String,
 }
 struct DependencyJob {
     response: mpsc::Receiver<Result<crate::dependencies::Report>>,
@@ -73,8 +82,7 @@ pub struct App {
     logs: Vec<String>,
     busy: bool,
     last_poll: Instant,
-    tab: usize,
-    new_profile: String,
+    ui: UiState,
     settings: Settings,
     settings_epoch: u64,
     settings_edit_epoch: u64,
@@ -93,8 +101,6 @@ pub struct App {
     shutdown_requested: bool,
     wakeup: Option<crate::wakeup::Wakeup>,
     history: Vec<Generation>,
-    native_section: String,
-    raw_json: bool,
     failed_request: Option<String>,
     #[cfg(windows)]
     tray: Option<crate::tray::Tray>,
@@ -153,7 +159,7 @@ impl App {
                             }
                             Response {
                                 request_id: request.request_id,
-                                result: Err(e),
+                                result: Err(Error::new("CONNECTION_LOST", e.to_string())),
                             }
                         }
                     };
@@ -165,12 +171,21 @@ impl App {
         });
         let mut app = Self::with_channels(root, tx, rx);
         app.wakeup = Some(wakeup.clone());
+        app.ui.persistence = true;
         app.dependency_repaint = Some(cc.egui_ctx.clone());
         match crate::preferences::Appearance::load(&app.root) {
             Ok(appearance) => app.appearance = appearance,
-            Err(error) => app.message = format!("Appearance could not be loaded: {error}"),
+            Err(error) => app.message = format!("无法读取外观设置：{error}"),
         }
         app.appearance.apply(&cc.egui_ctx);
+        ui::configure(&cc.egui_ctx);
+        match crate::workspace::Workspace::load(&app.root) {
+            Ok(workspace) => app.ui.workspace = workspace,
+            Err(error) => {
+                app.ui.workspace_valid = false;
+                app.message = format!("界面资料无法读取，原文件已保留：{error}");
+            }
+        }
         #[cfg(windows)]
         {
             app.tray = crate::tray::Tray::new(wakeup).ok();
@@ -209,12 +224,11 @@ impl App {
             asset_root: root.display().to_string(),
             mode: ProxyMode::Direct,
             http_tag: "http-in".into(),
-            message: "Connecting to Supervisor…".into(),
+            message: "正在连接后台…".into(),
             logs: vec![],
             busy: false,
             last_poll: Instant::now(),
-            tab: 0,
-            new_profile: "default".into(),
+            ui: UiState::default(),
             settings: Settings::default(),
             settings_epoch: 0,
             settings_edit_epoch: 0,
@@ -233,8 +247,6 @@ impl App {
             shutdown_requested: false,
             wakeup: None,
             history: vec![],
-            native_section: "inbounds".into(),
-            raw_json: true,
             failed_request: None,
             #[cfg(windows)]
             tray: None,
@@ -251,9 +263,17 @@ impl App {
             assets: self.asset_root.clone(),
             mode: self.mode,
             http_tag: self.http_tag.clone(),
+            validation_epoch: self.ui.validation_epoch,
+            runtime_generation: self
+                .status
+                .as_ref()
+                .and_then(|s| s.generation.as_ref().map(|g| g.id.clone())),
+            supervisor_epoch: self.status.as_ref().map(|s| s.supervisor_epoch.clone()),
         }
     }
     fn invalidate_candidate(&mut self) {
+        self.ui.validation_epoch = self.ui.validation_epoch.wrapping_add(1);
+        self.ui.preview_open = false;
         self.candidate = None;
         self.candidate_context = None;
         self.confirm_apply = false;
@@ -263,12 +283,14 @@ impl App {
             epoch: self.settings_epoch,
             edit_epoch: self.settings_edit_epoch,
             core: self.core_path.clone(),
+            assets: self.asset_root.clone(),
             start_on_logon: self.settings.start_on_logon,
             connect_on_start: self.settings.connect_on_start,
         }
     }
     fn settings_edited(&mut self) {
         self.settings_edit_epoch = self.settings_edit_epoch.wrapping_add(1);
+        self.invalidate_candidate();
     }
     fn candidate_matches(&self) -> bool {
         self.candidate.as_ref().is_some_and(|c| {
@@ -288,9 +310,10 @@ impl App {
             self.candidate_context = Some(self.context());
             self.candidate = Some(c);
             self.confirm_apply = true;
+            self.ui.preview_open = true;
         } else {
             self.invalidate_candidate();
-            self.message = "Candidate does not match the current draft; validate again".into();
+            self.message = "候选与当前草稿不一致，请重新检查".into();
         }
     }
     fn refresh_profiles(&mut self) {
@@ -301,8 +324,20 @@ impl App {
     }
     fn send(&mut self, command: Command) {
         if command.is_write() && self.busy {
-            self.message = "Wait for the current operation to finish".into();
+            self.message = "请等待当前操作完成".into();
             return;
+        }
+        if command.is_write() {
+            let safe_stop = matches!(command, Command::StopCore | Command::Shutdown);
+            if !self.ui.connected
+                || self.ui.uncertain.is_some()
+                || (!safe_stop
+                    && (self.shutdown_requested
+                        || self.status.as_ref().is_some_and(|s| s.recovery_required)))
+            {
+                self.message = self.write_blocker().unwrap_or("当前状态暂不能变更").into();
+                return;
+            }
         }
         if let Command::ApplyProfile {
             candidate_id,
@@ -320,35 +355,45 @@ impl App {
                 && *http_inbound_tag == self.http_tag;
             if !matches {
                 self.invalidate_candidate();
-                self.message = "Draft or validation context changed; validate again".into();
+                self.message = "草稿或检查上下文已变化，请重新检查".into();
                 return;
             }
         }
         if matches!(command, Command::ValidateDraft { .. })
-            && self.selected_profile != self.profile_id
+            && (self.selected_profile != self.profile_id || self.has_draft_conflict())
         {
-            self.message = "Wait for the selected profile to load".into();
+            self.message = "请等待读取配置，或先处理草稿冲突".into();
+            return;
+        }
+        if matches!(command, Command::SetProxyMode { .. }) && !self.is_running() {
+            self.message = "请先启动 Core，再切换系统代理接管方式。".into();
             return;
         }
         let poll = match command {
             Command::GetStatus => Some("status"),
             Command::GetLogs => Some("logs"),
+            Command::ListProfileSummaries { .. } => Some("profiles"),
+            Command::GetRuntimeConfig { .. } => Some("runtime"),
             _ => None,
         };
         if poll.is_some() && self.pending.values().any(|p| p.poll == poll) {
             return;
         }
         if self.pending.len() >= MAX_PENDING {
-            self.message = "Request queue is full; wait for pending operations".into();
+            self.message = "请求队列已满，请等待当前操作完成".into();
             return;
         }
         if let Command::GetProfile { profile_id } = &command {
+            self.stash_draft();
             self.selected_profile = profile_id.clone();
             self.view_epoch = self.view_epoch.wrapping_add(1);
             self.invalidate_candidate();
         }
         let context = self.context();
+        let submitted_json =
+            matches!(command, Command::ApplyProfile { .. }).then(|| self.editor.clone());
         let write = command.is_write();
+        let operation_label = ui::command_name(&command);
         let settings_read = matches!(command, Command::GetSettings);
         let settings_write = matches!(command, Command::SaveSettings { .. });
         let request = Request::new(
@@ -367,19 +412,28 @@ impl App {
                     self.settings_edited();
                 }
                 let settings_context = settings_read.then(|| self.settings_context());
+                if write {
+                    self.add_event(
+                        "信息",
+                        format!("已提交{operation_label}"),
+                        request_id.clone(),
+                    );
+                }
                 self.pending.insert(
                     request_id,
                     Pending {
                         context,
                         settings_context,
                         poll,
+                        submitted_json,
+                        asset_root: self.asset_root.clone(),
                     },
                 );
                 if write {
                     self.busy = true;
                 }
             }
-            Err(error) => self.message = format!("Request was not sent: {error}"),
+            Err(error) => self.message = format!("请求未发送：{error}"),
         }
     }
     fn receive(&mut self) {
@@ -414,36 +468,109 @@ impl App {
                     // The latest load was superseded by editing. Keep the visible selection
                     // attached to the draft that was preserved, rather than a discarded load.
                     self.selected_profile = self.profile_id.clone();
-                    self.message =
-                        "Draft changed while loading; current edits were preserved".into();
+                    self.message = "载入期间草稿已变化，已保留当前编辑".into();
                 }
                 if command.is_write() {
-                    self.message =
-                        "Draft or selection changed; validate the current draft again".into();
+                    self.message = "草稿或编辑对象已变化，请重新检查当前草稿".into();
                 }
                 continue;
             }
             match response.result {
                 Err(error) => {
+                    if command.is_write()
+                        && matches!(
+                            error.code.as_str(),
+                            "CONNECTION_LOST"
+                                | "IPC_TIMEOUT"
+                                | "IPC_MESSAGE_TOO_LARGE"
+                                | "OPERATION_IN_PROGRESS"
+                                | "OPERATION_RECOVERY_REQUIRED"
+                        )
+                    {
+                        self.ui.uncertain = Some(ui::Uncertain {
+                            request_id: response.request_id.clone(),
+                            command: command.clone(),
+                            json: pending.submitted_json.clone(),
+                            profile: pending.context.profile.clone(),
+                            assets: pending.asset_root.clone(),
+                        });
+                    }
+                    if error.code == "CONNECTION_LOST" {
+                        self.ui.connected = false;
+                    }
+                    self.fail(error.clone(), response.request_id.clone());
+                    if matches!(command, Command::GetProfile { .. })
+                        && pending.context.epoch == self.view_epoch
+                    {
+                        self.selected_profile = self.profile_id.clone();
+                    }
                     if matches!(command, Command::Shutdown) {
                         self.shutdown_requested = false;
                         if let Some(wakeup) = &self.wakeup {
                             wakeup.reveal();
                         }
                     }
-                    self.message = format!("{} (request ID: {})", error, response.request_id);
+                    self.message = format!("{} 请求：{}", self.message, response.request_id);
                     if command.is_write() {
                         self.failed_request = Some(response.request_id);
                         self.send(Command::GetStatus);
                     }
                     if matches!(command, Command::GetStatus) {
-                        self.status = None;
+                        self.ui.connected = false;
                     }
                 }
                 Ok(value) => match command {
                     Command::GetStatus => {
                         if let Ok(status) = serde_json::from_value::<Status>(value) {
+                            let old_identity = self.status.as_ref().map(|s| {
+                                (&s.supervisor_epoch, s.generation.as_ref().map(|g| &g.id))
+                            });
+                            let new_identity = Some((
+                                &status.supervisor_epoch,
+                                status.generation.as_ref().map(|g| &g.id),
+                            ));
+                            if old_identity != new_identity {
+                                self.invalidate_candidate();
+                                self.ui.route_tested = None;
+                                self.route_result.clear();
+                            }
+                            self.connection_restored();
+                            if !self.ui.settings_loaded
+                                && !self.pending.values().any(|p| p.settings_context.is_some())
+                            {
+                                self.send(Command::GetSettings);
+                            }
+                            if !self.ui.profiles_loaded
+                                && !self.pending.values().any(|p| p.poll == Some("profiles"))
+                            {
+                                self.refresh_profiles();
+                            }
+                            let generation = status.generation.as_ref().map(|g| g.id.clone());
                             self.status = Some(status);
+                            if let Some(generation_id) = generation {
+                                if self
+                                    .ui
+                                    .runtime
+                                    .as_ref()
+                                    .is_none_or(|r| r.generation_id != generation_id)
+                                {
+                                    self.send(Command::GetRuntimeConfig { generation_id });
+                                }
+                            } else {
+                                self.ui.runtime = None;
+                            }
+                        }
+                    }
+                    Command::GetRuntimeConfig { generation_id } => {
+                        if self
+                            .status
+                            .as_ref()
+                            .and_then(|s| s.generation.as_ref())
+                            .is_some_and(|g| g.id == generation_id)
+                            && let Ok(config) = serde_json::from_value::<RuntimeConfig>(value)
+                            && config.generation_id == generation_id
+                        {
+                            self.ui.runtime = Some(config);
                         }
                     }
                     Command::ListProfileSummaries { after, .. } => {
@@ -452,8 +579,10 @@ impl App {
                                 self.profiles.clear();
                             }
                             self.profiles.extend(page.items);
+                            self.ui.profiles_loaded = page.next_after.is_none();
                             if after.is_none()
                                 && self.profile_id.is_empty()
+                                && self.selected_profile.is_empty()
                                 && let Some(p) = self.profiles.first()
                             {
                                 self.send(Command::GetProfile {
@@ -477,73 +606,108 @@ impl App {
                         self.history = serde_json::from_value(value).unwrap_or_default()
                     }
                     Command::StageHistory { .. } => {
-                        if let (Some(json), Some(c)) = (
-                            value.get("json").and_then(|v| v.as_str()),
-                            value.get("candidate").cloned(),
-                        ) {
+                        if let Some(json) = value.get("json").and_then(|v| v.as_str()) {
                             self.editor = json.into();
-                            if let Ok(c) = serde_json::from_value(c) {
-                                self.accept_candidate(c);
-                            }
+                            self.draft_edited();
                             self.message =
-                                "Historical snapshot staged; review the diff before applying"
-                                    .into();
+                                "历史已载入为草稿，请使用当前 Core 重新检查并预览。".into();
                         }
                     }
                     Command::GetSettings => {
                         if let Ok(s) = serde_json::from_value::<Settings>(value) {
                             self.core_path = s.core_path.display().to_string();
+                            self.asset_root = self
+                                .ui
+                                .workspace
+                                .asset_roots
+                                .get(&self.core_path)
+                                .cloned()
+                                .unwrap_or_else(|| {
+                                    s.core_path
+                                        .parent()
+                                        .filter(|p| !p.as_os_str().is_empty())
+                                        .unwrap_or(&self.root)
+                                        .display()
+                                        .to_string()
+                                });
+                            self.ui.saved_settings = Some(s.clone());
+                            self.ui.settings_loaded = true;
                             self.settings = s;
-                            if self.core_path.is_empty() && self.editor.is_empty() {
-                                self.tab = 1;
-                            }
+
                             self.start_dependencies("Status", "", None);
                         }
                     }
                     Command::ValidateDraft { .. } => {
                         if let Ok(c) = serde_json::from_value::<Candidate>(value) {
-                            self.message = format!("Core validation passed: {}", c.core.version);
+                            self.message = format!("Core 配置校验通过：{}", c.core.version);
                             self.accept_candidate(c);
                         }
                     }
-                    Command::GetOperation { .. } => {
-                        self.message = serde_json::to_string_pretty(&value).unwrap_or_default();
+                    Command::GetOperation { request_id } => {
+                        self.resolve_operation(&request_id, value);
                     }
-                    Command::DeleteProfile { .. } => {
-                        self.profile_id.clear();
-                        self.editor.clear();
-                        self.saved_json.clear();
-                        self.revision.clear();
-                        self.selected_profile.clear();
-                        self.view_epoch = self.view_epoch.wrapping_add(1);
-                        self.invalidate_candidate();
-                        self.refresh_profiles();
-                    }
+                    Command::DeleteProfile { profile_id, .. } => self.profile_deleted(&profile_id),
                     Command::GetLogs => {
                         self.logs = serde_json::from_value(value).unwrap_or_default()
                     }
                     Command::TestRoute { .. } => {
                         self.route_result = serde_json::to_string_pretty(&value).unwrap_or_default()
                     }
+                    Command::TestRunningRoute {
+                        generation_id,
+                        context,
+                    } => {
+                        if self
+                            .status
+                            .as_ref()
+                            .and_then(|s| s.generation.as_ref())
+                            .is_some_and(|g| g.id == generation_id)
+                        {
+                            self.ui.route_tested = Some((generation_id, context));
+                            self.route_result =
+                                serde_json::to_string_pretty(&value).unwrap_or_default();
+                        }
+                    }
                     Command::Shutdown => self.exit = true,
                     Command::CreateProfile { .. } => {
                         if let Ok(profile) = serde_json::from_value(value) {
-                            self.load(profile);
+                            self.imported_profile(profile);
                         }
-                        self.message = "Profile created".into();
                         self.refresh_profiles();
                     }
                     Command::ApplyProfile { .. } => {
-                        self.message = "Configuration applied".into();
+                        self.applied_draft(
+                            &pending.context.profile,
+                            pending.submitted_json.as_deref(),
+                        );
+                        self.ui.failure = None;
+                        self.ui.onboarding = false;
+                        self.add_event("信息", "配置已应用", response.request_id.clone());
+                        self.message = "配置已应用，正在读取最新运行状态。".into();
                         self.invalidate_candidate();
                         self.send(Command::GetStatus);
                         self.refresh_profiles();
-                        self.send(Command::GetProfile {
-                            profile_id: self.profile_id.clone(),
-                        });
+                        if self.selected_profile == pending.context.profile {
+                            self.send(Command::GetProfile {
+                                profile_id: self.profile_id.clone(),
+                            });
+                        }
+                    }
+                    Command::SaveSettings { settings } => {
+                        self.ui.saved_settings = Some(settings.clone());
+                        self.ui
+                            .workspace
+                            .asset_roots
+                            .insert(settings.core_path.display().to_string(), pending.asset_root);
+                        self.save_workspace();
+                        self.ui.settings_loaded = true;
+                        self.finish_setup_save(&settings);
+                        self.message = "设置已保存；运行中的 Core 保持原版本。".into();
+                        self.add_event("信息", "设置已保存", response.request_id);
+                        self.send(Command::GetStatus);
                     }
                     _ => {
-                        self.message = "Operation completed".into();
+                        self.message = "操作已完成，正在刷新状态".into();
                         self.send(Command::GetStatus);
                     }
                 },
@@ -551,333 +715,19 @@ impl App {
         }
     }
     fn load(&mut self, p: Profile) {
+        self.stash_draft();
         self.view_epoch = self.view_epoch.wrapping_add(1);
         self.selected_profile = p.id.clone();
         self.profile_id = p.id;
         self.saved_json = p.json.clone();
         self.editor = p.json;
         self.revision = p.revision;
+        self.restore_draft();
         self.invalidate_candidate();
         self.history.clear();
         self.send(Command::ListHistory {
             profile_id: self.profile_id.clone(),
         });
-    }
-    fn editor(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label("Profile");
-            let mut selected = self.selected_profile.clone();
-            egui::ComboBox::from_id_salt("profiles")
-                .selected_text(&selected)
-                .show_ui(ui, |ui| {
-                    for p in &self.profiles {
-                        ui.selectable_value(&mut selected, p.id.clone(), &p.id);
-                    }
-                });
-            if selected != self.selected_profile {
-                self.send(Command::GetProfile {
-                    profile_id: selected,
-                });
-            }
-            if ui.button("Reload").clicked() && !self.profile_id.is_empty() {
-                self.send(Command::GetProfile {
-                    profile_id: self.profile_id.clone(),
-                });
-            }
-            if ui.button("Export JSON…").clicked() {
-                #[cfg(windows)]
-                if let Some(path) = rfd::FileDialog::new()
-                    .set_file_name("config.json")
-                    .save_file()
-                {
-                    self.message = match std::fs::write(path, &self.editor) {
-                        Ok(_) => "Exported; file contains credentials".into(),
-                        Err(e) => e.to_string(),
-                    };
-                }
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.text_edit_singleline(&mut self.new_profile);
-            if ui.button("Create").clicked() {
-                self.send(Command::CreateProfile {
-                    profile_id: self.new_profile.clone(),
-                    json: default_config(),
-                });
-            }
-            if ui.button("Import JSON…").clicked() {
-                #[cfg(windows)]
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("JSON", &["json"])
-                    .pick_file()
-                {
-                    match std::fs::read_to_string(&path) {
-                        Ok(json) => {
-                            self.asset_root =
-                                path.parent().unwrap_or(&self.root).display().to_string();
-                            self.send(Command::CreateProfile {
-                                profile_id: self.new_profile.clone(),
-                                json,
-                            });
-                        }
-                        Err(e) => self.message = e.to_string(),
-                    }
-                }
-            }
-            if ui.button("Duplicate").clicked() {
-                self.send(Command::CreateProfile {
-                    profile_id: self.new_profile.clone(),
-                    json: self.editor.clone(),
-                });
-            }
-            if ui.button("Delete").clicked() && !self.profile_id.is_empty() {
-                self.send(Command::DeleteProfile {
-                    profile_id: self.profile_id.clone(),
-                    expected_revision: self.revision.clone(),
-                });
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.label("HTTP inbound tag");
-            ui.text_edit_singleline(&mut self.http_tag);
-            egui::ComboBox::from_label("Proxy mode")
-                .selected_text(format!("{:?}", self.mode))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.mode,
-                        ProxyMode::Direct,
-                        "Direct (release ownership)",
-                    );
-                    ui.selectable_value(&mut self.mode, ProxyMode::Global, "Global");
-                });
-        });
-        ui.label("Native JSON — unknown fields and rule order are preserved. Changes require validation and explicit apply.");
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.raw_json, true, "Raw JSON");
-            ui.selectable_value(&mut self.raw_json, false, "Structured fields");
-            if !self.raw_json {
-                for section in ["inbounds", "outbounds", "rules"] {
-                    ui.selectable_value(&mut self.native_section, section.into(), section);
-                }
-            }
-        });
-        let changed = egui::ScrollArea::vertical()
-            .max_height(350.0)
-            .show(ui, |ui| {
-                if self.raw_json {
-                    ui.add(
-                        egui::TextEdit::multiline(&mut self.editor)
-                            .code_editor()
-                            .desired_width(f32::INFINITY)
-                            .desired_rows(20),
-                    )
-                    .changed()
-                } else if let Ok(mut value) = serde_json::from_str(&self.editor) {
-                    let changed = crate::native_editor::edit(ui, &mut value, &self.native_section);
-                    if changed {
-                        self.editor = serde_json::to_string_pretty(&value).unwrap();
-                    }
-                    changed
-                } else {
-                    ui.label("Repair JSON syntax in the raw editor first.");
-                    false
-                }
-            })
-            .inner;
-        if changed {
-            self.invalidate_candidate();
-        }
-        if ui
-            .add_enabled(
-                !self.busy && !self.profile_id.is_empty(),
-                egui::Button::new("Validate candidate / preview changes"),
-            )
-            .clicked()
-        {
-            self.send(Command::ValidateDraft {
-                profile_id: self.profile_id.clone(),
-                expected_revision: self.revision.clone(),
-                json: self.editor.clone(),
-                core_path: self.core_path.clone().into(),
-                asset_root: self.asset_root.clone().into(),
-            });
-        }
-        if let Some(candidate) = self.candidate.clone() {
-            ui.label(format!(
-                "Validated with {} · resource files: {}",
-                candidate.core.version,
-                candidate.resources.files.len()
-            ));
-            for note in &candidate.resources.notes {
-                ui.colored_label(ui.visuals().warn_fg_color, note);
-            }
-            egui::CollapsingHeader::new("Changes from saved JSON").show(ui, |ui| {
-                let old = self.saved_json.as_str();
-                for line in diff_lines(old, &self.editor) {
-                    ui.monospace(line);
-                }
-            });
-            if self.confirm_apply
-                && self.candidate_matches()
-                && ui
-                    .add_enabled(
-                        !self.busy,
-                        egui::Button::new("Apply validated configuration"),
-                    )
-                    .clicked()
-            {
-                self.send(Command::ApplyProfile {
-                    candidate_id: candidate.id,
-                    candidate_digest: candidate.digest,
-                    proxy_mode: self.mode,
-                    http_inbound_tag: self.http_tag.clone(),
-                });
-            }
-        }
-        egui::CollapsingHeader::new("Committed snapshots / rollback").show(ui, |ui| {
-            for g in self.history.clone() {
-                ui.horizontal(|ui| {
-                    ui.monospace(format!("{} · {}", &g.id[..8], &g.candidate.revision[..12]));
-                    if ui.button("Preview this snapshot").clicked() {
-                        self.send(Command::StageHistory {
-                            generation_id: g.id,
-                            expected_revision: self.revision.clone(),
-                        });
-                    }
-                });
-            }
-        });
-    }
-    fn settings(&mut self, ui: &mut egui::Ui) {
-        let before = self.settings_context();
-        let previous_appearance = self.appearance;
-        egui::ComboBox::from_label("Appearance")
-            .selected_text(match self.appearance {
-                crate::preferences::Appearance::System => "Follow system",
-                crate::preferences::Appearance::Light => "Light",
-                crate::preferences::Appearance::Dark => "Dark",
-            })
-            .show_ui(ui, |ui| {
-                ui.selectable_value(
-                    &mut self.appearance,
-                    crate::preferences::Appearance::System,
-                    "Follow system",
-                );
-                ui.selectable_value(
-                    &mut self.appearance,
-                    crate::preferences::Appearance::Light,
-                    "Light",
-                );
-                ui.selectable_value(
-                    &mut self.appearance,
-                    crate::preferences::Appearance::Dark,
-                    "Dark",
-                );
-            });
-        if self.appearance != previous_appearance {
-            self.appearance.apply(ui.ctx());
-            if let Err(error) = self.appearance.save(&self.root) {
-                self.message = format!("Appearance changed but could not be saved: {error}");
-            }
-        }
-        ui.separator();
-        ui.heading("Managed Xray dependencies");
-        ui.label("Download official Xray Core, geoip.dat and geosite.dat. Existing running configurations keep their frozen dependencies.");
-        if !cfg!(windows) {
-            ui.label("Managed installation is available on Windows x64. Select an official Core manually on this platform.");
-        }
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Official version");
-            ui.text_edit_singleline(&mut self.dependency_version);
-            if ui
-                .add_enabled(
-                    cfg!(windows) && self.dependency_job.is_none(),
-                    egui::Button::new("Download / repair official Core"),
-                )
-                .clicked()
-            {
-                self.start_dependencies("Install", "", Some(ui.ctx().clone()));
-            }
-            if ui
-                .add_enabled(
-                    cfg!(windows) && self.dependency_job.is_none(),
-                    egui::Button::new("Check installed dependencies"),
-                )
-                .clicked()
-            {
-                self.start_dependencies("Status", "", Some(ui.ctx().clone()));
-            }
-        });
-        if self.dependency_job.is_some() {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label("Checking or downloading dependencies; this may take a few minutes…");
-            });
-        }
-        ui.label(&self.dependency_message);
-        for installation in self.dependency_report.installations.clone() {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(format!(
-                    "{} · {}",
-                    installation.version,
-                    if installation.valid {
-                        "Verified"
-                    } else {
-                        "Needs repair"
-                    }
-                ));
-                if let Some(error) = &installation.error {
-                    ui.label(error);
-                }
-                if ui
-                    .add_enabled(
-                        cfg!(windows) && installation.valid && self.dependency_job.is_none(),
-                        egui::Button::new("Use this version"),
-                    )
-                    .clicked()
-                {
-                    self.dependency_version = installation.version;
-                    self.start_dependencies(
-                        "Select",
-                        &installation.install_id,
-                        Some(ui.ctx().clone()),
-                    );
-                }
-            });
-        }
-        ui.separator();
-        ui.label("Official Xray Core executable (absolute path)");
-        ui.text_edit_singleline(&mut self.core_path);
-        if ui.button("Choose Core…").clicked() {
-            #[cfg(windows)]
-            if let Some(path) = rfd::FileDialog::new()
-                .add_filter("Executable", &["exe"])
-                .pick_file()
-            {
-                self.core_path = path.display().to_string();
-                if let Some(parent) = path.parent() {
-                    self.asset_root = parent.display().to_string();
-                }
-            }
-        }
-        ui.label("Resource directory for relative certificate paths and geo data");
-        ui.text_edit_singleline(&mut self.asset_root);
-        ui.checkbox(&mut self.settings.start_on_logon, "Start on Windows login");
-        ui.checkbox(
-            &mut self.settings.connect_on_start,
-            "Connect on Supervisor startup",
-        );
-        if before != self.settings_context() {
-            self.settings_edited();
-        }
-        if ui.button("Save settings").clicked() {
-            self.settings.core_path = self.core_path.clone().into();
-            self.send(Command::SaveSettings {
-                settings: self.settings.clone(),
-            });
-        }
-        ui.label(format!("Data directory: {}", self.root.display()));
-        ui.label("Phase 0–2: native profiles, runtime transactions and Windows system proxy. PAC and TUN are not enabled in this release.");
     }
     fn start_dependencies(
         &mut self,
@@ -930,17 +780,18 @@ impl App {
                         self.settings_edited();
                         self.invalidate_candidate();
                         self.dependency_message = format!(
-                            "{} verified and selected. Save settings, then validate your configuration.",
+                            "{} 已验证并选用。请保存设置，再检查并应用配置。",
                             bundle.version
                         );
                     } else {
                         self.dependency_message = format!(
-                            "{} verified. Current settings were preserved; use a verified version when ready.",
+                            "{} 已验证，已保留期间的新设置。需要时可选用该版本。",
                             bundle.version
                         );
                     }
                 } else {
-                    self.dependency_message = "No verified current bundle. Download / repair official Core to prepare dependencies.".into();
+                    self.dependency_message =
+                        "当前没有已验证的受管版本，请下载安装官方依赖或手动选择已有 Core。".into();
                 }
                 self.dependency_report = report;
             }
@@ -954,30 +805,55 @@ impl App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
-            "exit-gui" => self.exit = true,
-            "quit" => self.shutdown_requested = true,
+            "exit-gui" => {
+                if !self.busy && !self.shutdown_requested && self.ui.uncertain.is_none() {
+                    self.stash_draft();
+                    self.exit = true;
+                }
+            }
+            "quit" => {
+                self.shutdown_requested = true;
+                if (!self.ui.connected || self.ui.uncertain.is_some())
+                    && let Some(wakeup) = &self.wakeup
+                {
+                    wakeup.reveal();
+                }
+            }
             _ if self.shutdown_requested => {}
             "stop" => self.send(Command::StopCore),
-            "start" => self.send(Command::RestartCore),
+            "start" => {
+                if self.committed_id().is_some() {
+                    self.send(Command::RestartCore);
+                } else {
+                    self.ui.page = Page::Profiles;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                }
+            }
             "direct" => self.send(Command::SetProxyMode {
                 mode: ProxyMode::Direct,
-                http_inbound_tag: self.http_tag.clone(),
+                http_inbound_tag: self.runtime_http_tag(),
             }),
             "global" => self.send(Command::SetProxyMode {
                 mode: ProxyMode::Global,
-                http_inbound_tag: self.http_tag.clone(),
+                http_inbound_tag: self.runtime_http_tag(),
             }),
             _ => {}
         }
     }
     fn advance_shutdown(&mut self) {
-        if self.shutdown_requested && !self.busy && !self.exit {
+        if self.shutdown_requested
+            && !self.busy
+            && !self.exit
+            && self.ui.connected
+            && self.ui.uncertain.is_none()
+        {
             self.send(Command::Shutdown);
         }
     }
 }
 impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.stash_draft();
         if let Some(wakeup) = &self.wakeup {
             wakeup.close();
         }
@@ -985,9 +861,21 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.receive();
         self.receive_dependencies();
+        self.flush_draft_if_due();
         ctx.request_repaint_after(Duration::from_millis(300));
         #[cfg(windows)]
         {
+            if let Some(tray) = &self.tray {
+                tray.update(crate::tray::State {
+                    can_write: self.write_blocker().is_none(),
+                    can_stop: self.ui.connected && !self.busy && self.ui.uncertain.is_none(),
+                    can_exit_gui: !self.busy
+                        && !self.shutdown_requested
+                        && self.ui.uncertain.is_none(),
+                    running: self.is_running(),
+                    quitting: self.shutdown_requested,
+                });
+            }
             let actions = self.tray.as_ref().map(|t| t.actions()).unwrap_or_default();
             for action in actions {
                 self.tray_action(&action, ctx);
@@ -1015,73 +903,12 @@ impl eframe::App for App {
             && !self.shutdown_requested
         {
             self.send(Command::GetStatus);
-            if self.tab == 3 {
+            if self.ui.page == Page::Logs && !self.ui.logs_paused {
                 self.send(Command::GetLogs);
             }
             self.last_poll = Instant::now();
         }
-        egui::TopBottomPanel::top("header").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("Xray Pilot");
-                if let Some(status) = &self.status {
-                    ui.label(format!(
-                        "Core: {} · System proxy: {}",
-                        status.core_state, status.proxy_state
-                    ));
-                    if status.recovery_required {
-                        ui.colored_label(
-                            ui.visuals().warn_fg_color,
-                            "Recovery required — inspect the last error",
-                        );
-                    }
-                }
-                if self.busy {
-                    ui.spinner();
-                }
-            });
-            ui.horizontal(|ui| {
-                for (i, title) in ["Profiles / JSON", "Settings", "Routing diagnostics", "Logs"]
-                    .iter()
-                    .enumerate()
-                {
-                    ui.selectable_value(&mut self.tab, i, *title);
-                }
-                if self.status.is_none() && ui.button("Reconnect Supervisor").clicked() {
-                    self.send(Command::GetStatus);
-                }
-                if let Some(request_id) = self.failed_request.clone()
-                    && ui.button("Query failed request").clicked()
-                {
-                    self.send(Command::GetOperation { request_id });
-                }
-                if ui
-                    .add_enabled(!self.busy, egui::Button::new("Stop Core"))
-                    .clicked()
-                {
-                    self.send(Command::StopCore);
-                }
-                if ui
-                    .add_enabled(!self.busy, egui::Button::new("Start / restart"))
-                    .clicked()
-                {
-                    self.send(Command::RestartCore);
-                }
-            });
-        });
-        egui::TopBottomPanel::bottom("result").show(ctx, |ui| {
-            ui.label(&self.message);
-            if let Some(e) = self.status.as_ref().and_then(|s| s.last_error.as_ref()) {
-                ui.colored_label(ui.visuals().warn_fg_color, e.to_string());
-            }
-        });
-        egui::CentralPanel::default().show(ctx,|ui|{ui.add_enabled_ui(!self.busy,|ui|match self.tab{
-            0=>self.editor(ui),1=>{egui::ScrollArea::vertical().id_salt("settings-scroll").show(ui,|ui|self.settings(ui));},2=>{
-                ui.label("Static prediction only; missing context or unsupported earlier rules return Unknown.");
-                ui.horizontal(|ui|{ui.label("Host");ui.text_edit_singleline(&mut self.route_host);});ui.horizontal(|ui|{ui.label("Inbound tag");ui.text_edit_singleline(&mut self.route_inbound);ui.label("Network");ui.text_edit_singleline(&mut self.route_network);});
-                if ui.button("Simulate saved profile").clicked(){self.send(Command::TestRoute{profile_id:self.profile_id.clone(),context:RouteContext{host:self.route_host.clone(),port:Some(443),inbound_tag:Some(self.route_inbound.clone()),network:Some(self.route_network.clone()),target_ip:None}});}
-                ui.monospace(&self.route_result);
-            },_=>{ui.label("Core logs may include destinations or credentials. Logs are kept in memory, bounded to 1000 chunks.");egui::ScrollArea::vertical().stick_to_bottom(true).show(ui,|ui|{for line in &self.logs{ui.monospace(line);}});}
-        });});
+        self.render(ctx);
     }
 }
 fn default_config() -> String {

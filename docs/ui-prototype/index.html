@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light dark">
+  <title>Xray Pilot · 交互设计预览</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%23087e70'/%3E%3Cpath d='M5 16h6l3-8 4 16 3-8h6' stroke='white' fill='none' stroke-width='2'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="prototype-bar">
+    <div class="prototype-label"><span class="prototype-dot"></span><strong>交互设计预览</strong><span class="prototype-note">模拟数据 · 不操作真实系统</span></div>
+    <div class="prototype-tools">
+      <label for="scenario">演示场景</label>
+      <select id="scenario" aria-label="演示场景">
+        <option value="normal">日常运行</option>
+        <option value="first">首次安装</option>
+        <option value="offline">后台断开</option>
+        <option value="recovery">需要恢复</option>
+        <option value="failure">应用失败</option>
+        <option value="unknown">结果待确认</option>
+      </select>
+      <button data-action="reset" class="prototype-button" title="重置当前演示场景">重置</button>
+      <button data-action="guide" class="prototype-button">设计说明</button>
+      <button data-action="tray" class="prototype-button" id="tray-trigger" aria-haspopup="menu" aria-expanded="false">托盘预览</button>
+    </div>
+  </div>
+  <div id="app"></div>
+  <div id="tray-menu" class="tray-menu" role="menu" hidden></div>
+  <div id="task-region" aria-live="polite"></div>
+  <div id="toast-region" role="status" aria-live="polite"></div>
+  <dialog id="modal" aria-labelledby="modal-title"></dialog>
+  <script src="app.js"></script>
+</body>
+</html>

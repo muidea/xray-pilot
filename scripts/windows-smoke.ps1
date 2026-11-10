@@ -164,19 +164,19 @@ try {
         $guiProcess.Refresh()
         if ($guiProcess.HasExited) { throw 'Closing the window exited instead of hiding to tray' }
         if ([XraySmokeWindow]::IsWindowVisible($windowHandle)) { throw ("GUI window remained visible after close: $windowTitle") }
-        [XraySmokeWindow]::TrayCommand($guiProcess.Id, 'Open Xray Pilot')
+        [XraySmokeWindow]::TrayCommand($guiProcess.Id, '打开 Xray Pilot')
         for ($i=0; $i -lt 100 -and -not [XraySmokeWindow]::IsWindowVisible($windowHandle); $i++) { Start-Sleep -Milliseconds 100 }
         if (-not [XraySmokeWindow]::IsWindowVisible($windowHandle)) { throw 'Tray Open did not wake the hidden GUI' }
         if (-not $guiProcess.CloseMainWindow()) { throw 'Cannot hide GUI again' }
         Start-Sleep -Milliseconds 500
-        [XraySmokeWindow]::TrayCommand($guiProcess.Id, 'Exit GUI (keep Core)')
+        [XraySmokeWindow]::TrayCommand($guiProcess.Id, '仅退出界面，后台继续运行')
         if (-not $guiProcess.WaitForExit(10000)) { throw 'Tray Exit GUI did not close the hidden GUI' }
         $status = Call-Ctl 'status'
         if ($status.supervisor_epoch -ne $epoch -or $status.runtime_instance_id -ne $instance) { throw 'GUI exit changed Supervisor/Core ownership' }
         Start-Gui
         $status = Call-Ctl 'status'
         if ($status.supervisor_epoch -ne $epoch -or $status.runtime_instance_id -ne $instance) { throw 'GUI reopen restarted Supervisor/Core' }
-        [XraySmokeWindow]::TrayCommand($guiProcess.Id, 'Exit GUI (keep Core)')
+        [XraySmokeWindow]::TrayCommand($guiProcess.Id, '仅退出界面，后台继续运行')
         if (-not $guiProcess.WaitForExit(10000)) { throw 'Tray Exit GUI did not close the visible GUI' }
         'PASS: tray Open, hidden/visible Exit GUI, close-to-tray, independent Core lifetime and reopen'
     }
@@ -197,7 +197,7 @@ try {
         $guiProcess = Start-Process -FilePath (Join-Path $BinaryDir 'xray-manager.exe') -ArgumentList @('--background', '--data-dir', ('"' + $data + '"')) -PassThru
         # A background-started instance has no visible viewport to drive polling.
         Start-Sleep -Seconds 3
-        [XraySmokeWindow]::TrayCommand($guiProcess.Id, 'Exit and restore proxy')
+        [XraySmokeWindow]::TrayCommand($guiProcess.Id, '退出程序（停止 Core 并恢复代理）')
         if (-not $guiProcess.WaitForExit(10000)) { throw 'Tray Quit did not close the background GUI' }
         if (-not $server.WaitForExit(5000)) { throw 'Tray Quit did not stop Supervisor' }
         if (-not $coreProcess.WaitForExit(5000)) { throw 'Tray Quit did not stop Core' }

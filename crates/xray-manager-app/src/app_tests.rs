@@ -9,7 +9,8 @@ impl Harness {
     fn empty() -> Self {
         let (tx, requests) = mpsc::sync_channel(MAX_PENDING);
         let (responses, rx) = mpsc::channel();
-        let app = App::with_channels(PathBuf::from("isolated-gui-test"), tx, rx);
+        let mut app = App::with_channels(PathBuf::from("isolated-gui-test"), tx, rx);
+        app.ui.connected = true;
         Self {
             app,
             requests,
@@ -174,7 +175,7 @@ fn history_preview_is_bound_to_selection_and_stages_matching_json() {
         serde_json::json!({"json":"{\"historical\":true}","candidate":c}),
     );
     assert_eq!(h.app.editor, "{\"historical\":true}");
-    assert!(h.app.candidate_matches());
+    assert!(!h.app.candidate_matches());
     let request = h.send(Command::StageHistory {
         generation_id: "history".into(),
         expected_revision: h.app.revision.clone(),
@@ -514,5 +515,306 @@ fn tray_shutdown_failure_keeps_the_gui_and_request_identity_without_retrying() {
     assert!(!h.app.exit);
     assert!(!h.app.shutdown_requested);
     assert_eq!(h.app.failed_request, Some(request_id));
+    assert!(!h.requests.try_iter().any(|r| r.command.is_write()));
+}
+
+fn status(generation: Option<Generation>) -> Status {
+    Status {
+        generation,
+        core_state: "Running".into(),
+        proxy_state: "Unmanaged".into(),
+        runtime_instance_id: Some("core-instance".into()),
+        supervisor_epoch: "supervisor-1".into(),
+        last_error: None,
+        recovery_required: false,
+    }
+}
+fn generation(app: &App) -> Generation {
+    Generation {
+        id: "generation-1".into(),
+        transaction_id: "transaction-1".into(),
+        request_id: "apply-1".into(),
+        candidate: candidate(app, &app.editor),
+        proxy_mode: ProxyMode::Direct,
+        http_inbound_tag: "http-in".into(),
+        running: true,
+    }
+}
+fn fail_request(h: &mut Harness, request: Request, code: &str) {
+    h.responses
+        .send((
+            request.command,
+            Response {
+                request_id: request.request_id,
+                result: Err(Error::new(code, "test failure")),
+            },
+        ))
+        .unwrap();
+    h.app.receive();
+}
+
+#[test]
+fn profile_drafts_survive_switching_without_changing_the_runtime() {
+    let mut h = Harness::new();
+    let g = generation(&h.app);
+    h.app.status = Some(status(Some(g.clone())));
+    h.app.editor = "{\"draft\":1}".into();
+    let other = h.send(Command::GetProfile {
+        profile_id: "other".into(),
+    });
+    h.reply(other, profile("other", "{}"));
+    h.app.editor = "{\"other\":2}".into();
+    let first = h.send(Command::GetProfile {
+        profile_id: "p".into(),
+    });
+    h.reply(first, profile("p", "{}"));
+    assert_eq!(h.app.editor, "{\"draft\":1}");
+    assert_eq!(h.app.saved_json, "{}");
+    assert_eq!(
+        h.app
+            .status
+            .as_ref()
+            .unwrap()
+            .generation
+            .as_ref()
+            .unwrap()
+            .id,
+        g.id
+    );
+    assert!(!h.requests.try_iter().any(|r| r.command.is_write()));
+}
+
+#[test]
+fn persisted_draft_revision_conflict_requires_an_explicit_decision() {
+    let root = tempfile::tempdir().unwrap();
+    crate::workspace::Draft {
+        base_revision: hash(b"old"),
+        json: "{\"recovered\":true}".into(),
+    }
+    .save(root.path(), "p")
+    .unwrap();
+    let mut h = Harness::empty();
+    h.app.root = root.path().into();
+    h.app.ui.persistence = true;
+    h.app.load(profile("p", "{}"));
+    assert_eq!(h.app.editor, "{\"recovered\":true}");
+    assert!(h.app.has_draft_conflict());
+    h.app.validate_draft();
+    assert!(!h.requests.try_iter().any(|r| r.command.is_write()));
+    h.app.stash_draft();
+    assert_eq!(
+        crate::workspace::Draft::load(root.path(), "p")
+            .unwrap()
+            .unwrap()
+            .base_revision,
+        hash(b"old")
+    );
+}
+
+#[test]
+fn editing_and_reverting_invalidates_an_inflight_validation() {
+    let mut h = Harness::new();
+    let request = h.validate();
+    let c = candidate(&h.app, "{}");
+    h.app.editor = "{\"temporary\":true}".into();
+    h.app.draft_edited();
+    h.app.editor = "{}".into();
+    h.app.draft_edited();
+    h.reply(request, c);
+    assert!(!h.app.candidate_matches());
+    assert!(!h.app.confirm_apply);
+}
+
+#[test]
+fn disconnected_backend_preserves_last_status_and_blocks_mutations() {
+    let mut h = Harness::new();
+    let g = generation(&h.app);
+    h.app.status = Some(status(Some(g.clone())));
+    let poll = h.send(Command::GetStatus);
+    fail_request(&mut h, poll, "CONNECTION_LOST");
+    assert!(!h.app.ui.connected);
+    assert_eq!(
+        h.app
+            .status
+            .as_ref()
+            .unwrap()
+            .generation
+            .as_ref()
+            .unwrap()
+            .id,
+        g.id
+    );
+    h.app.send(Command::StopCore);
+    assert!(!h.requests.try_iter().any(|r| r.command.is_write()));
+    let poll = h.send(Command::GetStatus);
+    h.reply(poll, status(Some(g)));
+    assert!(h.app.ui.connected);
+    assert_eq!(h.app.message, "后台已连接。");
+}
+
+#[test]
+fn ambiguous_apply_is_queried_by_identity_and_never_resubmitted() {
+    let mut h = Harness::new();
+    h.app.editor = "{\"applied\":true}".into();
+    let c = candidate(&h.app, &h.app.editor);
+    h.app.accept_candidate(c.clone());
+    let request = h.send(apply(&c));
+    let request_id = request.request_id.clone();
+    let original_command = request.command.clone();
+    fail_request(&mut h, request, "IPC_TIMEOUT");
+    assert!(h.app.ui.uncertain.is_some());
+    h.app.send(Command::RestartCore);
+    h.app.send(Command::StopCore);
+    assert!(!h.requests.try_iter().any(|r| r.command.is_write()));
+    let query = h.send(Command::GetOperation {
+        request_id: request_id.clone(),
+    });
+    h.reply(query, serde_json::Value::Null);
+    assert!(h.app.ui.uncertain.is_some());
+    let query = h.send(Command::GetOperation {
+        request_id: request_id.clone(),
+    });
+    h.reply(query,serde_json::json!({"request":{"request_id":request_id,"command":original_command},"response":Response{request_id:request_id.clone(),result:Ok(serde_json::to_value(generation(&h.app)).unwrap())}}));
+    assert!(h.app.ui.uncertain.is_none());
+    assert_eq!(h.app.saved_json, "{\"applied\":true}");
+    assert!(!h.requests.try_iter().any(|r| r.command.is_write()));
+}
+
+#[test]
+fn apply_acknowledgement_preserves_a_new_editor_selection() {
+    let mut h = Harness::new();
+    h.app.editor = "{\"new\":true}".into();
+    let c = candidate(&h.app, &h.app.editor);
+    h.app.accept_candidate(c.clone());
+    let apply = h.send(apply(&c));
+    let read = h.send(Command::GetProfile {
+        profile_id: "other".into(),
+    });
+    let g = generation(&h.app);
+    h.reply(apply, g);
+    h.reply(read, profile("other", "{}"));
+    assert_eq!(h.app.profile_id, "other");
+    assert_eq!(h.app.selected_profile, "other");
+    assert!(
+        !h.requests
+            .try_iter()
+            .any(|r| matches!(r.command,Command::GetProfile{profile_id} if profile_id=="p"))
+    );
+}
+
+#[test]
+fn runtime_reads_and_route_results_cannot_cross_generation_boundaries() {
+    let mut h = Harness::new();
+    let g = generation(&h.app);
+    h.app.status = Some(status(Some(g.clone())));
+    let read = h.send(Command::GetRuntimeConfig {
+        generation_id: g.id.clone(),
+    });
+    let route = h.send(Command::TestRunningRoute {
+        generation_id: g.id.clone(),
+        context: RouteContext {
+            host: "example.com".into(),
+            ..Default::default()
+        },
+    });
+    let mut new = g.clone();
+    new.id = "generation-2".into();
+    h.app.status = Some(status(Some(new)));
+    h.reply(
+        read,
+        RuntimeConfig {
+            generation_id: g.id,
+            json: "{}".into(),
+        },
+    );
+    h.reply(route, serde_json::json!({"expected_outbound":"wrong"}));
+    assert!(h.app.ui.runtime.is_none());
+    assert!(h.app.route_result.is_empty());
+}
+
+#[test]
+fn recovery_allows_safe_stop_but_blocks_normal_writes() {
+    let mut h = Harness::new();
+    let mut s = status(None);
+    s.recovery_required = true;
+    h.app.status = Some(s);
+    h.app.send(Command::RestartCore);
+    assert!(!h.requests.try_iter().any(|r| r.command.is_write()));
+    let request = h.send(Command::StopCore);
+    assert!(matches!(request.command, Command::StopCore));
+}
+
+#[test]
+fn deleting_a_profile_does_not_clear_a_different_editors_draft() {
+    let mut h = Harness::new();
+    let deletion = h.send(Command::DeleteProfile {
+        profile_id: "p".into(),
+        expected_revision: h.app.revision.clone(),
+    });
+    let other = h.send(Command::GetProfile {
+        profile_id: "other".into(),
+    });
+    h.reply(other, profile("other", "{}"));
+    h.app.editor = "{\"preserved\":true}".into();
+    h.reply(deletion, serde_json::json!({"deleted":true}));
+    assert_eq!(h.app.profile_id, "other");
+    assert_eq!(h.app.editor, "{\"preserved\":true}");
+}
+
+#[test]
+fn corrupted_draft_and_workspace_files_are_not_overwritten_implicitly() {
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("config");
+    std::fs::create_dir_all(config.join("editor-drafts")).unwrap();
+    std::fs::write(config.join("gui.json"), "broken-metadata").unwrap();
+    std::fs::write(config.join("editor-drafts/p.json"), "broken-draft").unwrap();
+    let mut h = Harness::empty();
+    h.app.root = root.path().into();
+    h.app.ui.persistence = true;
+    h.app.ui.workspace_valid = false;
+    h.app.load(profile("p", "{}"));
+    h.app.editor = "{\"edited\":true}".into();
+    h.app.stash_draft();
+    h.app.save_workspace();
+    assert_eq!(
+        std::fs::read_to_string(config.join("gui.json")).unwrap(),
+        "broken-metadata"
+    );
+    assert_eq!(
+        std::fs::read_to_string(config.join("editor-drafts/p.json")).unwrap(),
+        "broken-draft"
+    );
+}
+
+#[test]
+fn incomplete_import_opens_field_advice_without_replacing_runtime_or_source() {
+    let mut h = Harness::new();
+    let g = generation(&h.app);
+    h.app.status = Some(status(Some(g.clone())));
+    h.app.fail(
+        Error::new("STATIC_VALIDATION_FAILED", "old import error"),
+        String::new(),
+    );
+    let json = "{\n \"outbounds\": [{\"tag\":\"pending\",\"extra\":true}]\n}";
+    let request = h.send(Command::CreateProfile {
+        profile_id: "partial".into(),
+        json: json.into(),
+    });
+    h.reply(request, profile("partial", json));
+    assert_eq!(h.app.editor, json);
+    assert_eq!(h.app.saved_json, json);
+    assert!(h.app.ui.page == ui::Page::Profiles);
+    assert!(h.app.ui.failure.is_none());
+    assert_eq!(
+        h.app
+            .status
+            .as_ref()
+            .unwrap()
+            .generation
+            .as_ref()
+            .unwrap()
+            .id,
+        g.id
+    );
     assert!(!h.requests.try_iter().any(|r| r.command.is_write()));
 }

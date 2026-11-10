@@ -1,4 +1,6 @@
 mod coverage;
+mod validation;
+pub use validation::{ConfigIssue, inspect_config, parse_document};
 pub mod resources;
 pub mod routing;
 pub mod security;
@@ -106,72 +108,14 @@ pub fn valid_id(value: &str) -> Result<()> {
     }
     Ok(())
 }
+/// Admission for checking/running, separate from importing an editable document.
 pub fn parse_config(bytes: &[u8]) -> Result<Value> {
-    if bytes.len() > 4 * 1024 * 1024 {
+    let value = parse_document(bytes)?;
+    if let Some(issue) = inspect_config(&value).into_iter().find(|i| i.blocking) {
         return Err(Error::new(
-            "CONFIG_TOO_LARGE",
-            "Configuration exceeds 4 MiB",
+            issue.code,
+            format!("{}: {} {}", issue.path, issue.message, issue.help),
         ));
-    }
-    let value: Value = serde_json::from_slice(bytes)?;
-    if !value.is_object() {
-        return Err(Error::new(
-            "CONFIG_PARSE_FAILED",
-            "Configuration must be a JSON object",
-        ));
-    }
-    for name in ["inbounds", "outbounds"] {
-        if let Some(items) = value.get(name) {
-            let items = items.as_array().ok_or_else(|| {
-                Error::new(
-                    "STATIC_VALIDATION_FAILED",
-                    format!("{name} must be an array"),
-                )
-            })?;
-            let mut tags = std::collections::HashSet::new();
-            for item in items {
-                if !item.is_object() {
-                    return Err(Error::new(
-                        "STATIC_VALIDATION_FAILED",
-                        format!("{name} entries must be objects"),
-                    ));
-                }
-                if let Some(tag) = item.get("tag").and_then(Value::as_str)
-                    && !tags.insert(tag)
-                {
-                    return Err(Error::new(
-                        "STATIC_VALIDATION_FAILED",
-                        format!("Duplicate {name} tag: {tag}"),
-                    ));
-                }
-                if name == "inbounds" && item.get("protocol").and_then(Value::as_str) == Some("tun")
-                {
-                    return Err(Error::new(
-                        "UNSUPPORTED_CAPABILITY",
-                        "TUN requires the Phase 5 privileged helper",
-                    ));
-                }
-            }
-        }
-    }
-    if let Some(rules) = value.pointer("/routing/rules").and_then(Value::as_array) {
-        let tags: std::collections::HashSet<_> = value
-            .get("outbounds")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|v| v.get("tag").and_then(Value::as_str))
-            .collect();
-        for rule in rules {
-            if let Some(tag) = rule.get("outboundTag").and_then(Value::as_str)
-                && !tags.contains(tag)
-            {
-                return Err(Error::new(
-                    "STATIC_VALIDATION_FAILED",
-                    format!("Unknown outboundTag: {tag}"),
-                ));
-            }
-        }
     }
     Ok(value)
 }
@@ -232,7 +176,7 @@ impl Store {
         })
     }
     pub fn create(&self, profile: &str, json: &str) -> Result<Profile> {
-        parse_config(json.as_bytes())?;
+        parse_document(json.as_bytes())?;
         let path = self.profile_path(profile)?;
         if path.exists() {
             return Err(Error::new("PROFILE_EXISTS", "Profile already exists"));

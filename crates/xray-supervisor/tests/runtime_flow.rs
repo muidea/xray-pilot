@@ -65,6 +65,105 @@ fn port() -> u16 {
 }
 
 #[tokio::test]
+async fn runtime_diagnostics_read_frozen_json_and_reject_stale_generations() {
+    let tmp = tempfile::tempdir().unwrap();
+    let core = fixture(tmp.path());
+    let proxy = FakeProxy(Arc::new(Mutex::new(ProxySnapshot::default())));
+    let mut s = Supervisor::with_backend(&tmp.path().join("data"), proxy)
+        .await
+        .unwrap();
+    let json = r#"{"outbounds":[{"tag":"running-direct","protocol":"freedom"}]}"#;
+    send(
+        &mut s,
+        Command::CreateProfile {
+            profile_id: "default".into(),
+            json: json.into(),
+        },
+    )
+    .await
+    .unwrap();
+    let c = candidate(&mut s, &core, json).await;
+    send(&mut s, apply(&c, ProxyMode::Direct)).await.unwrap();
+    let generation_id = s.generation.as_ref().unwrap().id.clone();
+    // A mutable saved profile is no longer the authority for the running version.
+    std::fs::write(
+        s.store.profile_path("default").unwrap(),
+        r#"{"outbounds":[{"tag":"saved-other","protocol":"freedom"}]}"#,
+    )
+    .unwrap();
+    let config: RuntimeConfig = serde_json::from_value(
+        send(
+            &mut s,
+            Command::GetRuntimeConfig {
+                generation_id: generation_id.clone(),
+            },
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(config.json, json);
+    let context = RouteContext {
+        host: "example.com".into(),
+        ..Default::default()
+    };
+    let result: RouteResult = serde_json::from_value(
+        send(
+            &mut s,
+            Command::TestRunningRoute {
+                generation_id: generation_id.clone(),
+                context: context.clone(),
+            },
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(result.expected_outbound.as_deref(), Some("running-direct"));
+    assert_eq!(result.actual_outbound, "Unverified");
+    let error = send(
+        &mut s,
+        Command::TestRunningRoute {
+            generation_id: "stale".into(),
+            context,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, "GENERATION_CONFLICT");
+    std::fs::write(&c.config_path, b"{}").unwrap();
+    assert_eq!(
+        send(
+            &mut s,
+            Command::GetRuntimeConfig {
+                generation_id: generation_id.clone()
+            }
+        )
+        .await
+        .unwrap_err()
+        .code,
+        "CONFIG_HASH_MISMATCH"
+    );
+    // Put immutable evidence back before using the ordinary stop transaction.
+    std::fs::write(&c.config_path, json).unwrap();
+    std::fs::write(s.store.profile_path("default").unwrap(), json).unwrap();
+    send(&mut s, Command::StopCore).await.unwrap();
+    assert_eq!(
+        send(
+            &mut s,
+            Command::TestRunningRoute {
+                generation_id,
+                context: RouteContext::default()
+            }
+        )
+        .await
+        .unwrap_err()
+        .code,
+        "CORE_NOT_RUNNING"
+    );
+}
+
+#[tokio::test]
 async fn committed_request_survives_restart_and_stale_proxy_is_released() {
     let tmp = tempfile::tempdir().unwrap();
     let core = fixture(tmp.path());
