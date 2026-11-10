@@ -42,6 +42,13 @@ struct Pending {
     settings_context: Option<SettingsContext>,
     poll: Option<&'static str>,
 }
+struct DependencyJob {
+    response: mpsc::Receiver<Result<crate::dependencies::Report>>,
+    context: SettingsContext,
+    asset_root: String,
+    select: bool,
+    version: String,
+}
 
 pub struct App {
     root: PathBuf,
@@ -71,6 +78,12 @@ pub struct App {
     settings: Settings,
     settings_epoch: u64,
     settings_edit_epoch: u64,
+    dependency_job: Option<DependencyJob>,
+    dependency_report: crate::dependencies::Report,
+    dependency_version: String,
+    dependency_message: String,
+    dependency_repaint: Option<egui::Context>,
+    appearance: crate::preferences::Appearance,
     route_host: String,
     route_inbound: String,
     route_network: String,
@@ -148,6 +161,12 @@ impl App {
             }
         });
         let mut app = Self::with_channels(root, tx, rx);
+        app.dependency_repaint = Some(cc.egui_ctx.clone());
+        match crate::preferences::Appearance::load(&app.root) {
+            Ok(appearance) => app.appearance = appearance,
+            Err(error) => app.message = format!("Appearance could not be loaded: {error}"),
+        }
+        app.appearance.apply(&cc.egui_ctx);
         #[cfg(windows)]
         {
             app.tray = crate::tray::Tray::new().ok();
@@ -195,6 +214,12 @@ impl App {
             settings: Settings::default(),
             settings_epoch: 0,
             settings_edit_epoch: 0,
+            dependency_job: None,
+            dependency_report: crate::dependencies::Report::default(),
+            dependency_version: crate::dependencies::DEFAULT_VERSION.into(),
+            dependency_message: String::new(),
+            dependency_repaint: None,
+            appearance: crate::preferences::Appearance::default(),
             route_host: "example.com".into(),
             route_inbound: "http-in".into(),
             route_network: "tcp".into(),
@@ -457,6 +482,10 @@ impl App {
                         if let Ok(s) = serde_json::from_value::<Settings>(value) {
                             self.core_path = s.core_path.display().to_string();
                             self.settings = s;
+                            if self.core_path.is_empty() && self.editor.is_empty() {
+                                self.tab = 1;
+                            }
+                            self.start_dependencies("Status", "", None);
                         }
                     }
                     Command::ValidateDraft { .. } => {
@@ -668,7 +697,7 @@ impl App {
                 candidate.resources.files.len()
             ));
             for note in &candidate.resources.notes {
-                ui.colored_label(egui::Color32::YELLOW, note);
+                ui.colored_label(ui.visuals().warn_fg_color, note);
             }
             egui::CollapsingHeader::new("Changes from saved JSON").show(ui, |ui| {
                 let old = self.saved_json.as_str();
@@ -709,6 +738,102 @@ impl App {
     }
     fn settings(&mut self, ui: &mut egui::Ui) {
         let before = self.settings_context();
+        let previous_appearance = self.appearance;
+        egui::ComboBox::from_label("Appearance")
+            .selected_text(match self.appearance {
+                crate::preferences::Appearance::System => "Follow system",
+                crate::preferences::Appearance::Light => "Light",
+                crate::preferences::Appearance::Dark => "Dark",
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut self.appearance,
+                    crate::preferences::Appearance::System,
+                    "Follow system",
+                );
+                ui.selectable_value(
+                    &mut self.appearance,
+                    crate::preferences::Appearance::Light,
+                    "Light",
+                );
+                ui.selectable_value(
+                    &mut self.appearance,
+                    crate::preferences::Appearance::Dark,
+                    "Dark",
+                );
+            });
+        if self.appearance != previous_appearance {
+            self.appearance.apply(ui.ctx());
+            if let Err(error) = self.appearance.save(&self.root) {
+                self.message = format!("Appearance changed but could not be saved: {error}");
+            }
+        }
+        ui.separator();
+        ui.heading("Managed Xray dependencies");
+        ui.label("Download official Xray Core, geoip.dat and geosite.dat. Existing running configurations keep their frozen dependencies.");
+        if !cfg!(windows) {
+            ui.label("Managed installation is available on Windows x64. Select an official Core manually on this platform.");
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Official version");
+            ui.text_edit_singleline(&mut self.dependency_version);
+            if ui
+                .add_enabled(
+                    cfg!(windows) && self.dependency_job.is_none(),
+                    egui::Button::new("Download / repair official Core"),
+                )
+                .clicked()
+            {
+                self.start_dependencies("Install", "", Some(ui.ctx().clone()));
+            }
+            if ui
+                .add_enabled(
+                    cfg!(windows) && self.dependency_job.is_none(),
+                    egui::Button::new("Check installed dependencies"),
+                )
+                .clicked()
+            {
+                self.start_dependencies("Status", "", Some(ui.ctx().clone()));
+            }
+        });
+        if self.dependency_job.is_some() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Checking or downloading dependencies; this may take a few minutes…");
+            });
+        }
+        ui.label(&self.dependency_message);
+        for installation in self.dependency_report.installations.clone() {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!(
+                    "{} · {}",
+                    installation.version,
+                    if installation.valid {
+                        "Verified"
+                    } else {
+                        "Needs repair"
+                    }
+                ));
+                if let Some(error) = &installation.error {
+                    ui.label(error);
+                }
+                if ui
+                    .add_enabled(
+                        cfg!(windows) && installation.valid && self.dependency_job.is_none(),
+                        egui::Button::new("Use this version"),
+                    )
+                    .clicked()
+                {
+                    self.dependency_version = installation.version;
+                    self.start_dependencies(
+                        "Select",
+                        &installation.install_id,
+                        Some(ui.ctx().clone()),
+                    );
+                }
+            });
+        }
+        ui.separator();
         ui.label("Official Xray Core executable (absolute path)");
         ui.text_edit_singleline(&mut self.core_path);
         if ui.button("Choose Core…").clicked() {
@@ -742,10 +867,79 @@ impl App {
         ui.label(format!("Data directory: {}", self.root.display()));
         ui.label("Phase 0–2: native profiles, runtime transactions and Windows system proxy. PAC and TUN are not enabled in this release.");
     }
+    fn start_dependencies(
+        &mut self,
+        action: &'static str,
+        install_id: &str,
+        repaint: Option<egui::Context>,
+    ) {
+        if !cfg!(windows) || self.dependency_job.is_some() {
+            return;
+        }
+        let Some(repaint) = repaint.or_else(|| self.dependency_repaint.clone()) else {
+            return;
+        };
+        let select = action != "Status" || self.core_path.is_empty();
+        let response = crate::dependencies::spawn(
+            crate::dependencies::Job::new(action, &self.root, &self.dependency_version, install_id),
+            repaint,
+        );
+        self.dependency_job = Some(DependencyJob {
+            response,
+            context: self.settings_context(),
+            asset_root: self.asset_root.clone(),
+            select,
+            version: self.dependency_version.clone(),
+        });
+        self.dependency_message = String::new();
+    }
+    fn receive_dependencies(&mut self) {
+        let Some(job) = &self.dependency_job else {
+            return;
+        };
+        let result = match job.response.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => Err(Error::new(
+                "DEPENDENCY_INSTALL_FAILED",
+                "Dependency worker disconnected",
+            )),
+        };
+        let job = self.dependency_job.take().unwrap();
+        match result {
+            Ok(report) => {
+                let matches = job.context == self.settings_context()
+                    && job.asset_root == self.asset_root
+                    && job.version == self.dependency_version;
+                if let Some(bundle) = &report.selected {
+                    if job.select && matches {
+                        self.core_path = bundle.core_path.display().to_string();
+                        self.asset_root = bundle.asset_root.display().to_string();
+                        self.settings_edited();
+                        self.invalidate_candidate();
+                        self.dependency_message = format!(
+                            "{} verified and selected. Save settings, then validate your configuration.",
+                            bundle.version
+                        );
+                    } else {
+                        self.dependency_message = format!(
+                            "{} verified. Current settings were preserved; use a verified version when ready.",
+                            bundle.version
+                        );
+                    }
+                } else {
+                    self.dependency_message = "No verified current bundle. Download / repair official Core to prepare dependencies.".into();
+                }
+                self.dependency_report = report;
+            }
+            Err(error) => self.dependency_message = error.to_string(),
+        }
+    }
 }
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.receive();
+        self.receive_dependencies();
         ctx.request_repaint_after(Duration::from_millis(300));
         if self.exit {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -797,7 +991,7 @@ impl eframe::App for App {
                     ));
                     if status.recovery_required {
                         ui.colored_label(
-                            egui::Color32::YELLOW,
+                            ui.visuals().warn_fg_color,
                             "Recovery required — inspect the last error",
                         );
                     }
@@ -838,11 +1032,11 @@ impl eframe::App for App {
         egui::TopBottomPanel::bottom("result").show(ctx, |ui| {
             ui.label(&self.message);
             if let Some(e) = self.status.as_ref().and_then(|s| s.last_error.as_ref()) {
-                ui.colored_label(egui::Color32::YELLOW, e.to_string());
+                ui.colored_label(ui.visuals().warn_fg_color, e.to_string());
             }
         });
         egui::CentralPanel::default().show(ctx,|ui|{ui.add_enabled_ui(!self.busy,|ui|match self.tab{
-            0=>self.editor(ui),1=>self.settings(ui),2=>{
+            0=>self.editor(ui),1=>{egui::ScrollArea::vertical().id_salt("settings-scroll").show(ui,|ui|self.settings(ui));},2=>{
                 ui.label("Static prediction only; missing context or unsupported earlier rules return Unknown.");
                 ui.horizontal(|ui|{ui.label("Host");ui.text_edit_singleline(&mut self.route_host);});ui.horizontal(|ui|{ui.label("Inbound tag");ui.text_edit_singleline(&mut self.route_inbound);ui.label("Network");ui.text_edit_singleline(&mut self.route_network);});
                 if ui.button("Simulate saved profile").clicked(){self.send(Command::TestRoute{profile_id:self.profile_id.clone(),context:RouteContext{host:self.route_host.clone(),port:Some(443),inbound_tag:Some(self.route_inbound.clone()),network:Some(self.route_network.clone()),target_ip:None}});}

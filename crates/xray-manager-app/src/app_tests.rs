@@ -357,3 +357,97 @@ fn latest_settings_read_wins_and_save_supersedes_pending_reads() {
     h.reply(save, serde_json::json!({"saved":true}));
     assert!(!h.app.busy);
 }
+
+fn dependency_job(
+    h: &mut Harness,
+    select: bool,
+) -> mpsc::Sender<Result<crate::dependencies::Report>> {
+    let (tx, rx) = mpsc::channel();
+    h.app.dependency_job = Some(DependencyJob {
+        response: rx,
+        context: h.app.settings_context(),
+        asset_root: h.app.asset_root.clone(),
+        select,
+        version: h.app.dependency_version.clone(),
+    });
+    tx
+}
+fn managed_report() -> crate::dependencies::Report {
+    serde_json::from_value(serde_json::json!({
+        "selected": {"version":"v26.11.9","core_path":"managed/xray.exe","asset_root":"managed"},
+        "installations":[{"version":"v26.11.9","install_id":"test","valid":true,"error":null}]
+    }))
+    .unwrap()
+}
+
+#[test]
+fn managed_bundle_populates_settings_and_requires_fresh_validation() {
+    let mut h = Harness::new();
+    let c = candidate(&h.app, "{}");
+    h.app.accept_candidate(c);
+    let tx = dependency_job(&mut h, true);
+    tx.send(Ok(managed_report())).unwrap();
+    h.app.receive_dependencies();
+    assert_eq!(h.app.core_path, "managed/xray.exe");
+    assert_eq!(h.app.asset_root, "managed");
+    assert!(!h.app.candidate_matches());
+    assert!(!h.app.busy);
+    assert!(!h.requests.try_iter().any(|r| r.command.is_write()));
+    let expected = Settings {
+        core_path: "managed/xray.exe".into(),
+        ..Settings::default()
+    };
+    assert_settings_and_save(&mut h, &expected);
+}
+
+#[test]
+fn dependency_completion_preserves_new_settings_and_installation_intent() {
+    for change in ["core", "assets", "login", "version", "save"] {
+        let mut h = Harness::new();
+        let tx = dependency_job(&mut h, true);
+        match change {
+            "core" => h.app.core_path = "user-core".into(),
+            "assets" => h.app.asset_root = "user-assets".into(),
+            "login" => h.app.settings.start_on_logon = true,
+            "version" => h.app.dependency_version = "v26.3.27".into(),
+            _ => {
+                h.send(Command::SaveSettings {
+                    settings: h.app.settings.clone(),
+                });
+            }
+        }
+        let expected = h.app.settings_context();
+        let assets = h.app.asset_root.clone();
+        tx.send(Ok(managed_report())).unwrap();
+        h.app.receive_dependencies();
+        assert!(h.app.settings_context() == expected, "{change}");
+        assert_eq!(h.app.asset_root, assets, "{change}");
+        assert_eq!(h.app.busy, change == "save");
+        assert_eq!(h.app.dependency_report.installations.len(), 1);
+    }
+}
+
+#[test]
+fn dependency_checks_and_failures_do_not_replace_a_selected_core() {
+    let mut h = Harness::new();
+    h.app.core_path = "user-core".into();
+    let tx = dependency_job(&mut h, false);
+    tx.send(Ok(managed_report())).unwrap();
+    h.app.receive_dependencies();
+    assert_eq!(h.app.core_path, "user-core");
+    let tx = dependency_job(&mut h, true);
+    tx.send(Err(Error::new(
+        "DEPENDENCY_INSTALL_FAILED",
+        "checksum failed",
+    )))
+    .unwrap();
+    h.app.receive_dependencies();
+    assert!(h.app.dependency_message.contains("checksum failed"));
+    assert_eq!(h.app.core_path, "user-core");
+    let tx = dependency_job(&mut h, true);
+    drop(tx);
+    h.app.receive_dependencies();
+    assert!(h.app.dependency_job.is_none());
+    assert!(h.app.dependency_message.contains("disconnected"));
+    assert_eq!(h.app.core_path, "user-core");
+}

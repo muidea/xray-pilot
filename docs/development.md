@@ -57,7 +57,7 @@ Windows PowerShell 设置 `$env:XRAY_TEST_CORE = "C:\path\to\xray.exe"` 后执�
 在 Windows 上可复测真实 Core、IPC、Job 强制退出清理和 GUI 生命周期（使用隔离数据目录与 Direct 模式）：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows-smoke.ps1 -BinaryDir .\target\release -CorePath C:\v2rayN\bin\Xray\xray.exe -Gui
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows-smoke.ps1 -BinaryDir .\target\release -CorePath C:\Tools\Xray\xray.exe -Gui
 ```
 
 使用解压后的程序包时，将 `-BinaryDir` 改为程序所在目录。脚本文件位于仓库或程序包的 scripts 目录。脚本不会注册登录任务或切换 WinINet 代理。
@@ -71,7 +71,7 @@ cargo test -p windows-integration --lib native_login_task_roundtrip -- --ignored
 本地 A/B 真实流量与 Windows 文件占用回滚专项验证（使用模拟系统代理）：
 
 ```powershell
-$env:XRAY_TEST_CORE = "C:\v2rayN\bin\Xray\xray.exe"
+$env:XRAY_TEST_CORE = "C:\Tools\Xray\xray.exe"
 cargo test -p xray-supervisor --test acceptance_edges --locked -- --ignored
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows-ipc-audit.ps1 -BinaryDir .\target\release -CorePath $env:XRAY_TEST_CORE
 ```
@@ -91,3 +91,11 @@ python scripts/package-windows.py --binary-dir target/release
 ```
 
 输出位于 dist：版本命名的 Windows x64 zip 以及 SHA256SUMS。包内包含三个程序、README、版本及源码提交标识、文档、示例和 Windows 验证脚本；不包含 Core 或用户数据。脚本会逐文件核对压缩包内容。正式发布前应使用干净的、与构建输入相同的源码提交，脚本将当前 HEAD 写入 VERSION.txt。
+
+自动依赖部署与完整性/修复验收：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows-dependencies-check.ps1
+```
+
+此专项从官方获取 Core，在独立临时目录验证安装、修复、离线输入和失败保护，不切换真实系统代理或登录任务。GUI 内嵌同一部署脚本，普通安装不需要开发用 fetch-test-core.py。

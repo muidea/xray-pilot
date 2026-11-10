@@ -2,13 +2,13 @@
 
 Xray Pilot 是 Windows 上的 Xray 配置与运行管理工具。你可以导入原生 JSON、检查配置、预览修改、启动 Core，并通过托盘管理系统代理。
 
-当前为 **0.1.1-rc.1 验证版（Pre-release）**，主要面向 Windows x64。支持 Global / Direct、配置历史和登录自启；PAC、TUN、Windows 服务部署及自动更新尚未提供。完整验收仍在进行，见 [已知限制](#已知限制)。
+当前为 **0.1.1-rc.2 验证版（Pre-release）**，主要面向 Windows x64。支持 Global / Direct、配置历史和登录自启；PAC、TUN、Windows 服务部署及自动更新尚未提供。完整验收仍在进行，见 [已知限制](#已知限制)。
 
 ## 安装
 
 ### 1. 准备程序
 
-从 [v0.1.1-rc.1 发布页](https://github.com/muidea/xray-pilot/releases/tag/v0.1.1-rc.1) 下载 [Windows x64 程序包](https://github.com/muidea/xray-pilot/releases/download/v0.1.1-rc.1/xray-pilot-0.1.1-rc.1-windows-x64.zip) 和 [SHA256SUMS](https://github.com/muidea/xray-pilot/releases/download/v0.1.1-rc.1/SHA256SUMS)，完整解压到固定位置，例如 `D:\Apps\xray-pilot`。这是供验证的预发布版；验证步骤见 [版本说明](docs/releases/v0.1.1-rc.1.md)。
+从 [v0.1.1-rc.2 发布页](https://github.com/muidea/xray-pilot/releases/tag/v0.1.1-rc.2) 下载 [Windows x64 程序包](https://github.com/muidea/xray-pilot/releases/download/v0.1.1-rc.2/xray-pilot-0.1.1-rc.2-windows-x64.zip) 和 [SHA256SUMS](https://github.com/muidea/xray-pilot/releases/download/v0.1.1-rc.2/SHA256SUMS)，完整解压到固定位置，例如 `D:\Apps\xray-pilot`。这是供验证的预发布版；验证步骤见 [版本说明](docs/releases/v0.1.1-rc.2.md)。
 
 获取仓库源码后，也可按 [源码构建说明](docs/development.md#从源码构建) 自行构建。
 
@@ -28,36 +28,47 @@ Xray Pilot 是 Windows 上的 Xray 配置与运行管理工具。你可以导入
 如需核对下载文件，在 PowerShell 中运行，并与随包提供的 `SHA256SUMS` 比较：
 
 ```powershell
-Get-FileHash .\xray-pilot-0.1.1-rc.1-windows-x64.zip -Algorithm SHA256
+Get-FileHash .\xray-pilot-0.1.1-rc.2-windows-x64.zip -Algorithm SHA256
 ```
 
-### 2. 准备 Xray Core
+### 2. 选择数据目录并启动
 
-从 [Xray 官方发布页](https://github.com/XTLS/Xray-core/releases) 获取适合 Windows x64 的 Core，解压并保留所需的 geo 数据文件。Xray Pilot 不捆绑或自动下载 Core。
-
-也可以直接使用已有 Core，例如：
-
-```text
-C:\v2rayN\bin\Xray\xray.exe
-```
-
-本机已使用该路径下的 Xray v26.3.27 验证启停和本地代理。其他版本需重新校验配置。
-
-### 3. 选择数据目录并启动
-
-双击 `xray-manager.exe` 即可启动。默认数据目录为：
-
-```text
-%LOCALAPPDATA%\XrayManager
-```
-
-需要自定义目录时，从程序所在目录执行：
+双击 `xray-manager.exe` 即可启动。默认数据目录为 `%LOCALAPPDATA%\XrayManager`。需要自定义目录时，从程序所在目录执行：
 
 ```powershell
 .\xray-manager.exe --data-dir "D:\Xray Pilot Data"
 ```
 
-后续启动和诊断都应使用同一数据目录。可以创建带上述参数的快捷方式。配置、Core 副本、历史和恢复记录保存在数据目录中，程序目录可以单独管理。
+后续启动和诊断都应使用同一数据目录。可创建带上述参数的快捷方式。首次没有 Core 设置时会打开 Settings，准备官方依赖。
+
+### 3. 自动准备官方依赖
+
+在 **Settings → Managed Xray dependencies** 保留推荐的官方版本 `v26.11.9`，点击 **Download / repair official Core**。程序会从 [XTLS/Xray-core 官方发布页](https://github.com/XTLS/Xray-core/releases) 对应版本下载 Windows x64 包及官方 `.dgst`，核对 SHA-256 后安装 `xray.exe`、`geoip.dat`、`geosite.dat`。
+
+安装完成后自动填入 Core 路径与资源目录，点击 **Save settings**。程序包运行和依赖部署使用 Windows x64 自带的 PowerShell；无需安装 Python 或 Rust。
+
+依赖保存在当前数据目录的 `dependencies/`：重复安装会校验并复用健康版本，损坏时可再次点击下载/修复；已验证的下载缓存可用于修复。新安装按版本分别保留，修复不会覆盖旧目录。下载失败不会切换已选依赖。
+
+**Check installed dependencies** 可重新核对文件完整性；列表中的 **Use this version** 会校验并选用已有版本。需要更换版本时，输入官方版本号后下载、保存设置，并重新校验和应用配置。安装和选择依赖不会自行重启或替换正在运行的 Core。
+
+### 无界面部署与离线安装
+
+也可先用随包脚本自动准备依赖，再打开 GUI 配置连接：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows-dependencies.ps1 -Action Install -DataDir "D:\Xray Pilot Data"
+.\xray-manager.exe --data-dir "D:\Xray Pilot Data"
+```
+
+脚本输出已验证的 Core 和资源路径；GUI 在尚未配置 Core 时会读取已安装的版本，随后保存设置即可。指定其他官方版本时增加 `-CoreVersion v26.11.9`。
+
+无法联网时，从 [官方 v26.11.9 发布页](https://github.com/XTLS/Xray-core/releases/tag/v26.11.9) 下载 `Xray-windows-64.zip` 和 `Xray-windows-64.zip.dgst`，放在同一目录，然后执行：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows-dependencies.ps1 -Action Install -DataDir "D:\Xray Pilot Data" -CoreVersion v26.11.9 -ArchivePath "D:\Downloads\Xray-windows-64.zip"
+```
+
+离线包同样需要通过 SHA-256、文件完整性和 Core 版本检查。已有自行从官方获取的 Core 也可在 Settings 手动选择其 `xray.exe` 及资源目录。
 
 ## 首次配置与连接
 
@@ -65,8 +76,8 @@ C:\v2rayN\bin\Xray\xray.exe
 
 打开 **Settings**：
 
-- 在 **Official Xray Core executable** 选择 `xray.exe`。
-- 在 **Resource directory** 填写证书、`geoip.dat`、`geosite.dat` 等文件的来源目录；使用上述 v2rayN Core 时可选 `C:\v2rayN\bin\Xray`。
+- 自动安装后，确认 **Official Xray Core executable** 和 **Resource directory** 已填入受管版本路径。
+- 手动准备 Core 时，选择从官方包解压的 `xray.exe`，资源目录填写 geo 文件及证书等文件所在目录。
 - 点击 **Save settings**。
 
 配置中引用的文件路径应相对于资源目录，例如 `certs/server.pem`。当前不接受越界路径或绝对文件依赖路径；遇到提示时需修改 JSON。应用会保存所需文件的副本，之后修改来源文件需重新校验、应用才会生效。
@@ -85,7 +96,7 @@ C:\v2rayN\bin\Xray\xray.exe
 | SOCKS 代理 | `127.0.0.1:10808`，Tag 为 `socks-in` |
 | 出站 | 直接连接目标，无远端隧道 |
 
-若 v2rayN 或其他程序正在使用这些端口，请先停止占用端口的实例，或修改 JSON 中的入站端口。同一个 Core 文件可以作为来源，但多个运行实例需要不同监听端口。
+若其他程序正在使用这些端口，请先停止占用端口的实例，或修改 JSON 中的入站端口。同一个 Core 文件可以作为来源，但多个运行实例需要不同监听端口。
 
 需要远端代理时，请导入你自己的原生 Xray JSON，填写真实的服务器、认证和 TLS 参数。[two-upstreams.json](examples/two-upstreams.json) 演示两个 SOCKS 上游按域名分流；其中 `20801`、`20802` 需要实际运行的上游服务。
 
@@ -115,6 +126,10 @@ curl.exe --proxy http://127.0.0.1:10809 --head https://example.com
 ```
 
 按实际端口替换 `10809`。收到网站响应可用于检查这条代理连接；远端出口是否符合预期还需结合自己的上游与网络环境确认。界面中的 **Routing diagnostics** 只做静态预测，不能代替实际连接测试。
+
+## 界面显示风格
+
+在 **Settings → Appearance** 选择 **Follow system**、**Light** 或 **Dark**，分别跟随系统、使用浅色或使用深色。默认跟随系统，修改立即生效并自动保存，重开后保留选择。
 
 ## 日常使用
 
@@ -175,8 +190,10 @@ curl.exe --proxy http://127.0.0.1:10809 --head https://example.com
 
 | 现象 | 处理方法 |
 | --- | --- |
-| Core 路径失效或文件已移动 | 在 Settings 重新选择现有 `xray.exe`，保存后重新校验配置 |
-| Core 启动失败或端口被占用 | 检查 **Logs** 和配置端口；排查 v2rayN 等其他实例，调整监听端口后重新校验 |
+| 官方依赖下载失败 | 检查到 GitHub 的连接，重试或按上面的离线安装步骤准备官方包与 `.dgst` |
+| 受管 Core 或 geo 文件损坏 | 点击 Check installed dependencies 检查，在 Official version 输入对应版本后 Download / repair，保存并重新校验配置 |
+| Core 路径失效或文件已移动 | 下载/修复受管版本，或重新选择从官方包获取的 `xray.exe`，保存后重新校验配置 |
+| Core 启动失败或端口被占用 | 检查 **Logs** 和配置端口；排查其他代理实例，调整监听端口后重新校验 |
 | 找不到 geo 文件或证书 | 检查资源来源目录及相对路径；补齐文件后重新校验 |
 | Global 已启用，但部分程序未走代理 | 确认该程序使用 Windows 系统代理；也可手动填写 `127.0.0.1` 和实际 HTTP/SOCKS 端口 |
 | 自动连接被拒绝 | 检查冻结文件是否完整及候选中的依赖提示；未覆盖的配置需显式校验、应用 |
@@ -193,6 +210,8 @@ curl.exe --proxy http://127.0.0.1:10809 --head https://example.com
 日志可能包含目标地址或认证信息，分享前请检查内容。
 
 ## 已知限制
+
+自动依赖部署目前覆盖 Windows x64 的 Xray Core 与官方包内 geo 数据；用户自己的服务器配置、证书和密钥仍需自行准备。受管安装、缓存及冻结历史尚不自动清理。
 
 当前仍缺真实 Windows 系统代理往返、实际登录启动、跨用户访问控制和完整 GUI 交互等验收证据。尚无历史容量限制和自动清理，使用中数据目录会持续增长；不应自行删除其中的恢复记录。
 

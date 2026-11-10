@@ -1,6 +1,8 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 mod app;
+mod dependencies;
 mod native_editor;
+mod preferences;
 #[cfg(windows)]
 mod tray;
 

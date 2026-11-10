@@ -2,7 +2,7 @@
 
 对应设计：`Xray Windows Manager架构与实现设计.md` V1.2。此文件记录已实现代码和验证边界，不替代设计中的完整验收要求。
 
-当前状态见 [Phase 0–2 遗留项](phase0-2-backlog.md)：C01–C16 各自确认场景均已修复并纳入正式回归。最新关闭 C16：Settings 读取独立于 Profile 加载，同时保留设置编辑、保存及候选上下文保护，见 [C16 收口记录](phase0-2-c16-closeout.md)。v0.1.1-rc.1 用于 Windows x64 验证；系统验收缺口与 F01–F05 未完成部分继续保留。
+当前状态见 [Phase 0–2 遗留项](phase0-2-backlog.md)：C01–C16 各自确认场景均已修复并纳入正式回归。最新关闭 C16：Settings 读取独立于 Profile 加载，同时保留设置编辑、保存及候选上下文保护，见 [C16 收口记录](phase0-2-c16-closeout.md)。v0.1.1-rc.2 增加官方依赖自动部署与显示风格选择，用于 Windows x64 验证；系统验收缺口与 F01–F05 未完成部分继续保留。
 
 ## 已实现
 
@@ -127,3 +127,17 @@ README 改为安装、配置和部署手册，技术构建及测试说明移到 
 Settings 使用独立读取代次、编辑版本与设置草稿匹配；Profile 正文加载不再受 Core 设置读取干扰。新增 5 组正式回归后，Linux 69 项常规测试、Windows 原生 44 项常规单元及 2 项独立 IPC 测试通过，GUI 两平台各 10 项。格式检查与两平台全目标严格 Clippy 通过。旧版 C16 探针保留为历史证据，不作为修复后的通过测试。
 
 版本提升至 0.1.1-rc.1，Cargo.lock 的外部依赖保持不变。README 提供版本下载及用户验证步骤；程序包增加 VERSION.txt，并统一使用打包脚本和 SHA-256。Windows 新版 release 的 GUI/Core/IPC/Job 和停滞客户端监督脚本均通过，真实系统代理未修改。完整发布与 release 验证记录见 [C16 收口](phase0-2-c16-closeout.md)。其余 V/F 项保持清单状态，未由发布自动关闭。
+
+## v0.1.1-rc.2：首次依赖部署与外观选择（2026-11-10）
+
+新增 Windows x64 官方 Core/geo 下载、SHA-256 与版本验证、缓存复用、版本列表/选择和新目录修复；GUI 与 PowerShell 均有入口。安装仅写 dependencies，不修改运行代次或 manager.json；GUI 路径保存仍走既有设置事务。界面显示支持跟随系统、浅色、深色，立即应用并持久化。使用和恢复边界见 [依赖与偏好说明](installation-and-dependencies.md)。README 的正式部署不再依赖开发机 Core 路径。
+
+v0.1.1-rc.1 的远端 [Ubuntu/Windows MSVC CI](https://github.com/muidea/xray-pilot/actions/runs/42749741396) 已全部通过；rc.2 的验证另行记录，不复用旧版本结果替代新增功能验收。
+
+本轮 Linux **74 项**常规回归、Windows 原生 **52 项**回归通过，包含 Windows GUI 的 16 项与跨进程 IPC 两项；格式检查及两平台全目标严格 Clippy 通过。官方 v26.11.9 已通过实际联网下载和完整性校验，安装/复用、损坏检测/新目录修复、原子选择失败、排他锁及离线/错误版本/错误摘要验收通过。
+
+Windows GNU 首次全量测试中，既有 4 MiB 配置 IPC 用例曾收到 unexpected EOF；相同二进制单独复测和随后完整 52 项复测通过，未确定首次失败原因，V06/V09 的压力与跨环境验收继续保留。
+
+最终 Windows release 使用自动安装器下载并验证的官方 v26.11.9，通过 GUI 窗口/关闭到托盘/只退界面保持 Core/重开、Job 强杀清理、历史请求重放与启动、IPC 负面输入/停滞客户端监督冒烟。隔离数据目录分别为 `xray-pilot-smoke-2ff46ed325cf4adbab6aa91c9c0a900c`、`xray-pilot-pipe-audit-0bc5e4d7049141ec82ef7d97be5fe226`；未切换真实 WinINet 或注册登录任务。
+
+最终 release 的实际 Windows 窗口分别以已保存的 Light/Dark 偏好启动，浅色和深色均已目视核对；三种偏好切换及保存/重读由正式回归覆盖。Settings 另提供纵向滚动及依赖按钮换行，警告使用随主题变化的配色。此项不扩展为 V08 全交互完成。

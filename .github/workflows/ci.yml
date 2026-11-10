@@ -27,6 +27,10 @@ jobs:
         run: python scripts/fetch-test-core.py --github-env
       - name: Official Core smoke test (uses a fake system proxy)
         run: cargo test -p xray-supervisor --test real_core --locked -- --ignored
+      - name: Windows official dependency deployment and repair
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/windows-dependencies-check.ps1
       - name: Controlled upstream and file-lock acceptance (fake system proxy)
         run: cargo test -p xray-supervisor --test acceptance_edges --locked -- --ignored
       - name: Official Core proxy lease evidence recovery (fake system proxy)
