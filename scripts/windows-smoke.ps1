@@ -8,10 +8,60 @@ $ErrorActionPreference = 'Stop'
 Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
 public static class XraySmokeWindow {
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool IsWindowVisible(IntPtr hWnd);
+    private delegate bool EnumProc(IntPtr hWnd, IntPtr data);
+    [DllImport("user32.dll")] private static extern bool EnumWindows(EnumProc callback, IntPtr data);
+    [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetClassName(IntPtr window, StringBuilder text, int size);
+    [DllImport("user32.dll")] private static extern bool PostMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")] private static extern IntPtr SendMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")] private static extern int GetMenuItemCount(IntPtr menu);
+    [DllImport("user32.dll")] private static extern uint GetMenuItemID(IntPtr menu, int position);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetMenuString(IntPtr menu, uint position, StringBuilder text, int size, uint flags);
+    private static IntPtr Find(uint processId, string className) {
+        IntPtr result = IntPtr.Zero;
+        EnumWindows((window, data) => {
+            uint owner; GetWindowThreadProcessId(window, out owner);
+            if (owner != processId) return true;
+            var text = new StringBuilder(256); GetClassName(window, text, text.Capacity);
+            if (text.ToString() != className) return true;
+            result = window; return false;
+        }, IntPtr.Zero);
+        return result;
+    }
+    public static void TrayCommand(uint processId, string title) {
+        var tray = IntPtr.Zero;
+        for (int attempt=0; attempt<100 && tray==IntPtr.Zero; attempt++) {
+            tray = Find(processId, "tray_icon_app");
+            if (tray==IntPtr.Zero) Thread.Sleep(100);
+        }
+        if (tray == IntPtr.Zero) throw new Exception("Tray HWND unavailable");
+        // Open this instance's real popup, and resolve the command by its visible text.
+        if (!PostMessage(tray, 6002, IntPtr.Zero, (IntPtr)0x204)) throw new Exception("Cannot open tray popup");
+        uint command = UInt32.MaxValue;
+        try {
+            for (int attempt=0; attempt<100; attempt++) {
+                var popup = Find(processId, "#32768");
+                if (popup != IntPtr.Zero) {
+                    var menu = SendMessage(popup, 0x1E1, IntPtr.Zero, IntPtr.Zero);
+                    for (int i=0; i<GetMenuItemCount(menu); i++) {
+                        var text = new StringBuilder(256); GetMenuString(menu, (uint)i, text, text.Capacity, 0x400);
+                        if (text.ToString().Replace("&", "") == title) { command = GetMenuItemID(menu, i); break; }
+                    }
+                }
+                if (command != UInt32.MaxValue) break;
+                Thread.Sleep(50);
+            }
+        } finally { PostMessage(tray, 0x1F, IntPtr.Zero, IntPtr.Zero); }
+        if (command == UInt32.MaxValue) throw new Exception("Tray item unavailable: " + title);
+        // Dispatch the same WM_COMMAND produced by selecting the resolved native menu item.
+        if (!PostMessage(tray, 0x111, (IntPtr)command, IntPtr.Zero)) throw new Exception("Cannot select tray item");
+    }
 }
 '@
 $BinaryDir = (Resolve-Path $BinaryDir).Path
@@ -114,14 +164,21 @@ try {
         $guiProcess.Refresh()
         if ($guiProcess.HasExited) { throw 'Closing the window exited instead of hiding to tray' }
         if ([XraySmokeWindow]::IsWindowVisible($windowHandle)) { throw ("GUI window remained visible after close: $windowTitle") }
-        $guiProcess.Kill(); $guiProcess.WaitForExit()
+        [XraySmokeWindow]::TrayCommand($guiProcess.Id, 'Open Xray Pilot')
+        for ($i=0; $i -lt 100 -and -not [XraySmokeWindow]::IsWindowVisible($windowHandle); $i++) { Start-Sleep -Milliseconds 100 }
+        if (-not [XraySmokeWindow]::IsWindowVisible($windowHandle)) { throw 'Tray Open did not wake the hidden GUI' }
+        if (-not $guiProcess.CloseMainWindow()) { throw 'Cannot hide GUI again' }
+        Start-Sleep -Milliseconds 500
+        [XraySmokeWindow]::TrayCommand($guiProcess.Id, 'Exit GUI (keep Core)')
+        if (-not $guiProcess.WaitForExit(10000)) { throw 'Tray Exit GUI did not close the hidden GUI' }
         $status = Call-Ctl 'status'
         if ($status.supervisor_epoch -ne $epoch -or $status.runtime_instance_id -ne $instance) { throw 'GUI exit changed Supervisor/Core ownership' }
         Start-Gui
         $status = Call-Ctl 'status'
         if ($status.supervisor_epoch -ne $epoch -or $status.runtime_instance_id -ne $instance) { throw 'GUI reopen restarted Supervisor/Core' }
-        $guiProcess.Kill(); $guiProcess.WaitForExit()
-        'PASS: GUI window, close-to-tray, independent Core lifetime and reopen'
+        [XraySmokeWindow]::TrayCommand($guiProcess.Id, 'Exit GUI (keep Core)')
+        if (-not $guiProcess.WaitForExit(10000)) { throw 'Tray Exit GUI did not close the visible GUI' }
+        'PASS: tray Open, hidden/visible Exit GUI, close-to-tray, independent Core lifetime and reopen'
     }
     $server.Kill(); $server.WaitForExit()
     if (-not $coreProcess.WaitForExit(5000)) { throw 'Job did not terminate Core after Supervisor was killed' }
@@ -132,8 +189,23 @@ try {
     $replayed = Call-Ctl 'request' $apply
     if ($replayed.id -ne $generation.id) { throw 'Committed request was not deduplicated after restart' }
     if ((Call-Ctl 'status').core_state -ne 'Stopped') { throw 'Replay unexpectedly started Core' }
-    $null = Call-Ctl 'shutdown'
-    if (-not $server.WaitForExit(5000)) { throw 'Supervisor did not shut down' }
+    if ($Gui) {
+        $null = Call-Ctl 'start'
+        $children = @(Get-CimInstance Win32_Process -Filter ("ParentProcessId = " + $server.Id) | Where-Object { $_.Name -eq 'xray.exe' })
+        if ($children.Count -ne 1) { throw 'Expected one restarted Core' }
+        $coreProcess = Get-Process -Id $children[0].ProcessId
+        $guiProcess = Start-Process -FilePath (Join-Path $BinaryDir 'xray-manager.exe') -ArgumentList @('--background', '--data-dir', ('"' + $data + '"')) -PassThru
+        # A background-started instance has no visible viewport to drive polling.
+        Start-Sleep -Seconds 3
+        [XraySmokeWindow]::TrayCommand($guiProcess.Id, 'Exit and restore proxy')
+        if (-not $guiProcess.WaitForExit(10000)) { throw 'Tray Quit did not close the background GUI' }
+        if (-not $server.WaitForExit(5000)) { throw 'Tray Quit did not stop Supervisor' }
+        if (-not $coreProcess.WaitForExit(5000)) { throw 'Tray Quit did not stop Core' }
+        'PASS: background tray Quit stops GUI, Supervisor and Core'
+    } else {
+        $null = Call-Ctl 'shutdown'
+        if (-not $server.WaitForExit(5000)) { throw 'Supervisor did not shut down' }
+    }
     if ((Proxy-Fingerprint) -ne $proxyBefore) { throw 'Proxy settings changed during Direct smoke test' }
     'PASS: Startup without reconnect, historical success replay and unchanged system proxy'
     'Evidence directory: ' + $work

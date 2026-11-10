@@ -451,3 +451,68 @@ fn dependency_checks_and_failures_do_not_replace_a_selected_core() {
     assert!(h.app.dependency_message.contains("disconnected"));
     assert_eq!(h.app.core_path, "user-core");
 }
+
+#[test]
+fn tray_gui_exit_keeps_the_supervisor_and_core_untouched() {
+    let mut h = Harness::new();
+    h.app.tray_action("exit-gui", &egui::Context::default());
+    assert!(h.app.exit);
+    assert!(!h.app.shutdown_requested);
+    assert!(!h.requests.try_iter().any(|r| r.command.is_write()));
+}
+
+#[test]
+fn tray_quit_waits_for_an_inflight_write_and_exits_after_shutdown_succeeds() {
+    let mut h = Harness::new();
+    let save = h.send(Command::SaveSettings {
+        settings: h.app.settings.clone(),
+    });
+    let context = egui::Context::default();
+    h.app.tray_action("quit", &context);
+    h.app.advance_shutdown();
+    assert!(h.app.shutdown_requested);
+    assert!(!h.app.exit);
+    assert!(!h.requests.try_iter().any(|r| r.command.is_write()));
+    h.reply(save, serde_json::json!({"saved":true}));
+    h.app.advance_shutdown();
+    let shutdown = h
+        .requests
+        .try_iter()
+        .find(|r| matches!(r.command, Command::Shutdown))
+        .unwrap();
+    h.app.tray_action("quit", &context);
+    h.app.tray_action("start", &context);
+    h.app.advance_shutdown();
+    assert!(!h.app.exit);
+    assert!(!h.requests.try_iter().any(|r| r.command.is_write()));
+    h.reply(shutdown, serde_json::json!({"stopped":true}));
+    assert!(h.app.exit);
+}
+
+#[test]
+fn tray_shutdown_failure_keeps_the_gui_and_request_identity_without_retrying() {
+    let mut h = Harness::new();
+    h.app.tray_action("quit", &egui::Context::default());
+    h.app.advance_shutdown();
+    let request = h
+        .requests
+        .try_iter()
+        .find(|r| matches!(r.command, Command::Shutdown))
+        .unwrap();
+    let request_id = request.request_id;
+    h.responses
+        .send((
+            request.command,
+            Response {
+                request_id: request_id.clone(),
+                result: Err(Error::new("IPC_TIMEOUT", "Query the shutdown result")),
+            },
+        ))
+        .unwrap();
+    h.app.receive();
+    h.app.advance_shutdown();
+    assert!(!h.app.exit);
+    assert!(!h.app.shutdown_requested);
+    assert_eq!(h.app.failed_request, Some(request_id));
+    assert!(!h.requests.try_iter().any(|r| r.command.is_write()));
+}

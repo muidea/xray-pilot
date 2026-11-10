@@ -90,6 +90,8 @@ pub struct App {
     route_result: String,
     confirm_apply: bool,
     exit: bool,
+    shutdown_requested: bool,
+    wakeup: Option<crate::wakeup::Wakeup>,
     history: Vec<Generation>,
     native_section: String,
     raw_json: bool,
@@ -102,7 +104,8 @@ impl App {
         let (tx, requests) = mpsc::sync_channel::<Request>(MAX_PENDING);
         let (responses, rx) = mpsc::channel();
         let worker_root = root.clone();
-        let context = cc.egui_ctx.clone();
+        let wakeup = crate::wakeup::Wakeup::new(cc);
+        let worker_wakeup = wakeup.clone();
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Runtime::new().unwrap();
             let ping = Request::new(Command::GetStatus, None);
@@ -157,10 +160,11 @@ impl App {
                 if responses.send((command, response)).is_err() {
                     break;
                 }
-                context.request_repaint();
+                worker_wakeup.request();
             }
         });
         let mut app = Self::with_channels(root, tx, rx);
+        app.wakeup = Some(wakeup.clone());
         app.dependency_repaint = Some(cc.egui_ctx.clone());
         match crate::preferences::Appearance::load(&app.root) {
             Ok(appearance) => app.appearance = appearance,
@@ -169,7 +173,7 @@ impl App {
         app.appearance.apply(&cc.egui_ctx);
         #[cfg(windows)]
         {
-            app.tray = crate::tray::Tray::new().ok();
+            app.tray = crate::tray::Tray::new(wakeup).ok();
         }
         #[cfg(windows)]
         if app.tray.is_none() {
@@ -226,6 +230,8 @@ impl App {
             route_result: String::new(),
             confirm_apply: false,
             exit: false,
+            shutdown_requested: false,
+            wakeup: None,
             history: vec![],
             native_section: "inbounds".into(),
             raw_json: true,
@@ -419,6 +425,12 @@ impl App {
             }
             match response.result {
                 Err(error) => {
+                    if matches!(command, Command::Shutdown) {
+                        self.shutdown_requested = false;
+                        if let Some(wakeup) = &self.wakeup {
+                            wakeup.reveal();
+                        }
+                    }
                     self.message = format!("{} (request ID: {})", error, response.request_id);
                     if command.is_write() {
                         self.failed_request = Some(response.request_id);
@@ -935,46 +947,73 @@ impl App {
             Err(error) => self.dependency_message = error.to_string(),
         }
     }
+    #[cfg(any(windows, test))]
+    fn tray_action(&mut self, action: &str, ctx: &egui::Context) {
+        match action {
+            "open" => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+            "exit-gui" => self.exit = true,
+            "quit" => self.shutdown_requested = true,
+            _ if self.shutdown_requested => {}
+            "stop" => self.send(Command::StopCore),
+            "start" => self.send(Command::RestartCore),
+            "direct" => self.send(Command::SetProxyMode {
+                mode: ProxyMode::Direct,
+                http_inbound_tag: self.http_tag.clone(),
+            }),
+            "global" => self.send(Command::SetProxyMode {
+                mode: ProxyMode::Global,
+                http_inbound_tag: self.http_tag.clone(),
+            }),
+            _ => {}
+        }
+    }
+    fn advance_shutdown(&mut self) {
+        if self.shutdown_requested && !self.busy && !self.exit {
+            self.send(Command::Shutdown);
+        }
+    }
 }
 impl eframe::App for App {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(wakeup) = &self.wakeup {
+            wakeup.close();
+        }
+    }
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.receive();
         self.receive_dependencies();
         ctx.request_repaint_after(Duration::from_millis(300));
-        if self.exit {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            return;
-        }
         #[cfg(windows)]
         {
             let actions = self.tray.as_ref().map(|t| t.actions()).unwrap_or_default();
             for action in actions {
-                match action.as_str() {
-                    "open" => {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    }
-                    "stop" => self.send(Command::StopCore),
-                    "start" => self.send(Command::RestartCore),
-                    "direct" => self.send(Command::SetProxyMode {
-                        mode: ProxyMode::Direct,
-                        http_inbound_tag: self.http_tag.clone(),
-                    }),
-                    "global" => self.send(Command::SetProxyMode {
-                        mode: ProxyMode::Global,
-                        http_inbound_tag: self.http_tag.clone(),
-                    }),
-                    "exit-gui" => self.exit = true,
-                    "quit" => self.send(Command::Shutdown),
-                    _ => {}
-                }
+                self.tray_action(&action, ctx);
             }
+        }
+        self.advance_shutdown();
+        if self.exit {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            if let Some(wakeup) = &self.wakeup {
+                wakeup.request();
+            } else {
+                ctx.request_repaint();
+            }
+            return;
+        }
+        #[cfg(windows)]
+        {
             if ctx.input(|i| i.viewport().close_requested()) && self.tray.is_some() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             }
         }
-        if self.last_poll.elapsed() > Duration::from_secs(2) && !self.busy {
+        if self.last_poll.elapsed() > Duration::from_secs(2)
+            && !self.busy
+            && !self.shutdown_requested
+        {
             self.send(Command::GetStatus);
             if self.tab == 3 {
                 self.send(Command::GetLogs);

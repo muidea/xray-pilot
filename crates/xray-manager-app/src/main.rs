@@ -5,6 +5,7 @@ mod native_editor;
 mod preferences;
 #[cfg(windows)]
 mod tray;
+mod wakeup;
 
 fn main() -> eframe::Result {
     let root = xray_supervisor::ipc::data_arg().expect("Valid data directory");

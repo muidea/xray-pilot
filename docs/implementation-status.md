@@ -2,7 +2,7 @@
 
 对应设计：`Xray Windows Manager架构与实现设计.md` V1.2。此文件记录已实现代码和验证边界，不替代设计中的完整验收要求。
 
-当前状态见 [Phase 0–2 遗留项](phase0-2-backlog.md)：C01–C16 各自确认场景均已修复并纳入正式回归。最新关闭 C16：Settings 读取独立于 Profile 加载，同时保留设置编辑、保存及候选上下文保护，见 [C16 收口记录](phase0-2-c16-closeout.md)。v0.1.1-rc.2 增加官方依赖自动部署与显示风格选择，用于 Windows x64 验证；系统验收缺口与 F01–F05 未完成部分继续保留。
+当前状态见 [Phase 0–2 遗留项](phase0-2-backlog.md)：C01–C17 各自确认场景均已修复并纳入正式回归。最新关闭 C17：Windows 隐藏窗口的托盘命令及关闭响应主动唤醒 GUI，见 [C17 收口记录](phase0-2-c17-closeout.md)。v0.1.1-rc.3 修复托盘退出并调整 Windows 默认数据目录，用于 Windows x64 验证；系统验收缺口与 F01–F05 未完成部分继续保留。
 
 ## 已实现
 
@@ -141,3 +141,9 @@ Windows GNU 首次全量测试中，既有 4 MiB 配置 IPC 用例曾收到 unex
 最终 Windows release 使用自动安装器下载并验证的官方 v26.11.9，通过 GUI 窗口/关闭到托盘/只退界面保持 Core/重开、Job 强杀清理、历史请求重放与启动、IPC 负面输入/停滞客户端监督冒烟。隔离数据目录分别为 `xray-pilot-smoke-2ff46ed325cf4adbab6aa91c9c0a900c`、`xray-pilot-pipe-audit-0bc5e4d7049141ec82ef7d97be5fe226`；未切换真实 WinINet 或注册登录任务。
 
 最终 release 的实际 Windows 窗口分别以已保存的 Light/Dark 偏好启动，浅色和深色均已目视核对；三种偏好切换及保存/重读由正式回归覆盖。Settings 另提供纵向滚动及依赖按钮换行，警告使用随主题变化的配色。此项不扩展为 V08 全交互完成。
+
+## C17 与默认数据目录（2026-11-10）
+
+Windows 隐藏窗口后托盘菜单无法退出已复现并修复。回调和 IPC 响应主动唤醒隐藏 HWND；完整退出等待在途写操作，失败保留界面/请求身份。Windows 默认数据目录调整为安装目录下的 data，四个入口共用，显式参数仍优先，旧数据不自动迁移。Linux 77 项、Windows 原生 GUI 19 项及两平台严格 Clippy 通过；最终 release 的原生托盘/官方 Core/Job 与默认目录隔离验收通过，见 [C17 收口](phase0-2-c17-closeout.md)。
+
+v0.1.1-rc.2 发布标签的 [Ubuntu/Windows MSVC 流水线](https://github.com/muidea/xray-pilot/actions/runs/42754591475) 已全部通过。rc.3 的远端验收在源码提交后执行，不以 rc.2 结果替代。

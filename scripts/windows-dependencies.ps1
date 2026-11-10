@@ -1,6 +1,6 @@
 ﻿param(
     [ValidateSet('Install', 'Status', 'Select')][string]$Action = 'Install',
-    [string]$DataDir = (Join-Path $env:LOCALAPPDATA 'XrayManager'),
+    [string]$DataDir = '',
     [string]$CoreVersion = 'v26.11.9',
     [string]$InstallId = '',
     [string]$ArchivePath = '',
@@ -22,7 +22,10 @@ if ($StdinJson) {
 if ($Action -notin @('Install', 'Status', 'Select')) { throw 'Unknown dependency action' }
 if ($CoreVersion -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') { throw 'Use an official version tag such as v26.11.9' }
 if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { throw 'Managed dependencies currently require Windows x64 PowerShell' }
-if (-not $DataDir) { throw 'A data directory is required' }
+if (-not $DataDir) {
+    if (-not $PSScriptRoot) { throw 'A data directory is required for embedded installation' }
+    $DataDir = Join-Path (Split-Path $PSScriptRoot -Parent) 'data'
+}
 if ($DataDir.StartsWith('\\?\UNC\')) { $DataDir = '\\' + $DataDir.Substring(8) }
 elseif ($DataDir.StartsWith('\\?\')) { $DataDir = $DataDir.Substring(4) }
 $DataDir = [IO.Path]::GetFullPath($DataDir)

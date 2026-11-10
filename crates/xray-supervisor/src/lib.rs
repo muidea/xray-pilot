@@ -1200,10 +1200,10 @@ impl<B: ProxyBackend> Supervisor<B> {
 
 pub fn default_root() -> Result<PathBuf> {
     #[cfg(windows)]
-    let root = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .ok_or_else(|| Error::new("INVALID_DATA_DIR", "LOCALAPPDATA is missing"))?
-        .join("XrayManager");
+    let root = std::env::current_exe()?
+        .parent()
+        .ok_or_else(|| Error::new("INVALID_DATA_DIR", "Executable directory is missing"))?
+        .join("data");
     #[cfg(not(windows))]
     let root = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)

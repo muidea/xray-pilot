@@ -1,6 +1,10 @@
 # 首次部署、官方依赖与界面偏好
 
-适用版本：v0.1.1-rc.2，Windows x64。用户安装步骤见 [README](../README.md)。正式部署从 [XTLS/Xray-core 官方发布页](https://github.com/XTLS/Xray-core/releases) 获取依赖，默认使用已验证版本 v26.11.9。
+适用版本：v0.1.1-rc.3，Windows x64。用户安装步骤见 [README](../README.md)。正式部署从 [XTLS/Xray-core 官方发布页](https://github.com/XTLS/Xray-core/releases) 获取依赖，默认使用已验证版本 v26.11.9。
+
+## 默认数据目录
+
+Windows 的 GUI、Supervisor 和 CLI 默认使用各自可执行文件所在目录的 `data`；它们应保持在同一安装目录。随包的 scripts/windows-dependencies.ps1 默认使用脚本目录上一级的 data。默认值均与当前工作目录无关。GUI 内嵌脚本仍显式接收其数据目录。`--data-dir` / `-DataDir` 可以覆盖默认值，旧版 LOCALAPPDATA 数据不会自动迁移或合并。
 
 ## 使用入口
 

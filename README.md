@@ -2,13 +2,13 @@
 
 Xray Pilot 是 Windows 上的 Xray 配置与运行管理工具。你可以导入原生 JSON、检查配置、预览修改、启动 Core，并通过托盘管理系统代理。
 
-当前为 **0.1.1-rc.2 验证版（Pre-release）**，主要面向 Windows x64。支持 Global / Direct、配置历史和登录自启；PAC、TUN、Windows 服务部署及自动更新尚未提供。完整验收仍在进行，见 [已知限制](#已知限制)。
+当前为 **0.1.1-rc.3 验证版（Pre-release）**，主要面向 Windows x64。支持 Global / Direct、配置历史和登录自启；PAC、TUN、Windows 服务部署及自动更新尚未提供。完整验收仍在进行，见 [已知限制](#已知限制)。
 
 ## 安装
 
 ### 1. 准备程序
 
-从 [v0.1.1-rc.2 发布页](https://github.com/muidea/xray-pilot/releases/tag/v0.1.1-rc.2) 下载 [Windows x64 程序包](https://github.com/muidea/xray-pilot/releases/download/v0.1.1-rc.2/xray-pilot-0.1.1-rc.2-windows-x64.zip) 和 [SHA256SUMS](https://github.com/muidea/xray-pilot/releases/download/v0.1.1-rc.2/SHA256SUMS)，完整解压到固定位置，例如 `D:\Apps\xray-pilot`。这是供验证的预发布版；验证步骤见 [版本说明](docs/releases/v0.1.1-rc.2.md)。
+从 [v0.1.1-rc.3 发布页](https://github.com/muidea/xray-pilot/releases/tag/v0.1.1-rc.3) 下载 [Windows x64 程序包](https://github.com/muidea/xray-pilot/releases/download/v0.1.1-rc.3/xray-pilot-0.1.1-rc.3-windows-x64.zip) 和 [SHA256SUMS](https://github.com/muidea/xray-pilot/releases/download/v0.1.1-rc.3/SHA256SUMS)，完整解压到固定位置，例如 `D:\Apps\xray-pilot`。这是供验证的预发布版；验证步骤见 [版本说明](docs/releases/v0.1.1-rc.3.md)。
 
 获取仓库源码后，也可按 [源码构建说明](docs/development.md#从源码构建) 自行构建。
 
@@ -28,18 +28,20 @@ Xray Pilot 是 Windows 上的 Xray 配置与运行管理工具。你可以导入
 如需核对下载文件，在 PowerShell 中运行，并与随包提供的 `SHA256SUMS` 比较：
 
 ```powershell
-Get-FileHash .\xray-pilot-0.1.1-rc.2-windows-x64.zip -Algorithm SHA256
+Get-FileHash .\xray-pilot-0.1.1-rc.3-windows-x64.zip -Algorithm SHA256
 ```
 
 ### 2. 选择数据目录并启动
 
-双击 `xray-manager.exe` 即可启动。默认数据目录为 `%LOCALAPPDATA%\XrayManager`。需要自定义目录时，从程序所在目录执行：
+双击 `xray-manager.exe` 即可启动。Windows 默认数据目录为程序安装目录下的 `data`，例如 `D:\Apps\xray-pilot\data`；从快捷方式或其他工作目录启动也使用此位置。GUI、后台、CLI 和随包依赖安装脚本使用同一默认目录。需要自定义目录时，从程序所在目录执行：
 
 ```powershell
 .\xray-manager.exe --data-dir "D:\Xray Pilot Data"
 ```
 
 后续启动和诊断都应使用同一数据目录。可创建带上述参数的快捷方式。首次没有 Core 设置时会打开 Settings，准备官方依赖。
+
+安装目录应可写；若目录受保护，请解压到可写位置或指定 `--data-dir`。旧版默认使用 `%LOCALAPPDATA%\XrayManager`，升级后如需继续使用旧数据，请显式指定旧目录，例如 `--data-dir "$env:LOCALAPPDATA\XrayManager"`；程序不会自动迁移或合并数据。启用过登录自启的安装仍绑定其原数据目录，请保持入口参数一致。
 
 ### 3. 自动准备官方依赖
 

@@ -99,3 +99,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows-dependenci
 ```
 
 此专项从官方获取 Core，在独立临时目录验证安装、修复、离线输入和失败保护，不切换真实系统代理或登录任务。GUI 内嵌同一部署脚本，普通安装不需要开发用 fetch-test-core.py。
+
+Windows 默认数据目录与启动位置一致性验收（在隔离临时安装目录复制程序，不使用现有用户数据）：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows-portable-check.ps1 -BinaryDir .\target\release
+```
+
+`windows-smoke.ps1 -Gui` 现在通过真实托盘弹出菜单的文本解析菜单 ID，并投递同一原生菜单命令，验证隐藏窗口重开、隐藏/可见窗口的仅退 GUI、后台隐藏启动后的完整退出。运行过程使用 Direct，不改真实 WinINet。

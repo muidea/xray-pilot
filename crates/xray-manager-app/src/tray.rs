@@ -4,10 +4,10 @@ use tray_icon::{
 };
 pub struct Tray {
     _icon: TrayIcon,
-    items: Vec<(MenuItem, &'static str)>,
+    actions: std::sync::mpsc::Receiver<String>,
 }
 impl Tray {
-    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(wakeup: crate::wakeup::Wakeup) -> Result<Self, Box<dyn std::error::Error>> {
         let menu = Menu::new();
         let mut items = vec![];
         for (title, key) in [
@@ -21,7 +21,7 @@ impl Tray {
         ] {
             let item = MenuItem::new(title, true, None);
             menu.append(&item)?;
-            items.push((item, key));
+            items.push((item.id().clone(), key));
         }
         let mut pixels = vec![0; 32 * 32 * 4];
         for y in 0usize..32 {
@@ -39,15 +39,19 @@ impl Tray {
             .with_tooltip("Xray Pilot")
             .with_icon(Icon::from_rgba(pixels, 32, 32)?)
             .build()?;
-        Ok(Self { _icon: icon, items })
+        let (tx, actions) = std::sync::mpsc::channel();
+        MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+            if let Some((_, key)) = items.iter().find(|(id, _)| id == &event.id) {
+                let _ = tx.send((*key).into());
+                wakeup.request();
+            }
+        }));
+        Ok(Self {
+            _icon: icon,
+            actions,
+        })
     }
     pub fn actions(&self) -> Vec<String> {
-        let mut actions = vec![];
-        while let Ok(event) = MenuEvent::receiver().try_recv() {
-            if let Some((_, key)) = self.items.iter().find(|(item, _)| item.id() == &event.id) {
-                actions.push((*key).into());
-            }
-        }
-        actions
+        self.actions.try_iter().collect()
     }
 }
