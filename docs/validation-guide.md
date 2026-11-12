@@ -1,6 +1,6 @@
 # 验证说明
 
-本包为 **v0.1.1-rc.17 Windows x64 本地验证版**，包含 PAC 自动代理与内置模板、持久化日志、WinHTTP 只读诊断、Dynamic 依赖、Mixed 入站、路由冲突提示和 TCP 延迟探测。构建版本、源码提交和文件指纹见 `VERSION.txt` 与 `SOURCE-MANIFEST.json`；本地验证包可能记录 `source_dirty=true`，不能作为已发布版本。
+本包为 **v0.1.1-rc.18 Windows x64 本地验证版**，包含 PAC 自动代理与内置模板、持久化日志、WinHTTP 只读诊断、Dynamic 依赖、Mixed 入站、路由冲突提示和 TCP 延迟探测。构建版本、源码提交和文件指纹见 `VERSION.txt` 与 `SOURCE-MANIFEST.json`；本地验证包可能记录 `source_dirty=true`，不能作为已发布版本。
 
 文件名统一采用 `xray-pilot-<版本>-windows-x64.zip`，验证版本使用 `rc.N` 预发布版本号。每轮内容不同的对外交付使用新的版本号。本包由 Linux 交叉构建 Windows GNU 目标，用于功能验证；正式发布前仍需 MSVC CI 和签核。验证包只附带本说明和 `docs/发布说明.md`，设计、评审、交接和历史收口文档保留在源码仓库，不随验证包分发。
 
@@ -49,7 +49,7 @@ Invoke-WebRequest -UseBasicParsing '<PAC URL>' | Select-Object -ExpandProperty C
 4. 显式点击 **停止 Core**，完全退出后再次启动；不应自动启动 Core。
 5. 取消勾选“启动时恢复”，重复第 2–3 步；不应自动启动。
 6. 自动恢复只启动 Core，不自动重新接管系统代理；需要时手动选择 Global/PAC。
-7. 若配置包含未分类字段，自动启动会尝试运行并提示自动恢复不可用；若包含动态外部依赖，自动连接会跳过。两种情况都不应阻断后台，可手动点击“启动上次应用版本”。
+7. 若配置仅包含未分类字段，自动启动和恢复会尝试运行；若包含动态外部依赖，自动连接会跳过。两种情况都不应阻断后台，可手动点击“启动上次应用版本”。
 
 ## 4. 诊断与对话框验证
 

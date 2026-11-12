@@ -615,10 +615,6 @@ async fn incomplete_frozen_resources_attempt_auto_connect_without_blocking() {
     let status = send(&mut s, Command::GetStatus).await.unwrap();
     assert_eq!(status["core_state"], "Running");
     assert_eq!(status["recovery_required"], false);
-    assert!(
-        status["auto_connect_notice"]
-            .as_str()
-            .is_some_and(|notice| notice.contains("未分类依赖"))
-    );
+    assert!(status["auto_connect_notice"].is_null());
     send(&mut s, Command::StopCore).await.unwrap();
 }

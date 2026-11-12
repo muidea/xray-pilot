@@ -643,12 +643,12 @@ impl App {
         }
         if !candidate.resources.complete {
             ui.add(egui::Label::new(
-                RichText::new("配置已通过 Core 校验，可手动确认应用；自动连接、异常重试及自动恢复旧 Core 不可用。")
+                RichText::new("配置已通过 Core 校验。未分类字段无法冻结；启动和恢复时仍需 Core 接受，失败会停止并报告。")
                     .color(ui.visuals().warn_fg_color),
             ).wrap());
             if !candidate.resources.dynamic.is_empty() {
                 ui.label(format!(
-                    "其中 {} 项为显式动态外部文件，启动前会重新核对观察哈希。",
+                    "其中 {} 项为显式动态外部文件；自动连接、异常重试及自动恢复旧 Core 不可用。",
                     candidate.resources.dynamic.len()
                 ));
             }

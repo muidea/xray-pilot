@@ -1180,7 +1180,7 @@ fn long_preview_diagnostics_scroll_without_overlap_and_new_candidate_starts_at_t
             );
             let summary = text_bounds(
                 &output,
-                "配置已通过 Core 校验，可手动确认应用；自动连接、异常重试及自动恢复旧 Core 不可用。",
+                "配置已通过 Core 校验。未分类字段无法冻结；启动和恢复时仍需 Core 接受，失败会停止并报告。",
             );
             assert!(summary.top() > target.bottom());
             assert!(summary.bottom() < json_viewport_rects(&output)[0].top());

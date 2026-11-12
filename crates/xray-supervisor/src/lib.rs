@@ -48,6 +48,13 @@ struct Retry {
     epoch: u64,
     due: Instant,
 }
+fn automatic_recovery_allowed(resources: &xray_model::Resources) -> bool {
+    // Unknown fields cannot be frozen, but their absence is detected when Core
+    // starts. Dynamic files are always excluded because their content is outside
+    // the frozen generation.
+    resources.complete || resources.dynamic.is_empty()
+}
+
 pub struct Supervisor<B: ProxyBackend> {
     pub store: Store,
     _lock: xray_config::StoreLock,
@@ -1259,11 +1266,11 @@ impl<B: ProxyBackend> Supervisor<B> {
             if let Some(g) = &journal.previous
                 && journal.previous_instance.is_some()
             {
-                if !g.candidate.resources.complete {
+                if !automatic_recovery_allowed(&g.candidate.resources) {
                     self.proxy.release()?;
                     return Err(Error::new(
                         "RESOURCE_REVALIDATION_REQUIRED",
-                        "Previous generation contains unclassified dependencies",
+                        "Previous generation contains dynamic dependencies",
                     ));
                 }
                 if let Some(pac) = &g.pac
@@ -1460,10 +1467,6 @@ impl<B: ProxyBackend> Supervisor<B> {
                 );
                 let response = self.handle(request).await;
                 match response.result {
-                    Ok(_) if incomplete => {
-                        self.auto_connect_notice =
-                            Some("已自动启动，但当前配置包含未分类依赖，自动恢复不可用。".into());
-                    }
                     Ok(_) => self.auto_connect_notice = None,
                     Err(error) if incomplete => {
                         self.auto_connect_notice = Some(format!(
@@ -1506,10 +1509,9 @@ impl<B: ProxyBackend> Supervisor<B> {
                     if !self.restart_budget.available(Instant::now()) {
                         self.last_error = Some(Self::budget_exhausted());
                     } else if !self.blocked
-                        && self
-                            .generation
-                            .as_ref()
-                            .is_some_and(|g| g.running && g.candidate.resources.complete)
+                        && self.generation.as_ref().is_some_and(|g| {
+                            g.running && automatic_recovery_allowed(&g.candidate.resources)
+                        })
                     {
                         self.retry = Some(Retry {
                             generation: core.generation_id,
