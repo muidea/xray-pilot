@@ -43,6 +43,7 @@ struct SettingsContext {
     assets: String,
     start_on_logon: bool,
     connect_on_start: bool,
+    restore_last_state: bool,
 }
 struct Pending {
     context: EditorContext,
@@ -288,6 +289,7 @@ impl App {
             assets: self.asset_root.clone(),
             start_on_logon: self.settings.start_on_logon,
             connect_on_start: self.settings.connect_on_start,
+            restore_last_state: self.settings.restore_last_state,
         }
     }
     fn settings_edited(&mut self) {
@@ -296,14 +298,16 @@ impl App {
         self.invalidate_candidate();
     }
     fn candidate_matches(&self) -> bool {
-        self.candidate.as_ref().is_some_and(|c| {
-            c.profile_id == self.profile_id
-                && c.base_revision == self.revision
-                && c.revision == hash(self.editor.as_bytes())
-        }) && self
-            .candidate_context
-            .as_ref()
-            .is_some_and(|context| *context == self.context())
+        self.ui.number_inputs.is_empty()
+            && self.candidate.as_ref().is_some_and(|c| {
+                c.profile_id == self.profile_id
+                    && c.base_revision == self.revision
+                    && c.revision == hash(self.editor.as_bytes())
+            })
+            && self
+                .candidate_context
+                .as_ref()
+                .is_some_and(|context| *context == self.context())
     }
     fn accept_candidate(&mut self, c: Candidate) {
         if c.profile_id == self.profile_id
@@ -325,7 +329,129 @@ impl App {
             limit: 100,
         });
     }
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn tray_status(&self) -> String {
+        let Some(status) = &self.status else {
+            return "未读取".into();
+        };
+        let core = match status.core_state.as_str() {
+            "Running" => "运行中",
+            "Degraded" => "等待恢复",
+            _ => "已停止",
+        };
+        let proxy = match status.proxy_state.as_str() {
+            "Owned" => "系统代理已接管",
+            "Released" => "系统代理已释放",
+            "Conflict" => "代理冲突",
+            "RecoveryRequired" => "代理恢复受限",
+            _ => "未接管系统代理",
+        };
+        format!("{core} · {proxy}")
+    }
+    pub(in crate::app) fn pac_draft(&self) -> PacDraft {
+        self.pac_draft_for(&self.profile_id)
+    }
+    fn pac_draft_for(&self, profile: &str) -> PacDraft {
+        self.ui
+            .workspace
+            .pac
+            .get(profile)
+            .cloned()
+            .unwrap_or_default()
+    }
+    /// Mode switches apply to the committed generation, not the profile being edited.
+    pub(in crate::app) fn running_pac_draft(&self) -> PacDraft {
+        self.committed_id()
+            .map(|profile| self.pac_draft_for(profile))
+            .unwrap_or_default()
+    }
+    pub(in crate::app) fn pac_endpoint(
+        &mut self,
+    ) -> std::result::Result<std::net::SocketAddr, String> {
+        if self.editor.trim().is_empty() {
+            return Err("尚未选择配置；请先在配置页添加或打开配置。".into());
+        }
+        let value = serde_json::from_str::<serde_json::Value>(&self.editor)
+            .map_err(|error| format!("当前 JSON 无法解析：{error}"))?;
+        let candidates: Vec<String> = value
+            .get("inbounds")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter(|v| matches!(v["protocol"].as_str(), Some("http" | "mixed")))
+            .filter_map(|v| v["tag"].as_str())
+            .map(str::to_owned)
+            .collect();
+        if candidates.is_empty() {
+            return Err(
+                "当前配置没有 HTTP 或 Mixed 入站；请先在配置的本地入口中添加回环、无认证的入口。"
+                    .into(),
+            );
+        }
+        // Prefer the current selection, but recover automatically when the
+        // user added/renamed an inbound or made the previous one ineligible.
+        let mut order = Vec::with_capacity(candidates.len());
+        if candidates.contains(&self.http_tag) {
+            order.push(self.http_tag.clone());
+        }
+        order.extend(
+            candidates
+                .iter()
+                .filter(|tag| **tag != self.http_tag)
+                .cloned(),
+        );
+        let mut last_error = String::new();
+        for tag in order {
+            match xray_runtime::http_endpoint(&value, &tag) {
+                Ok(endpoint) => {
+                    self.http_tag = tag;
+                    return Ok(endpoint);
+                }
+                Err(error) => last_error = error.message,
+            }
+        }
+        Err(format!(
+            "当前 HTTP/Mixed 入站不能用于系统代理：{last_error}"
+        ))
+    }
+    pub(in crate::app) fn save_pac_draft(&mut self, draft: PacDraft) {
+        self.ui.workspace.pac.insert(self.profile_id.clone(), draft);
+        self.save_workspace();
+    }
+    fn note_core_running(&mut self, running: bool) {
+        if running && !self.ui.workspace.last_core_running {
+            self.ui.workspace.last_core_running = true;
+            self.save_workspace();
+        }
+    }
+    fn maybe_restore_core(&mut self) {
+        if !self.ui.settings_loaded
+            || !self.settings.restore_last_state
+            || self.ui.restore_attempted
+            || self.busy
+            || self.shutdown_requested
+            || self.ui.uncertain.is_some()
+            || self.write_blocker().is_some()
+            || !self.ui.workspace.last_core_running
+        {
+            return;
+        }
+        let Some(status) = self.status.as_ref() else {
+            return;
+        };
+        if status.core_state != "Stopped" || status.recovery_required || status.generation.is_none()
+        {
+            return;
+        }
+        self.ui.restore_attempted = true;
+        self.message = "正在恢复上次 Core 运行状态…".into();
+        self.send(Command::RestartCore);
+    }
     fn send(&mut self, command: Command) {
+        if matches!(command, Command::StopCore) && self.ui.workspace.last_core_running {
+            self.ui.workspace.last_core_running = false;
+            self.save_workspace();
+        }
         if command.is_write() && self.busy {
             self.message = "请等待当前操作完成".into();
             return;
@@ -347,6 +473,7 @@ impl App {
             candidate_digest,
             proxy_mode,
             http_inbound_tag,
+            ..
         } = &command
         {
             let matches = self.candidate_matches()
@@ -549,7 +676,10 @@ impl App {
                                 self.refresh_profiles();
                             }
                             let generation = status.generation.as_ref().map(|g| g.id.clone());
+                            let running = status.core_state == "Running";
                             self.status = Some(status);
+                            self.note_core_running(running);
+                            self.maybe_restore_core();
                             if let Some(generation_id) = generation {
                                 if self
                                     .ui
@@ -610,10 +740,17 @@ impl App {
                     }
                     Command::StageHistory { .. } => {
                         if let Some(json) = value.get("json").and_then(|v| v.as_str()) {
-                            self.editor = json.into();
-                            self.draft_edited();
+                            let core = value
+                                .pointer("/candidate/core/version")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("历史版本")
+                                .to_owned();
+                            self.open_history_diff(ui::HistoryPreview {
+                                json: json.into(),
+                                core,
+                            });
                             self.message =
-                                "历史已载入为草稿，请使用当前 Core 重新检查并预览。".into();
+                                "已准备历史与当前草稿的比较；确认后才会替换草稿。".into();
                         }
                     }
                     Command::GetSettings => {
@@ -643,6 +780,7 @@ impl App {
                                     });
                                 self.settings = s;
                             }
+                            self.maybe_restore_core();
 
                             self.start_dependencies("Status", "", None);
                         }
@@ -662,6 +800,15 @@ impl App {
                     }
                     Command::TestRoute { .. } => {
                         self.route_result = serde_json::to_string_pretty(&value).unwrap_or_default()
+                    }
+                    Command::TestPac { .. } => {
+                        self.ui.pac_test = serde_json::to_string_pretty(&value).unwrap_or_default();
+                        self.message = "PAC 执行测试完成。".into();
+                    }
+                    Command::TestLatency { .. } => {
+                        self.ui.latency_result =
+                            serde_json::to_string_pretty(&value).unwrap_or_default();
+                        self.message = "TCP 延迟探测完成。".into();
                     }
                     Command::TestRunningRoute {
                         generation_id,
@@ -730,12 +877,17 @@ impl App {
     fn load(&mut self, p: Profile) {
         self.stash_draft();
         self.view_epoch = self.view_epoch.wrapping_add(1);
+        self.ui.guided = Default::default();
         self.selected_profile = p.id.clone();
         self.profile_id = p.id;
         self.saved_json = p.json.clone();
         self.editor = p.json;
         self.revision = p.revision;
         self.restore_draft();
+        self.reset_undo(&self.editor.clone());
+        self.ui.pac_notes.clear();
+        self.ui.pac_test.clear();
+        self.ui.allow_dynamic = false;
         self.invalidate_candidate();
         self.history.clear();
         self.send(Command::ListHistory {
@@ -813,10 +965,22 @@ impl App {
     }
     #[cfg(any(windows, test))]
     fn tray_action(&mut self, action: &str, ctx: &egui::Context) {
+        if let Some(profile) = action.strip_prefix("profile:") {
+            self.open_profile_from_tray(profile, ctx);
+            return;
+        }
         match action {
             "open" => {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+            "exit" => {
+                if !self.shutdown_requested {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    self.open_exit_dialog();
+                    ctx.request_repaint();
+                }
             }
             "exit-gui" => {
                 if !self.busy && !self.shutdown_requested && self.ui.uncertain.is_none() {
@@ -844,10 +1008,17 @@ impl App {
             "direct" => self.send(Command::SetProxyMode {
                 mode: ProxyMode::Direct,
                 http_inbound_tag: self.runtime_http_tag(),
+                pac: None,
             }),
             "global" => self.send(Command::SetProxyMode {
                 mode: ProxyMode::Global,
                 http_inbound_tag: self.runtime_http_tag(),
+                pac: None,
+            }),
+            "pac" => self.send(Command::SetProxyMode {
+                mode: ProxyMode::Pac,
+                http_inbound_tag: self.runtime_http_tag(),
+                pac: Some(self.running_pac_draft()),
             }),
             _ => {}
         }
@@ -880,16 +1051,34 @@ impl eframe::App for App {
         ctx.request_repaint_after(Duration::from_millis(300));
         #[cfg(windows)]
         {
-            if let Some(tray) = &self.tray {
-                tray.update(crate::tray::State {
-                    can_write: self.write_blocker().is_none(),
-                    can_stop: self.ui.connected && !self.busy && self.ui.uncertain.is_none(),
-                    can_exit_gui: !self.busy
-                        && !self.shutdown_requested
-                        && self.ui.uncertain.is_none(),
-                    running: self.is_running(),
-                    quitting: self.shutdown_requested,
-                });
+            let tray_state = crate::tray::State {
+                status: self.tray_status(),
+                can_write: self.write_blocker().is_none(),
+                can_stop: self.ui.connected && !self.busy && self.ui.uncertain.is_none(),
+                can_exit_gui: !self.busy && !self.shutdown_requested && self.ui.uncertain.is_none(),
+                running: self.is_running(),
+                quitting: self.shutdown_requested,
+            };
+            let profiles = self
+                .profiles
+                .iter()
+                .map(|p| {
+                    let running = self.is_running() && self.committed_id() == Some(p.id.as_str());
+                    let label = format!(
+                        "{}{}{}",
+                        self.ui.workspace.name(&p.id),
+                        if running { " · 运行中" } else { "" },
+                        if p.id == self.profile_id {
+                            " · 正在编辑"
+                        } else {
+                            ""
+                        }
+                    );
+                    (p.id.clone(), label)
+                })
+                .collect();
+            if let Some(tray) = &mut self.tray {
+                tray.update(tray_state, profiles);
             }
             let actions = self.tray.as_ref().map(|t| t.actions()).unwrap_or_default();
             for action in actions {
@@ -935,7 +1124,7 @@ impl eframe::App for App {
         self.render(ctx);
     }
 }
-fn default_config() -> String {
+pub(crate) fn default_config() -> String {
     serde_json::to_string_pretty(&serde_json::json!({"log":{"loglevel":"warning"},"inbounds":[{"tag":"socks-in","listen":"127.0.0.1","port":10808,"protocol":"socks","settings":{"udp":true}},{"tag":"http-in","listen":"127.0.0.1","port":10809,"protocol":"http","settings":{}}],"outbounds":[{"tag":"direct","protocol":"freedom"}]})).unwrap()
 }
 fn diff_lines(old: &str, new: &str) -> Vec<String> {

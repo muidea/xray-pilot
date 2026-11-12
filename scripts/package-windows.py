@@ -5,10 +5,23 @@ import argparse
 from datetime import datetime, timezone
 import hashlib
 import json
+import re
 from pathlib import Path
 import subprocess
 import tomllib
 import zipfile
+
+
+def package_readme(text):
+    """Flatten links to internal development docs that are not packaged."""
+    def replace(match):
+        label, target = match.group(1), match.group(2)
+        if target.startswith("docs/validation-guide.md"):
+            return f"[{label}](docs/验证说明.md)"
+        if target.startswith("docs/"):
+            return label
+        return match.group(0)
+    return re.sub(r"\[([^\]]+)\]\((docs/[^)]+)\)", replace, text)
 
 
 def source_manifest(root):
@@ -68,19 +81,24 @@ def main():
         (args.binary_dir / name, name)
         for name in ("xray-manager.exe", "xray-supervisor.exe", "xrayctl.exe")
     ]
-    files += [(root / name, name) for name in ("README.md", "LICENSE")]
-    for directory, pattern in (
-        ("docs", "*.md"),
-        ("docs/ui-prototype", "*.html"),
-        ("docs/ui-prototype", "*.css"),
-        ("docs/ui-prototype", "*.js"),
-        ("examples", "*.json"),
-        ("scripts", "windows-*.ps1"),
-    ):
-        files += [
-            (path, path.relative_to(root).as_posix())
-            for path in sorted((root / directory).rglob(pattern))
-        ]
+    files += [(root / "LICENSE", "LICENSE")]
+    readme_data = package_readme((root / "README.md").read_text(encoding="utf-8")).encode("utf-8")
+    # Validation packages intentionally ship a curated docs subset. Design,
+    # review, handoff and historical closeout notes stay in the source tree.
+    files += [
+        (root / "docs/validation-guide.md", "docs/验证说明.md"),
+        (root / f"docs/releases/v{version}.md", "docs/发布说明.md"),
+    ]
+    files += [
+        (path, path.relative_to(root).as_posix())
+        for path in sorted((root / "examples").rglob("*.json"))
+    ]
+    # Keep user-facing dependency setup and the read-only proxy snapshot helper.
+    # Smoke, portable-path, IPC and installer self-tests are developer audits.
+    files += [
+        (root / "scripts/windows-dependencies.ps1", "scripts/windows-dependencies.ps1"),
+        (root / "scripts/windows-proxy-snapshot.ps1", "scripts/windows-proxy-snapshot.ps1"),
+    ]
     for source, _ in files:
         if not source.is_file():
             parser.error(f"Missing package input: {source}")
@@ -93,7 +111,7 @@ def main():
             "Use a new version for changed contents or a separate output directory."
         )
     metadata = f"version={version}\nsource_commit={revision}\nplatform=windows-x64\n"
-    extra = {}
+    extra = {"README.md": readme_data}
     if args.validation:
         source_files, tree_hash = source_manifest(root)
         metadata += (
@@ -112,12 +130,18 @@ def main():
                     "size": source.stat().st_size,
                 }
                 for source, name in files
+            ]
+            + [
+                {
+                    "path": "README.md",
+                    "sha256": hashlib.sha256(readme_data).hexdigest(),
+                    "size": len(readme_data),
+                }
             ],
         }
         extra["SOURCE-MANIFEST.json"] = json.dumps(
             manifest, ensure_ascii=False, indent=2
         ).encode("utf-8")
-        extra["验证说明.md"] = (root / "docs/validation-guide.md").read_bytes()
     extra["VERSION.txt"] = metadata.encode("utf-8")
     with zipfile.ZipFile(package, "x", zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
         for source, name in files:

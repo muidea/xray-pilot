@@ -9,10 +9,12 @@ license.workspace = true
 xray-model.workspace = true
 xray-config.workspace = true
 xray-runtime.workspace = true
+xray-pac.workspace = true
 windows-integration.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+flate2 = "1"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true

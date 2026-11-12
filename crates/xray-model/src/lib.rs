@@ -63,6 +63,76 @@ pub enum ProxyMode {
     #[default]
     Direct,
     Global,
+    Pac,
+}
+
+pub const DEFAULT_PAC_PORT: u16 = 18080;
+fn default_pac_port() -> u16 {
+    DEFAULT_PAC_PORT
+}
+
+/// Built-in PAC template strategy.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PacTemplateMode {
+    /// Proxy everything except local/LAN hosts.
+    #[default]
+    All,
+    /// Proxy only the listed domains; everything else is direct.
+    ProxyList,
+    /// Proxy everything except the listed domains.
+    DirectList,
+}
+
+/// PAC editor draft. The script is frozen into an immutable publication only
+/// when a PAC generation is applied; drafts never change the running setting.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PacDraft {
+    /// Generated drafts are recomputed from the candidate config at apply time.
+    #[serde(default)]
+    pub generated: bool,
+    /// Built-in default-template drafts are recomputed from the HTTP endpoint at apply time.
+    #[serde(default)]
+    pub template: bool,
+    #[serde(default)]
+    pub template_mode: PacTemplateMode,
+    #[serde(default)]
+    pub domains: Vec<String>,
+    #[serde(default)]
+    pub script: String,
+    #[serde(default = "default_pac_port")]
+    pub port: u16,
+}
+impl Default for PacDraft {
+    fn default() -> Self {
+        Self {
+            generated: false,
+            template: true,
+            template_mode: PacTemplateMode::All,
+            domains: Vec::new(),
+            script: String::new(),
+            port: DEFAULT_PAC_PORT,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PacPublication {
+    /// Content hash, used as the immutable publication path segment.
+    pub revision: String,
+    pub sha256: String,
+    pub url: String,
+    pub port: u16,
+    pub path: PathBuf,
+}
+
+/// Read-only WinHTTP proxy state. WinHTTP is a separate, machine-wide
+/// configuration mechanism and is never modified by this application.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WinHttpConfig {
+    /// WinHTTP access type reported for a default session.
+    pub access_type: String,
+    pub proxy: String,
+    pub bypass: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -80,12 +150,21 @@ pub struct ResourceFile {
     pub sha256: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DynamicResource {
+    pub source: PathBuf,
+    pub sha256: String,
+    #[serde(default)]
+    pub observed_at: u64,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Resources {
     pub id: String,
     pub root: PathBuf,
     pub files: Vec<ResourceFile>,
     pub complete: bool,
     pub notes: Vec<String>,
+    #[serde(default)]
+    pub dynamic: Vec<DynamicResource>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CoreIdentity {
@@ -113,6 +192,9 @@ pub struct Generation {
     pub proxy_mode: ProxyMode,
     pub http_inbound_tag: String,
     pub running: bool,
+    /// Immutable PAC publication associated with this generation.
+    #[serde(default)]
+    pub pac: Option<PacPublication>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Profile {
@@ -141,6 +223,12 @@ pub struct Settings {
     pub core_path: PathBuf,
     pub connect_on_start: bool,
     pub start_on_logon: bool,
+    /// Restore a Core that was running before the previous component shutdown.
+    #[serde(default = "default_true")]
+    pub restore_last_state: bool,
+}
+fn default_true() -> bool {
+    true
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -148,6 +236,7 @@ impl Default for Settings {
             core_path: PathBuf::new(),
             connect_on_start: false,
             start_on_logon: false,
+            restore_last_state: true,
         }
     }
 }
@@ -188,18 +277,38 @@ pub enum Command {
         json: String,
         core_path: PathBuf,
         asset_root: PathBuf,
+        /// Explicitly allow absolute external files as Dynamic inputs. Such
+        /// generations cannot auto-connect or auto-recover.
+        #[serde(default)]
+        allow_dynamic: bool,
     },
     ApplyProfile {
         candidate_id: String,
         candidate_digest: String,
         proxy_mode: ProxyMode,
         http_inbound_tag: String,
+        /// Required when `proxy_mode` is Pac; ignored otherwise.
+        #[serde(default)]
+        pac: Option<PacDraft>,
     },
     StopCore,
     RestartCore,
     SetProxyMode {
         mode: ProxyMode,
         http_inbound_tag: String,
+        /// Required when `mode` is Pac; ignored otherwise.
+        #[serde(default)]
+        pac: Option<PacDraft>,
+    },
+    /// Read-only PAC `FindProxyForURL` execution test.
+    TestPac {
+        script: String,
+        url: String,
+    },
+    /// Read-only TCP latency probe to a user-specified host and port.
+    TestLatency {
+        host: String,
+        port: u16,
     },
     SaveSettings {
         settings: Settings,
@@ -241,6 +350,8 @@ impl Command {
                 | Self::GetOperationDetails { .. }
                 | Self::TestRoute { .. }
                 | Self::TestRunningRoute { .. }
+                | Self::TestPac { .. }
+                | Self::TestLatency { .. }
         )
     }
 }
@@ -277,6 +388,18 @@ pub struct Status {
     /// Status reads and historical operation replay do not acknowledge this error.
     pub last_error: Option<Error>,
     pub recovery_required: bool,
+    /// Independent WinHTTP diagnostics; never written.
+    #[serde(default)]
+    pub winhttp: Option<WinHttpConfig>,
+    /// Local HTTP/SOCKS readiness result for the current Core.
+    #[serde(default)]
+    pub listener_state: String,
+    /// PAC service state for the current generation.
+    #[serde(default)]
+    pub pac_state: String,
+    /// Non-fatal startup notice, e.g. automatic connection was skipped.
+    #[serde(default)]
+    pub auto_connect_notice: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -286,6 +409,16 @@ pub struct RouteContext {
     pub inbound_tag: Option<String>,
     pub network: Option<String>,
     pub target_ip: Option<String>,
+    #[serde(default)]
+    pub source_ip: Option<String>,
+    #[serde(default)]
+    pub source_port: Option<u16>,
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub protocol: Option<String>,
+    #[serde(default)]
+    pub attrs: Option<std::collections::BTreeMap<String, String>>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RouteResult {

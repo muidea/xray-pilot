@@ -1,6 +1,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 mod app;
 mod dependencies;
+mod guided_config;
 mod icon;
 mod native_editor;
 mod path_display;

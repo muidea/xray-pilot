@@ -41,6 +41,8 @@ async fn incomplete_import_preserves_source_and_replay_but_does_not_start_core()
                 json: json.into(),
                 core_path: tmp.path().join("not-used"),
                 asset_root: tmp.path().into(),
+
+                allow_dynamic: false,
             },
             None,
         ))
@@ -100,6 +102,8 @@ async fn official_api_configuration_can_be_imported_and_checked_without_starting
                 json,
                 core_path: core.clone(),
                 asset_root: core.parent().unwrap().into(),
+
+                allow_dynamic: false,
             },
             None,
         ))

@@ -1,5 +1,26 @@
 use super::*;
 
+fn dialog_title(ui: &mut egui::Ui, title: &str, subtitle: &str) {
+    ui.label(RichText::new(title).strong().size(22.0));
+    if !subtitle.is_empty() {
+        ui.add(egui::Label::new(RichText::new(subtitle).small().weak()).wrap());
+    }
+    ui.add_space(10.0);
+}
+
+fn dialog_actions(ui: &mut egui::Ui) {
+    ui.add_space(4.0);
+    ui.separator();
+    ui.add_space(6.0);
+}
+
+fn danger_button(ui: &mut egui::Ui, label: &str) -> bool {
+    ui.add(egui::Button::new(
+        RichText::new(label).color(ui.visuals().error_fg_color),
+    ))
+    .clicked()
+}
+
 impl Action {
     pub(super) fn copy(&self) -> (&'static str, &'static str, &'static str) {
         match self {
@@ -38,20 +59,15 @@ impl Action {
                 "释放本程序持有的代理控制权并恢复先前设置，其他程序的代理可能仍然启用。",
                 "恢复先前设置",
             ),
-            Action::GuiExit => (
-                "仅退出界面？",
-                "界面与托盘退出，后台和 Core 继续运行。再次启动界面可重新连接。",
-                "仅退出界面",
+            Action::ExportJson => (
+                "导出配置？",
+                "配置可能包含节点地址、UUID、密码、私钥等敏感信息；导出文件不受本程序数据目录保护，请妥善保管。",
+                "导出…",
             ),
-            Action::Shutdown => (
-                "退出整个程序？",
-                "停止 Core，条件恢复本程序接管的代理，并退出后台和界面。执行中会等待当前操作完成；结果不明时须先查询。",
-                "停止并退出",
-            ),
-            Action::History(_) => (
-                "载入历史为草稿？",
-                "历史 JSON 将替换当前草稿，不立即回滚。载入后仍需用当前选定的 Core 重新检查并确认应用。",
-                "载入为草稿",
+            Action::Proxy(ProxyMode::Pac) => (
+                "使用 PAC 自动代理？",
+                "后台会发布不可变 PAC 版本并验证后设置当前用户 PAC URL；实际客户端缓存与出口仍需另行验证。",
+                "确认切换",
             ),
             Action::AdoptDraft(_) => (
                 "保留草稿并重新检查？",
@@ -71,13 +87,15 @@ impl App {
             let width = if matches!(dialog, Dialog::Create) {
                 900.0
             } else {
-                650.0
+                680.0
             };
             ui.set_width((ctx.content_rect().width() - 100.0).clamp(300.0, width));
             match &dialog {
                 Dialog::Create => self.create_dialog_contents(ui),
                 Dialog::Rename(profile) => self.rename_dialog_contents(ui, profile),
                 Dialog::Confirm(action) => self.confirm_dialog_contents(ui, action, ctx),
+                Dialog::HistoryDiff => self.history_diff_dialog_contents(ui),
+                Dialog::ExitChoice => self.exit_choice_dialog_contents(ui),
                 Dialog::UnsavedExit(kind) => self.unsaved_exit_dialog_contents(ui, *kind),
             }
         });
@@ -86,25 +104,30 @@ impl App {
         }
     }
     fn unsaved_exit_dialog_contents(&mut self, ui: &mut egui::Ui, kind: ExitKind) -> bool {
-        ui.heading("草稿未保存，暂未退出");
+        dialog_title(
+            ui,
+            "草稿未保存，暂未退出",
+            "部分修改尚未写入磁盘；可返回编辑、重试保存，或明确放弃后退出。",
+        );
         egui::ScrollArea::vertical()
             .id_salt("unsaved-exit-body")
-            .max_height((ui.ctx().content_rect().height() - 240.0).max(100.0))
+            .max_height((ui.ctx().content_rect().height() - 260.0).max(100.0))
             .show(ui, |ui| {
-                ui.label("部分修改尚未写入磁盘。返回后仍可编辑；导出可在其他可写目录保留副本。");
+                ui.label("导出可在其他可写目录保留副本；放弃后不会自动恢复这些修改。");
+                ui.add_space(6.0);
                 let mut profiles: Vec<_> = self.ui.pending_draft_writes.iter().collect();
                 profiles.sort();
                 for profile in profiles {
                     line(ui, "未保存配置", self.ui.workspace.name(profile));
                 }
             });
-        ui.separator();
+        dialog_actions(ui);
         let mut keep_open = true;
         ui.horizontal_wrapped(|ui| {
             if ui.button("返回编辑").clicked() {
                 keep_open = false;
             }
-            if ui.button("重试保存并退出").clicked() {
+            if primary(ui, "重试保存并退出", true) {
                 self.request_exit(kind);
                 if matches!(kind, ExitKind::Shutdown) {
                     self.advance_shutdown();
@@ -125,12 +148,115 @@ impl App {
                 ui.ctx()
                     .copy_text(serde_json::to_string_pretty(&self.unsaved_drafts_json()).unwrap());
             }
+            if danger_button(ui, "放弃未保存修改并退出") {
+                self.discard_unsaved_and_exit(kind);
+                keep_open = false;
+            }
         });
-        if ui.button("放弃未保存修改并退出").clicked() {
-            self.discard_unsaved_and_exit(kind);
-            keep_open = false;
-        }
         keep_open
+    }
+    fn exit_choice_dialog_contents(&mut self, ui: &mut egui::Ui) -> bool {
+        dialog_title(
+            ui,
+            "退出 Xray Pilot",
+            "请选择退出方式；默认值会在下次打开此对话框时预选。",
+        );
+        ui.radio_value(
+            &mut self.ui.exit_choice,
+            ExitKind::Gui,
+            "仅退出界面，后台和 Core 继续运行",
+        );
+        ui.label(
+            RichText::new("托盘仍可重新打开界面；适合暂时收起窗口。")
+                .small()
+                .weak(),
+        );
+        ui.add_space(6.0);
+        ui.radio_value(
+            &mut self.ui.exit_choice,
+            ExitKind::Shutdown,
+            "退出整个程序，停止 Core 并恢复代理",
+        );
+        ui.label(
+            RichText::new("会等待当前操作完成；结果不明时先恢复连接并查询原操作。")
+                .small()
+                .weak(),
+        );
+        ui.add_space(8.0);
+        ui.checkbox(&mut self.ui.exit_remember, "记住为默认退出方式");
+        dialog_actions(ui);
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("取消").clicked() {
+                return false;
+            }
+            if primary(ui, "继续退出", !self.exit) {
+                let choice = self.ui.exit_choice;
+                if self.ui.exit_remember {
+                    self.ui.workspace.exit_default = match choice {
+                        ExitKind::Gui => crate::workspace::ExitDefault::Gui,
+                        ExitKind::Shutdown => crate::workspace::ExitDefault::Shutdown,
+                    };
+                    self.save_workspace();
+                }
+                self.request_exit(choice);
+                return false;
+            }
+            true
+        })
+        .inner
+    }
+    fn history_diff_dialog_contents(&mut self, ui: &mut egui::Ui) -> bool {
+        let Some(preview) = self.ui.history_preview.clone() else {
+            return false;
+        };
+        dialog_title(
+            ui,
+            "比较历史版本与当前草稿",
+            &format!(
+                "历史 Core：{}；差异中 - 为当前草稿，+ 为历史版本。载入只替换草稿，不会立即回滚运行版本。",
+                preview.core
+            ),
+        );
+        let lines = diff_lines(&self.editor, &preview.json);
+        let added = lines.iter().filter(|line| line.starts_with('+')).count();
+        let removed = lines.iter().filter(|line| line.starts_with('-')).count();
+        if lines.is_empty() {
+            ui.label("当前草稿与历史版本内容相同。");
+        } else {
+            ui.label(format!("共 {added} 行新增、{removed} 行删除。"));
+            egui::ScrollArea::vertical()
+                .id_salt("history-diff")
+                .max_height((ui.ctx().content_rect().height() - 260.0).max(120.0))
+                .show(ui, |ui| {
+                    for line in lines.iter().take(300) {
+                        ui.label(
+                            RichText::new(line)
+                                .monospace()
+                                .color(if line.starts_with('+') {
+                                    accent(ui)
+                                } else {
+                                    ui.visuals().warn_fg_color
+                                }),
+                        );
+                    }
+                    if lines.len() > 300 {
+                        ui.label(RichText::new("差异较长，仅显示前 300 行。").small().weak());
+                    }
+                });
+        }
+        dialog_actions(ui);
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("保留当前草稿").clicked() {
+                self.ui.history_preview = None;
+                return false;
+            }
+            if primary(ui, "载入历史为草稿", true) {
+                self.load_history_preview();
+                return false;
+            }
+            true
+        })
+        .inner
     }
     fn confirm_dialog_contents(
         &mut self,
@@ -139,20 +265,21 @@ impl App {
         ctx: &egui::Context,
     ) -> bool {
         let (title, note, confirm) = action.copy();
-        ui.heading(title);
-        egui::ScrollArea::vertical()
-            .id_salt(("confirm-body", title))
-            .max_height((ctx.content_rect().height() - 180.0).max(140.0))
-            .show(ui, |ui| {
-                ui.add(egui::Label::new(note).wrap());
-                if let Action::Switch(id) = action {
-                    line(ui, "切换到", self.ui.workspace.name(id));
-                }
-                if let Action::Proxy(ProxyMode::Global) = action {
-                    line(ui, "使用 HTTP 入站", &self.runtime_http_tag());
-                }
-            });
-        ui.separator();
+        dialog_title(ui, title, note);
+        if matches!(action, Action::Switch(_) | Action::Proxy(ProxyMode::Global)) {
+            egui::ScrollArea::vertical()
+                .id_salt(("confirm-body", title))
+                .max_height((ctx.content_rect().height() - 220.0).max(100.0))
+                .show(ui, |ui| {
+                    if let Action::Switch(id) = action {
+                        line(ui, "切换到", self.ui.workspace.name(id));
+                    }
+                    if let Action::Proxy(ProxyMode::Global) = action {
+                        line(ui, "使用 HTTP 入站", &self.runtime_http_tag());
+                    }
+                });
+        }
+        dialog_actions(ui);
         ui.horizontal_wrapped(|ui| {
             let cancel = ui.button("取消").clicked();
             let confirm = primary(ui, confirm, !self.exit);
@@ -164,11 +291,19 @@ impl App {
         .inner
     }
     fn create_dialog_contents(&mut self, ui: &mut egui::Ui) -> bool {
-        ui.heading(if self.ui.import_json {
-            "添加 / 导入配置"
-        } else {
-            "新建配置"
-        });
+        dialog_title(
+            ui,
+            if self.ui.import_json {
+                "添加 / 导入配置"
+            } else {
+                "新建配置"
+            },
+            if self.ui.import_json {
+                "导入原生 JSON；名称、资源目录和节点参数由你确认，不自动推测。"
+            } else {
+                "选择场景与连接模板；保存不会启动 Core。"
+            },
+        );
         let mut can_import = false;
         let mut needs_work = false;
         // Keep the title and action row outside the scrolling body. Long JSON,
@@ -220,12 +355,49 @@ impl App {
                     let height = (body_height - used_height - 100.0).max(100.0);
                     json_editor(ui, &mut self.ui.new_json, "import-json", height);
                 } else {
-                    ui.label("创建本地 HTTP / SOCKS 入口与直连出站，不包含远端节点。添加配置不会自动启动。");
+                    use crate::guided_config::{Scene, Template};
+                    if !self.ui.new_guided_started {
+                        ui.label("选择使用场景");
+                        ui.horizontal_wrapped(|ui| {
+                            for scene in Scene::ALL { ui.selectable_value(&mut self.ui.new_scene, scene, scene.label()); }
+                        });
+                        if self.ui.new_scene != Scene::Direct {
+                            ui.label("选择与服务端一致的连接模板");
+                            egui::ComboBox::from_id_salt("create-template").selected_text(self.ui.new_template.label()).show_ui(ui, |ui| {
+                                for template in Template::ALL { ui.selectable_value(&mut self.ui.new_template, template, template.label()); }
+                            });
+                        }
+                        ui.label("模板自动准备本机 HTTP / SOCKS 入口及基础出站。远端地址、端口和认证参数按服务端资料填写。");
+                        if ui.button("开始填写").clicked() {
+                            self.ui.new_json = serde_json::to_string_pretty(&crate::guided_config::scene(self.ui.new_scene, self.ui.new_template)).unwrap();
+                            self.ui.new_guided_started = true;
+                            if self.ui.new_scene != Scene::Direct {
+                                self.ui.new_node_names.insert("node-1".into(), format!("{} 节点", self.ui.new_template.label()));
+                            }
+                        }
+                    } else {
+                        ui.label(RichText::new(format!("{} · {}", self.ui.new_scene.label(), if self.ui.new_scene == Scene::Direct { "本地诊断" } else { self.ui.new_template.label() })).strong());
+                        if let Ok(mut value) = xray_config::parse_document(self.ui.new_json.as_bytes()) {
+                            let mut changed = false;
+                            if self.ui.new_scene != Scene::Direct {
+                                ui.label("节点显示名称");
+                                let name = self.ui.new_node_names.entry("node-1".into()).or_default();
+                                ui.add(singleline(name, f32::INFINITY).char_limit(80));
+                                changed |= ui.push_id(("new-node", self.ui.new_editor_epoch), |ui| crate::guided_config::node_form(ui, &mut value["outbounds"][0], None)).inner;
+                            }
+                            if changed { self.ui.new_json = serde_json::to_string_pretty(&value).unwrap(); }
+                            if self.ui.new_scene == Scene::Split {
+                                ui.label("保存后进入「分流规则」，添加需要走代理、直连或阻止的网站。未设置例外时默认通过此节点。");
+                            }
+                            crate::guided_config::summary(ui, &value, &self.ui.new_node_names);
+                        }
+                        ui.label(RichText::new("本机端口将在检查和应用时核对，不会自动替换正在使用的端口。系统代理接管在应用预览前单独选择。").small().weak());
+                    }
                 }
                 match xray_config::parse_document(self.ui.new_json.as_bytes()) {
                     Ok(value) => {
-                        can_import = true;
-                        needs_work = config_review(ui, &value);
+                        can_import = self.ui.import_json || self.ui.new_guided_started;
+                        if can_import { needs_work = config_review(ui, &value); }
                     }
                     Err(error) => {
                         ui.colored_label(ui.visuals().error_fg_color, "JSON 暂时无法解析，请修正后保存；当前输入会保留。");
@@ -233,8 +405,8 @@ impl App {
                     }
                 }
             });
-        ui.separator();
-        ui.horizontal(|ui| {
+        dialog_actions(ui);
+        ui.horizontal_wrapped(|ui| {
             if ui.button("取消").clicked() {
                 return false;
             }
@@ -258,6 +430,12 @@ impl App {
                     profile_id.clone(),
                     self.ui.new_name.trim().chars().take(80).collect(),
                 );
+                if !self.ui.new_node_names.is_empty() {
+                    self.ui
+                        .workspace
+                        .node_names
+                        .insert(profile_id.clone(), self.ui.new_node_names.clone());
+                }
                 self.save_workspace();
                 self.send(Command::CreateProfile {
                     profile_id,
@@ -271,9 +449,14 @@ impl App {
         .inner
     }
     fn rename_dialog_contents(&mut self, ui: &mut egui::Ui, profile: &str) -> bool {
-        ui.heading("修改配置显示名称");
-        ui.label("名称不改变配置标识、JSON 内容或运行版本。");
+        dialog_title(
+            ui,
+            "修改配置显示名称",
+            "名称不改变配置标识、JSON 内容或运行版本。",
+        );
+        ui.label("配置显示名称");
         ui.add(singleline(&mut self.ui.rename, f32::INFINITY));
+        dialog_actions(ui);
         ui.horizontal_wrapped(|ui| {
             if ui.button("取消").clicked() {
                 return false;
@@ -290,7 +473,7 @@ impl App {
         })
         .inner
     }
-    pub(in crate::app) fn execute_action(&mut self, action: Action, ctx: &egui::Context) {
+    pub(in crate::app) fn execute_action(&mut self, action: Action, _ctx: &egui::Context) {
         match action {
             Action::Switch(id) => self.switch_profile(id),
             Action::Discard(profile) => {
@@ -300,6 +483,7 @@ impl App {
                 }
                 self.ui.unreadable_drafts.remove(&profile);
                 self.editor = self.saved_json.clone();
+                self.ui.number_inputs.clear();
                 self.ui.draft_conflict = false;
                 self.draft_edited();
                 self.stash_draft();
@@ -317,28 +501,30 @@ impl App {
                 profile_id: profile,
                 expected_revision: revision,
             }),
+            Action::ExportJson => {
+                #[cfg(windows)]
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_file_name("config.json")
+                    .save_file()
+                {
+                    if let Err(error) = std::fs::write(path, &self.editor) {
+                        self.fail(error.into(), String::new());
+                    } else {
+                        self.message = "配置已导出；文件可能包含认证信息。".into();
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    self.message = "当前平台不提供图形文件选择器。".into();
+                }
+            }
             Action::Stop => self.send(Command::StopCore),
             Action::Restart => self.send(Command::RestartCore),
             Action::Proxy(mode) => self.send(Command::SetProxyMode {
                 mode,
                 http_inbound_tag: self.runtime_http_tag(),
+                pac: (mode == ProxyMode::Pac).then(|| self.running_pac_draft()),
             }),
-            Action::History(generation_id) => self.send(Command::StageHistory {
-                generation_id,
-                expected_revision: self.revision.clone(),
-            }),
-            Action::GuiExit => {
-                if !self.busy && !self.shutdown_requested && self.ui.uncertain.is_none() {
-                    self.request_exit(ExitKind::Gui);
-                }
-            }
-            Action::Shutdown => {
-                self.request_exit(ExitKind::Shutdown);
-                if !self.ui.connected || self.ui.uncertain.is_some() {
-                    self.message = "退出请求已保留，请先恢复连接并查询原操作结果。".into();
-                }
-                ctx.request_repaint();
-            }
         }
     }
     pub(in crate::app) fn runtime_http_tag(&self) -> String {
@@ -371,9 +557,12 @@ impl App {
         let candidate = self.candidate.clone().unwrap();
         let response = egui::Modal::new(egui::Id::new("candidate-preview")).show(ctx, |ui| {
             ui.set_width((ctx.content_rect().width() - 100.0).clamp(300.0, 900.0));
-            ui.heading("预览本次应用");
-            ui.label("以下内容将作为同一个运行版本应用。确认后才会切换 Core 与配置。");
-            let body_height = (ctx.content_rect().height() - 240.0).max(140.0);
+            dialog_title(
+                ui,
+                "预览本次应用",
+                "以下内容将作为同一个运行版本应用；确认后才会切换 Core 与配置。",
+            );
+            let body_height = (ctx.content_rect().height() - 260.0).max(120.0);
             egui::ScrollArea::vertical()
                 .id_salt(("candidate-preview-body", &candidate.id))
                 .max_height(body_height)
@@ -382,7 +571,7 @@ impl App {
                         self.preview_body(ui, &candidate, body_height)
                     });
                 });
-            ui.separator();
+            dialog_actions(ui);
             ui.horizontal_wrapped(|ui| {
                 let cancel = ui.button("返回编辑").clicked();
                 let apply = primary(
@@ -400,6 +589,7 @@ impl App {
                         candidate_digest: candidate.digest,
                         proxy_mode: self.mode,
                         http_inbound_tag: self.http_tag.clone(),
+                        pac: (self.mode == ProxyMode::Pac).then(|| self.pac_draft()),
                     });
                 }
                 cancel || apply
@@ -419,15 +609,49 @@ impl App {
         );
         line(ui, "通过校验的 Core", &candidate.core.version);
         line(ui, "系统代理方式", mode_name(self.mode));
-        if self.mode == ProxyMode::Global {
+        if matches!(self.mode, ProxyMode::Global | ProxyMode::Pac) {
             line(ui, "接管使用的 HTTP Tag", &self.http_tag);
         }
-        line(ui, "实际出口", "未验证");
+        if self.mode == ProxyMode::Pac {
+            let draft = self.pac_draft();
+            line(ui, "PAC 服务端口", &draft.port.to_string());
+            line(
+                ui,
+                "PAC 脚本",
+                if draft.template {
+                    match draft.template_mode {
+                        xray_model::PacTemplateMode::All => "内置默认模板（全部代理）",
+                        xray_model::PacTemplateMode::ProxyList => "内置模板（仅代理清单）",
+                        xray_model::PacTemplateMode::DirectList => "内置模板（清单直连）",
+                    }
+                } else if draft.generated || draft.script.trim().is_empty() {
+                    "按当前配置自动生成"
+                } else {
+                    "自定义脚本"
+                },
+            );
+        }
+        if let Ok(value) = xray_config::parse_document(self.editor.as_bytes()) {
+            let names = self
+                .ui
+                .workspace
+                .node_names
+                .get(&candidate.profile_id)
+                .cloned()
+                .unwrap_or_default();
+            crate::guided_config::summary(ui, &value, &names);
+        }
         if !candidate.resources.complete {
             ui.add(egui::Label::new(
                 RichText::new("配置已通过 Core 校验，可手动确认应用；自动连接、异常重试及自动恢复旧 Core 不可用。")
                     .color(ui.visuals().warn_fg_color),
             ).wrap());
+            if !candidate.resources.dynamic.is_empty() {
+                ui.label(format!(
+                    "其中 {} 项为显式动态外部文件，启动前会重新核对观察哈希。",
+                    candidate.resources.dynamic.len()
+                ));
+            }
         }
         ui.separator();
         // The viewport bounds scrolling, while its document stays unbounded.

@@ -2,11 +2,69 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     fs,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::Mutex,
 };
 use xray_config::{optional_json, read_json, valid_id, write_json};
 use xray_model::{Error, Request, Response, Result, canonical_hash, hash, id};
+
+const MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Archive {
+    operation_archive: u32,
+    uncompressed_bytes: usize,
+    sha256: String,
+    gzip: Vec<u8>,
+}
+impl Operation {
+    pub(super) fn archive(&self) -> Result<Vec<u8>> {
+        let bytes = serde_json::to_vec(self)?;
+        if bytes.len() > MAX_RECORD_BYTES {
+            return Err(OperationStore::corrupt());
+        }
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&bytes)?;
+        Ok(serde_json::to_vec(&Archive {
+            operation_archive: 1,
+            uncompressed_bytes: bytes.len(),
+            sha256: hash(&bytes),
+            gzip: encoder.finish()?,
+        })?)
+    }
+}
+
+fn read_operation(path: &Path) -> Result<Option<Operation>> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let mut bytes = Vec::new();
+    file.take(MAX_RECORD_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_RECORD_BYTES {
+        return Err(OperationStore::corrupt());
+    }
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    if value.get("operation_archive").is_some() {
+        let archive: Archive = serde_json::from_value(value)?;
+        if archive.operation_archive != 1 || archive.uncompressed_bytes > MAX_RECORD_BYTES {
+            return Err(OperationStore::corrupt());
+        }
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(archive.gzip.as_slice())
+            .take(archive.uncompressed_bytes as u64 + 1)
+            .read_to_end(&mut decoded)?;
+        if decoded.len() != archive.uncompressed_bytes || hash(&decoded) != archive.sha256 {
+            return Err(OperationStore::corrupt());
+        }
+        Ok(Some(serde_json::from_slice(&decoded)?))
+    } else {
+        Ok(Some(serde_json::from_value(value)?))
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Operation {
@@ -80,7 +138,7 @@ impl OperationStore {
     pub fn get(&self, caller: &str, id: &str) -> Result<Option<Operation>> {
         let path = self.path(caller, id);
         let result = (|| {
-            let op: Option<Operation> = optional_json(&path)?;
+            let op = read_operation(&path)?;
             if let Some(op) = &op {
                 self.verify(&path, op)?;
                 if op.caller != caller || op.request.request_id != id {
@@ -183,7 +241,7 @@ impl OperationStore {
             let path = entry?.path();
             // Crash leftovers from atomic_write are not published operation records.
             if path.extension().is_some_and(|ext| ext == "json") {
-                let op: Operation = read_json(&path).map_err(|_| Self::corrupt())?;
+                let op = read_operation(&path)?.ok_or_else(Self::corrupt)?;
                 self.verify(&path, &op)?;
                 records.push(op);
             }

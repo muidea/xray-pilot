@@ -24,11 +24,25 @@ impl App {
                         ui.checkbox(&mut self.settings.start_on_logon, "登录 Windows 后启动界面");
                         ui.label(RichText::new("登录自启不等同于启动 Core。").small().weak());
                         ui.add_space(10.0);
-                        ui.checkbox(&mut self.settings.connect_on_start, "后台启动后自动连接");
+                        ui.checkbox(
+                            &mut self.settings.restore_last_state,
+                            "启动时恢复上次 Core 运行状态",
+                        );
                         ui.label(
-                            RichText::new("仅使用上次已成功应用的版本；恢复异常时先处理安全恢复。")
-                                .small()
-                                .weak(),
+                            RichText::new(
+                                "上次退出前 Core 正在运行，则组件启动后自动恢复；手动停止的状态不会恢复。包含动态外部依赖时会跳过自动连接；未分类字段会尝试启动，但自动恢复不可用。",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                        ui.add_space(6.0);
+                        ui.checkbox(&mut self.settings.connect_on_start, "后台启动后总是自动连接");
+                        ui.label(
+                            RichText::new(
+                                "即使上次为停止状态，也尝试启动上次已成功应用的版本；恢复异常时先处理安全恢复。",
+                            )
+                            .small()
+                            .weak(),
                         );
                     });
                 }
@@ -75,6 +89,16 @@ impl App {
                     );
                     ui.separator();
                     ui.label("草稿与配置显示名称保存在本数据目录中，草稿不改变已应用的原生配置。草稿可能包含节点认证信息，请与正式配置一起妥善保管。");
+                    ui.separator();
+                    ui.label("会话日志");
+                    ui.monospace(display_path(&self.root.join("logs/supervisor.log")));
+                    ui.label(
+                        RichText::new(
+                            "日志带 UTC 时间戳与操作/代次上下文，凭据字段自动脱敏；超过 4 MiB 轮转一个备份，备份保留 7 天。",
+                        )
+                        .small()
+                        .weak(),
+                    );
                 }
             }
             if matches!(
@@ -258,18 +282,6 @@ impl App {
                     if before != self.settings_context() {
                         self.settings_edited();
                     }
-                    ui.separator();
-                    if primary(
-                        ui,
-                        "保存并继续",
-                        self.write_blocker().is_none() && !self.core_path.is_empty(),
-                    ) {
-                        self.settings.core_path = self.core_path.clone().into();
-                        self.ui.advance_setup_after_save = true;
-                        self.send(Command::SaveSettings {
-                            settings: self.settings.clone(),
-                        });
-                    }
                 }
                 1 => {
                     ui.label(RichText::new("添加第一份配置").strong().size(21.0));
@@ -340,9 +352,24 @@ impl App {
                 }
             }
             ui.add_space(15.0);
-            if ui.button("稍后设置，进入总览").clicked() {
-                self.ui.onboarding = false;
-            }
+            ui.horizontal_wrapped(|ui| {
+                if self.ui.setup_step == 0
+                    && primary(
+                        ui,
+                        "保存并继续",
+                        self.write_blocker().is_none() && !self.core_path.is_empty(),
+                    )
+                {
+                    self.settings.core_path = self.core_path.clone().into();
+                    self.ui.advance_setup_after_save = true;
+                    self.send(Command::SaveSettings {
+                        settings: self.settings.clone(),
+                    });
+                }
+                if ui.button("稍后设置，进入总览").clicked() {
+                    self.ui.onboarding = false;
+                }
+            });
         });
     }
 }

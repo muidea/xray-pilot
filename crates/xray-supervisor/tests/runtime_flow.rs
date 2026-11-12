@@ -41,6 +41,8 @@ async fn candidate(s: &mut Supervisor<FakeProxy>, core: &std::path::Path, json: 
                 json: json.into(),
                 core_path: core.into(),
                 asset_root: root,
+
+                allow_dynamic: false,
             },
         )
         .await
@@ -54,6 +56,7 @@ fn apply(c: &Candidate, mode: ProxyMode) -> Command {
         candidate_digest: c.digest.clone(),
         proxy_mode: mode,
         http_inbound_tag: "http-in".into(),
+        pac: None,
     }
 }
 fn port() -> u16 {
@@ -462,4 +465,160 @@ async fn global_waits_for_slow_listener_and_restores_old_core_on_timeout_or_exit
         }
         send(&mut s, Command::StopCore).await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn dynamic_external_inputs_are_opt_in_and_revalidated_before_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let core = fixture(tmp.path());
+    let external = tmp.path().join("external-cert.pem");
+    fs::write(&external, "certificate-v1").unwrap();
+    let proxy = FakeProxy(Arc::new(Mutex::new(ProxySnapshot::default())));
+    let mut s = Supervisor::with_backend(&tmp.path().join("data"), proxy)
+        .await
+        .unwrap();
+    let json = serde_json::json!({
+        "inbounds": [{"tag":"http-in","listen":"127.0.0.1","port":port(),"protocol":"http"}],
+        "outbounds": [{"tag":"direct","protocol":"freedom","streamSettings":{"tlsSettings":{"certificates":[{"certificateFile": external.to_string_lossy()}]}}}]
+    })
+    .to_string();
+    send(
+        &mut s,
+        Command::CreateProfile {
+            profile_id: "default".into(),
+            json: json.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let profile = s.store.profile("default").unwrap();
+    let root = s.store.root.clone();
+    let c: Candidate = serde_json::from_value(
+        send(
+            &mut s,
+            Command::ValidateDraft {
+                profile_id: "default".into(),
+                expected_revision: profile.revision,
+                json,
+                core_path: core,
+                asset_root: root,
+                allow_dynamic: true,
+            },
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(!c.resources.complete);
+    assert_eq!(c.resources.dynamic.len(), 1);
+    send(&mut s, apply(&c, ProxyMode::Direct)).await.unwrap();
+    assert!(s.generation.as_ref().unwrap().running);
+    fs::write(&external, "certificate-v2").unwrap();
+    let error = send(&mut s, Command::RestartCore).await.unwrap_err();
+    assert_eq!(error.code, "RESOURCE_REVALIDATION_REQUIRED");
+    assert!(s.generation.as_ref().unwrap().running);
+    send(&mut s, Command::StopCore).await.unwrap();
+}
+
+#[tokio::test]
+async fn tcp_latency_probe_measures_a_local_listener_and_rejects_invalid_input() {
+    let tmp = tempfile::tempdir().unwrap();
+    let proxy = FakeProxy(Arc::new(Mutex::new(ProxySnapshot::default())));
+    let mut s = Supervisor::with_backend(&tmp.path().join("data"), proxy)
+        .await
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = listener.accept().await;
+    });
+    let result = send(
+        &mut s,
+        Command::TestLatency {
+            host: "127.0.0.1".into(),
+            port: address.port(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(result["port"], address.port());
+    assert!(result["ms"].is_u64());
+    server.await.unwrap();
+    assert_eq!(
+        send(
+            &mut s,
+            Command::TestLatency {
+                host: "  ".into(),
+                port: 443
+            }
+        )
+        .await
+        .unwrap_err()
+        .code,
+        "LATENCY_HOST_INVALID"
+    );
+    assert_eq!(
+        send(
+            &mut s,
+            Command::TestLatency {
+                host: "127.0.0.1".into(),
+                port: 0
+            }
+        )
+        .await
+        .unwrap_err()
+        .code,
+        "LATENCY_PORT_INVALID"
+    );
+}
+
+#[tokio::test]
+async fn incomplete_frozen_resources_attempt_auto_connect_without_blocking() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("data");
+    let core = fixture(tmp.path());
+    let proxy = FakeProxy(Arc::new(Mutex::new(ProxySnapshot::default())));
+    let mut s = Supervisor::with_backend(&root, proxy.clone())
+        .await
+        .unwrap();
+    send(
+        &mut s,
+        Command::CreateProfile {
+            profile_id: "default".into(),
+            json: "{}".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let c = candidate(
+        &mut s,
+        &core,
+        r#"{"unknown":{"extension":true},"outbounds":[{"tag":"direct","protocol":"freedom"}]}"#,
+    )
+    .await;
+    assert!(!c.resources.complete);
+    send(&mut s, apply(&c, ProxyMode::Direct)).await.unwrap();
+    send(
+        &mut s,
+        Command::SaveSettings {
+            settings: Settings {
+                connect_on_start: true,
+                ..Settings::default()
+            },
+        },
+    )
+    .await
+    .unwrap();
+    drop(s);
+
+    let mut s = Supervisor::with_backend(&root, proxy).await.unwrap();
+    let status = send(&mut s, Command::GetStatus).await.unwrap();
+    assert_eq!(status["core_state"], "Running");
+    assert_eq!(status["recovery_required"], false);
+    assert!(
+        status["auto_connect_notice"]
+            .as_str()
+            .is_some_and(|notice| notice.contains("未分类依赖"))
+    );
+    send(&mut s, Command::StopCore).await.unwrap();
 }

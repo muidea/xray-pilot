@@ -48,6 +48,8 @@ impl Harness {
             json: self.app.editor.clone(),
             core_path: self.app.core_path.clone().into(),
             asset_root: self.app.asset_root.clone().into(),
+
+            allow_dynamic: false,
         })
     }
 }
@@ -77,6 +79,8 @@ fn candidate(app: &App, json: &str) -> Candidate {
             files: vec![],
             complete: true,
             notes: vec![],
+
+            dynamic: vec![],
         },
     }
 }
@@ -86,6 +90,8 @@ fn apply(c: &Candidate) -> Command {
         candidate_digest: c.digest.clone(),
         proxy_mode: ProxyMode::Direct,
         http_inbound_tag: "http-in".into(),
+
+        pac: None,
     }
 }
 
@@ -170,10 +176,18 @@ fn history_preview_is_bound_to_selection_and_stages_matching_json() {
         expected_revision: h.app.revision.clone(),
     });
     let c = candidate(&h.app, "{\"historical\":true}");
+    let before = h.app.editor.clone();
     h.reply(
         request,
         serde_json::json!({"json":"{\"historical\":true}","candidate":c}),
     );
+    assert_eq!(h.app.editor, before);
+    assert!(matches!(h.app.ui.dialog, Some(ui::Dialog::HistoryDiff)));
+    assert_eq!(
+        h.app.ui.history_preview.as_ref().unwrap().json,
+        "{\"historical\":true}"
+    );
+    assert!(h.app.load_history_preview());
     assert_eq!(h.app.editor, "{\"historical\":true}");
     assert!(!h.app.candidate_matches());
     let request = h.send(Command::StageHistory {
@@ -220,12 +234,17 @@ fn stored_settings() -> Settings {
         core_path: std::env::temp_dir().join("saved-xray.exe"),
         start_on_logon: true,
         connect_on_start: true,
+        restore_last_state: true,
     }
 }
 fn assert_settings_and_save(h: &mut Harness, expected: &Settings) {
     assert_eq!(h.app.core_path, expected.core_path.display().to_string());
     assert_eq!(h.app.settings.start_on_logon, expected.start_on_logon);
     assert_eq!(h.app.settings.connect_on_start, expected.connect_on_start);
+    assert_eq!(
+        h.app.settings.restore_last_state,
+        expected.restore_last_state
+    );
     h.app.settings.core_path = h.app.core_path.clone().into();
     let request = h.send(Command::SaveSettings {
         settings: h.app.settings.clone(),
@@ -236,6 +255,15 @@ fn assert_settings_and_save(h: &mut Harness, expected: &Settings) {
     assert_eq!(settings.core_path, expected.core_path);
     assert_eq!(settings.start_on_logon, expected.start_on_logon);
     assert_eq!(settings.connect_on_start, expected.connect_on_start);
+    assert_eq!(settings.restore_last_state, expected.restore_last_state);
+}
+
+#[test]
+fn legacy_settings_default_to_restoring_the_previous_core_state() {
+    let settings: Settings =
+        serde_json::from_str(r#"{"core_path":"","connect_on_start":false,"start_on_logon":false}"#)
+            .unwrap();
+    assert!(settings.restore_last_state);
 }
 
 #[test]
@@ -527,6 +555,10 @@ fn status(generation: Option<Generation>) -> Status {
         supervisor_epoch: "supervisor-1".into(),
         last_error: None,
         recovery_required: false,
+        winhttp: None,
+        listener_state: "Ready".into(),
+        pac_state: "Stopped".into(),
+        auto_connect_notice: None,
     }
 }
 fn generation(app: &App) -> Generation {
@@ -538,6 +570,8 @@ fn generation(app: &App) -> Generation {
         proxy_mode: ProxyMode::Direct,
         http_inbound_tag: "http-in".into(),
         running: true,
+
+        pac: None,
     }
 }
 fn fail_request(h: &mut Harness, request: Request, code: &str) {
@@ -564,6 +598,8 @@ fn successful_runtime_operations_refresh_request_errors_and_keep_event_history()
         let failed = h.send(Command::SetProxyMode {
             mode: ProxyMode::Global,
             http_inbound_tag: "http-in".into(),
+
+            pac: None,
         });
         fail_request(&mut h, failed, "PROXY_ENDPOINT_INVALID");
         let poll = h.send(Command::GetStatus);
@@ -587,6 +623,8 @@ fn successful_runtime_operations_refresh_request_errors_and_keep_event_history()
             "proxy" => Command::SetProxyMode {
                 mode: ProxyMode::Global,
                 http_inbound_tag: "http-in".into(),
+
+                pac: None,
             },
             "restart" => Command::RestartCore,
             _ => Command::StopCore,
@@ -618,6 +656,8 @@ fn successful_runtime_request_preserves_local_persistence_failure() {
             Command::SetProxyMode {
                 mode: ProxyMode::Global,
                 http_inbound_tag: "http-in".into(),
+
+                pac: None,
             }
         };
         let request = h.send(command);
@@ -665,6 +705,7 @@ fn profile_drafts_survive_switching_without_changing_the_runtime() {
 fn persisted_draft_revision_conflict_requires_an_explicit_decision() {
     let root = tempfile::tempdir().unwrap();
     crate::workspace::Draft {
+        number_inputs: Default::default(),
         base_revision: hash(b"old"),
         json: "{\"recovered\":true}".into(),
     }
@@ -1054,4 +1095,93 @@ fn background_apply_persists_the_new_draft_base_for_response_and_result_query() 
         assert_eq!(reopened.app.editor, "{\"s\":2}");
         assert!(!reopened.app.has_draft_conflict(), "query={query}");
     }
+}
+
+#[test]
+fn unfinished_numbers_survive_failed_save_switch_restart_and_background_apply() {
+    use crate::workspace::{Draft, NumberInput};
+    let root = tempfile::tempdir().unwrap();
+    let mut h = Harness::empty();
+    h.app.root = root.path().into();
+    h.app.ui.persistence = true;
+    let json = r#"{"outbounds":[{"settings":{"port":0}}]}"#;
+    h.app.load(profile("p", json));
+    let path = "/outbounds/0/settings/port";
+    h.app.ui.number_inputs.insert(
+        path.into(),
+        NumberInput {
+            source: "0".into(),
+            text: "-".into(),
+        },
+    );
+    h.app.draft_edited();
+    assert!(h.app.has_draft_edits());
+    h.app.validate_draft();
+    assert!(!h.requests.try_iter().any(|r| r.command.is_write()));
+    std::fs::create_dir_all(root.path().join("config")).unwrap();
+    std::fs::write(root.path().join("config/editor-drafts"), b"blocked").unwrap();
+    h.app.request_exit(crate::app::ui::ExitKind::Gui);
+    assert!(!h.app.exit);
+    std::fs::remove_file(root.path().join("config/editor-drafts")).unwrap();
+    assert!(h.app.stash_draft());
+    h.app.load(profile("b", "{}"));
+    // Applying the same JSON in the background must not remove a pending number draft.
+    h.app.applied_draft("p", Some(json));
+    let disk = Draft::load(root.path(), "p").unwrap().unwrap();
+    assert_eq!(disk.number_inputs[path].text, "-");
+    let mut reopened = Harness::empty();
+    reopened.app.root = root.path().into();
+    reopened.app.ui.persistence = true;
+    reopened.app.load(profile("p", json));
+    assert_eq!(reopened.app.ui.number_inputs[path].text, "-");
+    assert!(!reopened.app.has_draft_conflict());
+    reopened.app.editor = json.replace("port\":0", "port\":-2");
+    reopened.app.draft_edited();
+    assert!(reopened.app.ui.number_inputs.is_empty());
+    assert!(reopened.app.stash_draft());
+    assert!(
+        Draft::load(root.path(), "p")
+            .unwrap()
+            .unwrap()
+            .number_inputs
+            .is_empty()
+    );
+}
+
+#[test]
+fn tray_profile_selection_opens_editor_without_applying_and_preserves_draft_confirmation() {
+    let mut h = Harness::new();
+    h.app.profiles = vec![
+        xray_model::ProfileSummary {
+            id: "p".into(),
+            revision: hash(b"{}"),
+        },
+        xray_model::ProfileSummary {
+            id: "b".into(),
+            revision: hash(b"{}"),
+        },
+    ];
+    let ctx = eframe::egui::Context::default();
+    h.app.open_profile_from_tray("b", &ctx);
+    let requests: Vec<_> = h.requests.try_iter().collect();
+    assert!(
+        requests
+            .iter()
+            .any(|r| matches!(&r.command, Command::GetProfile{profile_id} if profile_id=="b"))
+    );
+    assert!(!requests.iter().any(|r| r.command.is_write()));
+    let mut h = Harness::new();
+    h.app.profiles = vec![xray_model::ProfileSummary {
+        id: "b".into(),
+        revision: hash(b"{}"),
+    }];
+    h.app.editor = "{\"draft\":true}".into();
+    h.app.draft_edited();
+    h.app.open_profile_from_tray("b", &ctx);
+    assert!(
+        !h.requests
+            .try_iter()
+            .any(|r| matches!(r.command, Command::GetProfile { .. }) || r.command.is_write())
+    );
+    assert_eq!(h.app.editor, "{\"draft\":true}");
 }

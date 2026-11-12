@@ -96,7 +96,7 @@ impl App {
     }
     fn profile_choice(&mut self, ui: &mut egui::Ui, p: ProfileSummary) {
         let dirty = if p.id == self.profile_id {
-            self.editor != self.saved_json
+            self.has_draft_edits()
         } else {
             self.ui.drafts.contains_key(&p.id)
         };
@@ -117,7 +117,7 @@ impl App {
             .clicked()
             && self.selected_profile != p.id
         {
-            if self.editor != self.saved_json {
+            if self.has_draft_edits() {
                 self.ui.dialog = Some(Dialog::Confirm(Action::Switch(p.id)));
             } else {
                 self.switch_profile(p.id);
@@ -128,7 +128,7 @@ impl App {
         if self.profile_id.is_empty() {
             card_with_min_height(ui, min_height, |ui| {
                 ui.label(RichText::new("添加第一份配置").strong().size(20.0));
-                ui.label("导入服务商提供的原生 JSON，或新建本地直连模板。添加不会自动启动 Core。");
+                ui.label("选择使用场景和节点模板，填写连接信息；也可导入已有 JSON。添加不会自动启动 Core。");
             });
             return;
         }
@@ -140,7 +140,7 @@ impl App {
                         .size(21.0),
                 );
                 ui.label(
-                    RichText::new(if self.editor != self.saved_json {
+                    RichText::new(if self.has_draft_edits() {
                         "未应用草稿"
                     } else {
                         "已保存"
@@ -148,13 +148,18 @@ impl App {
                     .small()
                     .weak(),
                 );
-            });
-            ui.horizontal_wrapped(|ui| {
                 if ui.button("修改名称").clicked() {
                     self.ui.rename = self.ui.workspace.name(&self.profile_id).into();
                     self.ui.dialog = Some(Dialog::Rename(self.profile_id.clone()));
                 }
-                if ui.add_enabled(enabled, egui::Button::new("复制")).clicked() {
+                if ui
+                    .add_enabled(
+                        enabled && self.ui.number_inputs.is_empty(),
+                        egui::Button::new("复制"),
+                    )
+                    .on_hover_text("请先补全未完成的数值输入，再复制配置")
+                    .clicked()
+                {
                     self.begin_create(false, true);
                 }
                 if ui
@@ -173,26 +178,17 @@ impl App {
                     }));
                 }
                 #[cfg(windows)]
-                if ui.button("导出 JSON").clicked()
-                    && let Some(path) = rfd::FileDialog::new()
-                        .set_file_name("config.json")
-                        .save_file()
+                if ui
+                    .add_enabled(
+                        self.ui.number_inputs.is_empty(),
+                        egui::Button::new("导出 JSON"),
+                    )
+                    .on_hover_text("请先补全未完成的数值输入，再导出 JSON；输入已随草稿保留")
+                    .clicked()
                 {
-                    if let Err(error) = std::fs::write(path, &self.editor) {
-                        self.fail(error.into(), String::new());
-                    } else {
-                        self.message = "配置已导出。".into();
-                    }
+                    self.ui.dialog = Some(Dialog::Confirm(Action::ExportJson));
                 }
             });
-            ui.label(
-                RichText::new(format!(
-                    "正在编辑：草稿 · 标识：{} · 编辑不会改变当前运行版本",
-                    self.profile_id
-                ))
-                .small()
-                .weak(),
-            );
             if self.ui.draft_conflict {
                 ui.colored_label(
                     ui.visuals().warn_fg_color,
@@ -213,9 +209,9 @@ impl App {
             ui.horizontal_wrapped(|ui| {
                 for (tab, title) in [
                     (ProfileTab::Summary, "概览"),
-                    (ProfileTab::Inbounds, "入站"),
-                    (ProfileTab::Outbounds, "出站"),
-                    (ProfileTab::Routing, "路由"),
+                    (ProfileTab::Inbounds, "本地入口"),
+                    (ProfileTab::Outbounds, "节点"),
+                    (ProfileTab::Routing, "分流规则"),
                     (ProfileTab::Json, "原始 JSON"),
                     (ProfileTab::History, "历史"),
                 ] {
@@ -262,15 +258,28 @@ impl App {
         });
     }
     fn profile_footer(&mut self, ui: &mut egui::Ui, enabled: bool) {
-        ui.label(
-            RichText::new("草稿独立保存，只有确认应用后才会更新运行版本。")
-                .small()
-                .weak(),
-        );
         ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(
-                    enabled && self.editor != self.saved_json,
+                    enabled && !self.ui.undo.is_empty(),
+                    egui::Button::new("撤销编辑"),
+                )
+                .clicked()
+            {
+                self.undo_edit();
+            }
+            if ui
+                .add_enabled(
+                    enabled && !self.ui.redo.is_empty(),
+                    egui::Button::new("重做"),
+                )
+                .clicked()
+            {
+                self.redo_edit();
+            }
+            if ui
+                .add_enabled(
+                    enabled && self.has_draft_edits(),
                     egui::Button::new("放弃草稿"),
                 )
                 .clicked()
@@ -313,34 +322,51 @@ impl App {
         );
     }
     pub(in crate::app) fn profile_body(&mut self, ui: &mut egui::Ui, enabled: bool) {
+        if let Some(path) = self.ui.number_inputs.keys().next().cloned() {
+            ui.add(
+                egui::Label::new(format!(
+                    "有 {} 项未完成的数值输入，已随草稿保留。补全后可检查应用。",
+                    self.ui.number_inputs.len()
+                ))
+                .wrap(),
+            );
+            if ui.button("定位未完成数值").clicked() {
+                self.ui.profile_tab = if path.starts_with("/inbounds/") {
+                    ProfileTab::Inbounds
+                } else if path.starts_with("/outbounds/") {
+                    ProfileTab::Outbounds
+                } else {
+                    ProfileTab::Routing
+                };
+                self.ui.guided.native = true;
+                self.ui.guided.focus = Some(path);
+            }
+        }
         match self.ui.profile_tab {
             ProfileTab::Summary => {
                 if let Ok(value) = xray_config::parse_document(self.editor.as_bytes()) {
-                    config_review(ui, &value);
-                    ui.separator();
-                    for (label, key) in [
-                        ("入站数量", "/inbounds"),
-                        ("出站数量", "/outbounds"),
-                        ("路由规则", "/routing/rules"),
-                    ] {
-                        line(
-                            ui,
-                            label,
-                            &value
-                                .pointer(key)
-                                .and_then(|v| v.as_array())
-                                .map_or(0, Vec::len)
-                                .to_string(),
-                        );
+                    if let Some(path) = config_review_action(ui, &value) {
+                        self.ui.profile_tab = if path.starts_with("/outbounds") {
+                            ProfileTab::Outbounds
+                        } else if path.starts_with("/routing") {
+                            ProfileTab::Routing
+                        } else if path.starts_with("/inbounds") {
+                            ProfileTab::Inbounds
+                        } else {
+                            ProfileTab::Json
+                        };
+                        self.ui.guided.native = false;
+                        self.ui.guided.notice = Some(format!("待补充字段：{path}"));
+                        self.ui.guided.focus = Some(path);
                     }
-                    line(
-                        ui,
-                        "默认出站",
-                        value
-                            .pointer("/outbounds/0/tag")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("未命名 / 未设置"),
-                    );
+                    let names = self
+                        .ui
+                        .workspace
+                        .node_names
+                        .get(&self.profile_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    crate::guided_config::summary(ui, &value, &names);
                 } else {
                     ui.colored_label(
                         ui.visuals().warn_fg_color,
@@ -349,18 +375,31 @@ impl App {
                 }
                 ui.add_space(12.0);
                 ui.label("编辑不会立即切换连接");
-                ui.label(RichText::new("入站、出站和路由使用原生字段；未知字段和规则顺序保留。结构化编辑与原始 JSON 始终指向同一份草稿。").weak());
+                ui.label(RichText::new("节点按协议填写，分流规则按顺序匹配。高级字段与原始 JSON 保留，所有编辑指向同一份草稿。").weak());
                 if ui.button("编辑原始 JSON").clicked() {
                     self.ui.profile_tab = ProfileTab::Json;
                 }
                 ui.add_space(10.0);
+                if ui
+                    .checkbox(
+                        &mut self.ui.allow_dynamic,
+                        "允许动态外部依赖路径（不保证回滚内容）",
+                    )
+                    .on_hover_text("默认要求相对资源路径并冻结副本；显式允许后，应用与启动前会重新核对观察哈希，自动连接与自动恢复被禁用")
+                    .changed()
+                {
+                    self.invalidate_candidate();
+                }
                 ui.add_enabled_ui(enabled, |ui| {
                     self.proxy_draft_controls(ui);
                 });
             }
             ProfileTab::Json => {
                 if ui
-                    .add_enabled(enabled, egui::Button::new("格式化 JSON"))
+                    .add_enabled(
+                        enabled && self.ui.number_inputs.is_empty(),
+                        egui::Button::new("格式化 JSON"),
+                    )
                     .clicked()
                 {
                     match serde_json::from_str::<serde_json::Value>(&self.editor) {
@@ -372,7 +411,7 @@ impl App {
                     }
                 }
                 let response = ui
-                    .add_enabled_ui(enabled, |ui| {
+                    .add_enabled_ui(enabled && self.ui.number_inputs.is_empty(), |ui| {
                         let note_height = ui.text_style_height(&egui::TextStyle::Small)
                             + ui.spacing().item_spacing.y;
                         let height = (ui.available_height() - note_height).max(80.0);
@@ -389,31 +428,50 @@ impl App {
                 );
             }
             ProfileTab::History => {
-                if self.history.is_empty() {
-                    ui.label("暂无已提交的历史版本。");
-                }
-                for g in self.history.clone() {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.monospace(format!(
-                            "{} · {}",
-                            g.id.chars().take(8).collect::<String>(),
-                            g.candidate.core.version
-                        ));
-                        if ui
-                            .add_enabled(enabled, egui::Button::new("载入为草稿"))
-                            .clicked()
-                        {
-                            self.ui.dialog = Some(Dialog::Confirm(Action::History(g.id)));
-                        }
-                    });
-                }
                 ui.label(
                     RichText::new(
-                        "载入历史只替换草稿；仍需使用当前选定的 Core 重新检查、预览和确认应用。",
+                        "历史版本按提交顺序展示。先比较差异，再决定是否载入为草稿；载入后仍需检查并应用。",
                     )
                     .small()
                     .weak(),
                 );
+                if self.history.is_empty() {
+                    ui.label("暂无已提交的历史版本。");
+                }
+                for g in self.history.clone() {
+                    let current = self.committed_id() == Some(g.id.as_str());
+                    ui.horizontal_wrapped(|ui| {
+                        ui.monospace(format!(
+                            "{} · {} · {}{}{}",
+                            g.id.chars().take(8).collect::<String>(),
+                            g.candidate.core.version,
+                            mode_name(g.proxy_mode),
+                            g.pac
+                                .as_ref()
+                                .map(|p| format!(
+                                    " · PAC {}",
+                                    p.revision.chars().take(8).collect::<String>()
+                                ))
+                                .unwrap_or_default(),
+                            if current { " · 当前运行" } else { "" }
+                        ));
+                        if ui
+                            .add_enabled(enabled, egui::Button::new("比较并载入…"))
+                            .clicked()
+                        {
+                            if !self.ui.number_inputs.is_empty() {
+                                self.message =
+                                    "请先补全未完成的数值输入，或明确放弃草稿，再比较历史。".into();
+                            } else {
+                                self.message = "正在准备历史与当前草稿的比较…".into();
+                                self.send(Command::StageHistory {
+                                    generation_id: g.id.clone(),
+                                    expected_revision: self.revision.clone(),
+                                });
+                            }
+                        }
+                    });
+                }
             }
             tab => {
                 let section = match tab {
@@ -422,17 +480,109 @@ impl App {
                     _ => "rules",
                 };
                 if let Ok(mut value) = serde_json::from_str(&self.editor) {
-                    let changed = ui
-                        .add_enabled_ui(enabled, |ui| {
-                            crate::native_editor::edit(ui, &mut value, section)
-                        })
-                        .inner;
+                    let mut names = self
+                        .ui
+                        .workspace
+                        .node_names
+                        .get(&self.profile_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    if let Some(notice) = &self.ui.guided.notice {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(notice).color(ui.visuals().warn_fg_color),
+                            )
+                            .wrap(),
+                        );
+                    }
+                    let pending_focus = self.ui.guided.focus.clone();
+                    let mut changed = false;
+                    let mut names_changed = false;
+                    ui.push_id((&self.profile_id, self.view_epoch), |ui| {
+                        ui.add_enabled_ui(enabled, |ui| {
+                            if tab != ProfileTab::Inbounds {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.selectable_value(
+                                        &mut self.ui.guided.native,
+                                        false,
+                                        "常用表单",
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.ui.guided.native,
+                                        true,
+                                        "高级：原生字段编辑",
+                                    );
+                                });
+                            }
+                            if tab == ProfileTab::Inbounds || self.ui.guided.native {
+                                changed |= crate::native_editor::edit_focused(
+                                    ui,
+                                    &mut value,
+                                    section,
+                                    pending_focus.as_deref(),
+                                    &mut self.ui.number_inputs,
+                                );
+                                self.ui.guided.focus = None;
+                            } else if self.ui.number_inputs.is_empty() {
+                                let result = if tab == ProfileTab::Outbounds {
+                                    crate::guided_config::edit_nodes(
+                                        ui,
+                                        &mut value,
+                                        &mut names,
+                                        &mut self.ui.guided,
+                                    )
+                                } else {
+                                    crate::guided_config::edit_routes(
+                                        ui,
+                                        &mut value,
+                                        &names,
+                                        &mut self.ui.guided,
+                                    )
+                                };
+                                changed |= result.changed;
+                                names_changed = result.names_changed;
+                                if result.raw {
+                                    self.ui.guided.native = true;
+                                    self.ui.guided.focus = pending_focus;
+                                }
+                            }
+                        });
+                    });
+                    if names_changed {
+                        self.ui
+                            .workspace
+                            .node_names
+                            .insert(self.profile_id.clone(), names);
+                        self.save_workspace();
+                    }
                     if changed {
+                        self.ui.guided.notice = None;
                         self.editor = serde_json::to_string_pretty(&value).unwrap();
                         self.draft_edited();
                     }
                 } else {
                     ui.label("请先在原始 JSON 中修正语法。");
+                }
+                if tab == ProfileTab::Routing
+                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&self.editor)
+                {
+                    let conflicts = xray_config::conflicts::conflicts(&value);
+                    if !conflicts.is_empty() {
+                        ui.separator();
+                        ui.colored_label(
+                            ui.visuals().warn_fg_color,
+                            format!("发现 {} 项静态顺序/遮蔽风险", conflicts.len()),
+                        );
+                        for conflict in conflicts {
+                            ui.label(
+                                RichText::new(format!(
+                                    "规则 {}：{}",
+                                    conflict.index, conflict.message
+                                ))
+                                .small(),
+                            );
+                        }
+                    }
                 }
                 ui.label(
                     RichText::new(if tab == ProfileTab::Routing {
@@ -454,13 +604,58 @@ impl App {
         egui::ComboBox::from_id_salt("draft-mode")
             .selected_text(mode_name(self.mode))
             .show_ui(ui, |ui| {
-                for mode in [ProxyMode::Direct, ProxyMode::Global] {
+                for mode in [ProxyMode::Direct, ProxyMode::Global, ProxyMode::Pac] {
                     ui.selectable_value(&mut self.mode, mode, mode_name(mode));
                 }
             });
-        if self.mode == ProxyMode::Global {
-            ui.label("用于接管代理的 HTTP 入站 Tag");
-            ui.add(singleline(&mut self.http_tag, f32::INFINITY));
+        if matches!(self.mode, ProxyMode::Global | ProxyMode::Pac) {
+            ui.label("接管系统代理使用的本地 HTTP 入口");
+            let listeners: Vec<_> = serde_json::from_str::<serde_json::Value>(&self.editor)
+                .ok()
+                .and_then(|v| v.get("inbounds").and_then(|a| a.as_array()).cloned())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|v| matches!(v["protocol"].as_str(), Some("http" | "mixed")))
+                .filter_map(|v| {
+                    let tag = v["tag"].as_str()?.to_owned();
+                    Some((
+                        tag.clone(),
+                        format!(
+                            "{}:{} · {}",
+                            v["listen"].as_str().unwrap_or("默认监听"),
+                            v.get("port")
+                                .map(|p| p.to_string())
+                                .unwrap_or_else(|| "待补充端口".into()),
+                            tag
+                        ),
+                    ))
+                })
+                .collect();
+            let selected = listeners
+                .iter()
+                .find(|(tag, _)| tag == &self.http_tag)
+                .map(|(_, label)| label.clone())
+                .unwrap_or_else(|| "请选择本地 HTTP 入口".into());
+            egui::ComboBox::from_id_salt("proxy-http-listener")
+                .width(ui.available_width().min(420.0))
+                .selected_text(selected)
+                .show_ui(ui, |ui| {
+                    for (tag, label) in &listeners {
+                        ui.selectable_value(&mut self.http_tag, tag.clone(), label);
+                    }
+                });
+            if listeners.is_empty() {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    "请先在本地入口中添加回环 HTTP 监听。应用前还会检查端口占用和入口兼容性。",
+                );
+            }
+        }
+        if self.mode == ProxyMode::Pac && self.pac_draft().script.trim().is_empty() {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                "PAC 脚本为空；可在 PAC 页生成或填写后再应用。",
+            );
         }
         ui.label(
             RichText::new("这里仅设置下次应用方式。解除接管会恢复先前设置，其他代理可能仍然有效。")

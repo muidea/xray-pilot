@@ -61,6 +61,8 @@ async fn candidate(s: &mut Supervisor<FakeProxy>, json: String) -> Candidate {
                 json,
                 core_path: core,
                 asset_root: assets,
+
+                allow_dynamic: false,
             },
         )
         .await,
@@ -73,6 +75,8 @@ fn apply(c: &Candidate, mode: ProxyMode) -> Command {
         candidate_digest: c.digest.clone(),
         proxy_mode: mode,
         http_inbound_tag: "http-in".into(),
+
+        pac: None,
     }
 }
 fn unused_port() -> u16 {

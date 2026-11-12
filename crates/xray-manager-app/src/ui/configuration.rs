@@ -95,6 +95,19 @@ fn json_area(
 
 /// Returns whether fields need attention. Import of a valid object remains allowed.
 pub(super) fn config_review(ui: &mut egui::Ui, value: &serde_json::Value) -> bool {
+    config_review_inner(ui, value, false).0
+}
+
+pub(super) fn config_review_action(ui: &mut egui::Ui, value: &serde_json::Value) -> Option<String> {
+    config_review_inner(ui, value, true).1
+}
+
+fn config_review_inner(
+    ui: &mut egui::Ui,
+    value: &serde_json::Value,
+    jump: bool,
+) -> (bool, Option<String>) {
+    let mut target = None;
     let issues = xray_config::inspect_config(value);
     let blocking = issues.iter().filter(|i| i.blocking).count();
     if issues.is_empty() {
@@ -103,7 +116,7 @@ pub(super) fn config_review(ui: &mut egui::Ui, value: &serde_json::Value) -> boo
                 .small()
                 .weak(),
         );
-        return false;
+        return (false, None);
     }
     ui.label(
         RichText::new(if blocking > 0 {
@@ -119,7 +132,14 @@ pub(super) fn config_review(ui: &mut egui::Ui, value: &serde_json::Value) -> boo
         .default_open(blocking > 0)
         .show(ui, |ui| {
             for issue in issues.into_iter().take(20) {
-                ui.label(RichText::new(&issue.path).monospace().strong());
+                ui.push_id(&issue.path, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(&issue.path).monospace().strong());
+                        if jump && ui.button("去补充").clicked() {
+                            target = Some(issue.path.clone());
+                        }
+                    });
+                });
                 ui.add(egui::Label::new(issue.message).wrap());
                 ui.add(egui::Label::new(RichText::new(issue.help).weak()).wrap());
                 ui.add_space(6.0);
@@ -131,5 +151,5 @@ pub(super) fn config_review(ui: &mut egui::Ui, value: &serde_json::Value) -> boo
                 ));
             }
         });
-    true
+    (true, target)
 }

@@ -181,6 +181,8 @@ async fn core_exit_releases_global_proxy_while_an_idle_client_is_connected() {
                 json: config,
                 core_path: core,
                 asset_root: tmp.path().into(),
+
+                allow_dynamic: false,
             },
             None,
         ))
@@ -195,6 +197,8 @@ async fn core_exit_releases_global_proxy_while_an_idle_client_is_connected() {
             candidate_digest: c.digest,
             proxy_mode: xray_model::ProxyMode::Global,
             http_inbound_tag: "http-in".into(),
+
+            pac: None,
         },
         None,
     ))

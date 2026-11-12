@@ -347,6 +347,8 @@ async fn official_candidate_and_history_publications_recover_on_windows() {
                 json: json.into(),
                 core_path: core_path.clone(),
                 asset_root: tmp.path().into(),
+
+                allow_dynamic: false,
             };
             let command = if history {
                 let c: Candidate =
@@ -358,6 +360,8 @@ async fn official_candidate_and_history_publications_recover_on_windows() {
                         candidate_digest: c.digest,
                         proxy_mode: ProxyMode::Direct,
                         http_inbound_tag: "http-in".into(),
+
+                        pac: None,
                     },
                 )
                 .await
@@ -554,11 +558,15 @@ async fn failed_automatic_attempts_share_one_budget_and_manual_stop_remains_avai
                 files: vec![],
                 complete: true,
                 notes: vec![],
+
+                dynamic: vec![],
             },
         },
         proxy_mode: ProxyMode::Direct,
         http_inbound_tag: "http-in".into(),
         running: true,
+
+        pac: None,
     };
     write_json(&s.manifest(), &generation).unwrap();
     s.generation = Some(generation.clone());
@@ -618,6 +626,8 @@ async fn official_failed_starts_and_successful_restarts_share_budget_on_windows(
                     .expect("XRAY_TEST_CORE")
                     .into(),
                 asset_root: tmp.path().into(),
+
+                allow_dynamic: false,
             },
         )
         .await
@@ -631,6 +641,8 @@ async fn official_failed_starts_and_successful_restarts_share_budget_on_windows(
             candidate_digest: c.digest,
             proxy_mode: ProxyMode::Direct,
             http_inbound_tag: "http-in".into(),
+
+            pac: None,
         },
     )
     .await

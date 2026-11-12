@@ -19,6 +19,38 @@ async fn run() -> Result<()> {
             i += 1;
         }
     }
+    if positional.first().map(String::as_str) == Some("maintenance") {
+        let mut options = xray_supervisor::maintenance::Options::default();
+        let mut index = 1;
+        while index < positional.len() {
+            match positional[index].as_str() {
+                "--apply" => options.apply = true,
+                "--compress-operations" => options.compress_operations = true,
+                "--retain-days" => {
+                    index += 1;
+                    options.retain_days = positional
+                        .get(index)
+                        .and_then(|v| v.parse().ok())
+                        .ok_or_else(|| {
+                            xray_model::Error::new(
+                                "INVALID_ARGUMENT",
+                                "--retain-days requires a positive integer",
+                            )
+                        })?;
+                }
+                _ => {
+                    return Err(xray_model::Error::new(
+                        "INVALID_ARGUMENT",
+                        "maintenance [--apply] [--retain-days DAYS] [--compress-operations]",
+                    ));
+                }
+            }
+            index += 1;
+        }
+        let report = xray_supervisor::maintenance::run(&root, &options)?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
     let command = match positional.first().map(String::as_str).unwrap_or("status") {
         "status" => Command::GetStatus,
         "profiles" => Command::ListProfileSummaries {
@@ -45,7 +77,7 @@ async fn run() -> Result<()> {
         _ => {
             return Err(xray_model::Error::new(
                 "INVALID_ARGUMENT",
-                "Commands: status, profiles [AFTER], logs, start, stop, shutdown, operation ID, operation-details ID, request (JSON from stdin)",
+                "Commands: maintenance [--apply] [--retain-days DAYS] [--compress-operations], status, profiles [AFTER], logs, start, stop, shutdown, operation ID, operation-details ID, request (JSON from stdin)",
             ));
         }
     };

@@ -5,7 +5,7 @@ impl App {
         heading(
             ui,
             "诊断",
-            "进程、代理归属与实际网络分别呈现。路由只做静态预测。",
+            "进程、代理归属与本机探针分别呈现；路由只做静态预测，实际出口需外部验证。",
         );
         card(ui, |ui| {
             ui.label(RichText::new("本机状态").strong().size(18.0));
@@ -31,14 +31,106 @@ impl App {
                     .unwrap_or("未读取"),
             );
             line(ui, "系统代理归属", &self.proxy_label());
-            line(ui, "真实网络连通性", "未检测");
-            line(ui, "实际出口", "未验证");
+            if let Some(status) = &self.status {
+                line(
+                    ui,
+                    "代理模式",
+                    status
+                        .generation
+                        .as_ref()
+                        .map(|g| mode_name(g.proxy_mode))
+                        .unwrap_or("未应用"),
+                );
+                line(
+                    ui,
+                    "恢复状态",
+                    if status.recovery_required {
+                        "需要安全恢复"
+                    } else {
+                        "正常"
+                    },
+                );
+                if let Some(notice) = &status.auto_connect_notice {
+                    line(ui, "自动连接", notice);
+                }
+                if let Some(error) = &status.last_error {
+                    line(ui, "最近错误", &error.code);
+                    egui::CollapsingHeader::new("错误详情").show(ui, |ui| {
+                        ui.add(egui::Label::new(&error.message).wrap());
+                    });
+                }
+            }
+            line(
+                ui,
+                "本地入口",
+                match self.status.as_ref().map(|s| s.listener_state.as_str()) {
+                    Some("Ready") => "就绪（本机探针已通过）",
+                    Some("Starting") => "启动或恢复中",
+                    Some(_) => "未运行",
+                    None => "未读取",
+                },
+            );
+            line(
+                ui,
+                "PAC 服务",
+                match self.status.as_ref().map(|s| s.pac_state.as_str()) {
+                    Some("Serving") => "已发布",
+                    Some(_) => "未发布",
+                    None => "未读取",
+                },
+            );
+            if let Some(winhttp) = self.status.as_ref().and_then(|s| s.winhttp.as_ref()) {
+                ui.label(
+                    RichText::new(
+                        "用途：查看 WinHTTP 客户端（独立于 WinINet 系统代理）的默认会话代理来源；只读，不影响本程序的代理接管。",
+                    )
+                    .small()
+                    .weak(),
+                );
+                let summary = match winhttp.access_type.as_str() {
+                    "NAMED_PROXY" => "显式代理",
+                    "NO_PROXY" => "不使用代理",
+                    _ => "默认 / 系统代理",
+                };
+                line(ui, "WinHTTP 会话代理", summary);
+                egui::CollapsingHeader::new("WinHTTP 只读诊断").show(ui, |ui| {
+                    line(ui, "访问类型", &winhttp.access_type);
+                    line(
+                        ui,
+                        "代理",
+                        if winhttp.proxy.is_empty() {
+                            "（空）"
+                        } else {
+                            &winhttp.proxy
+                        },
+                    );
+                    line(
+                        ui,
+                        "绕过",
+                        if winhttp.bypass.is_empty() {
+                            "（空）"
+                        } else {
+                            &winhttp.bypass
+                        },
+                    );
+                    ui.label(
+                        RichText::new(
+                            "由 WinHTTP 默认会话只读获取；本程序不修改机器级或 WinHTTP 代理。",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                });
+            }
             if ui.button("重新读取状态").clicked() {
                 self.send(Command::GetStatus);
             }
             if !self.ui.operation_details.is_empty() {
                 egui::CollapsingHeader::new("最近查询的操作证据").show(ui, |ui| {
-                    ui.monospace(&self.ui.operation_details);
+                    egui::ScrollArea::vertical()
+                        .id_salt("operation-details")
+                        .max_height(240.0)
+                        .show(ui, |ui| ui.monospace(&self.ui.operation_details));
                 });
             }
             if let Some(request_id) = self.failed_request.clone()
@@ -57,6 +149,13 @@ impl App {
             if let Some(id) = self.committed_id() {
                 line(ui, "运行配置", self.ui.workspace.name(id));
             }
+            ui.label(
+                RichText::new(
+                    "用途：核对某个目标会命中当前运行配置的哪条 routing 规则和出站；只做静态预测，不发起连接，也不代替实际访问。",
+                )
+                .small()
+                .weak(),
+            );
             let field_width = (ui.available_width() - 164.0).max(140.0);
             egui::Grid::new("route-fields")
                 .num_columns(2)
@@ -84,16 +183,53 @@ impl App {
                             });
                     });
                     ui.end_row();
-                    ui.label("入站 Tag（可选）");
-                    ui.add(singleline(&mut self.route_inbound, field_width));
-                    ui.end_row();
-                    ui.label("已知目标 IP（可选）");
-                    ui.add(singleline(&mut self.ui.route_ip, field_width));
-                    ui.end_row();
                 });
+            egui::CollapsingHeader::new("高级匹配条件（可选）").show(ui, |ui| {
+                egui::Grid::new("route-advanced-fields")
+                    .num_columns(2)
+                    .min_col_width(148.0)
+                    .min_row_height(CONTROL_HEIGHT)
+                    .spacing(egui::vec2(16.0, 10.0))
+                    .show(ui, |ui| {
+                        ui.label("入站 Tag");
+                        ui.add(singleline(&mut self.route_inbound, field_width));
+                        ui.end_row();
+                        ui.label("已知目标 IP");
+                        ui.add(singleline(&mut self.ui.route_ip, field_width));
+                        ui.end_row();
+                        ui.label("来源 IP / 端口");
+                        ui.horizontal(|ui| {
+                            ui.add(singleline(&mut self.ui.route_source, field_width - 110.0));
+                            ui.add(singleline(&mut self.ui.route_source_port, 100.0));
+                        });
+                        ui.end_row();
+                        ui.label("用户 / 协议");
+                        ui.horizontal(|ui| {
+                            ui.add(singleline(
+                                &mut self.ui.route_user,
+                                field_width / 2.0 - 4.0,
+                            ));
+                            ui.add(singleline(
+                                &mut self.ui.route_protocol,
+                                field_width / 2.0 - 4.0,
+                            ));
+                        });
+                        ui.end_row();
+                        ui.label("属性 key=value");
+                        ui.add(singleline(&mut self.ui.route_attrs, field_width));
+                        ui.end_row();
+                    });
+                ui.label(
+                    RichText::new(
+                        "仅填写已知条件；留空表示该条件未知。DNS 解析、sniffing 和未支持的前序条件都可能使结果不确定。",
+                    )
+                    .small()
+                    .weak(),
+                );
+            });
             if primary(
                 ui,
-                "预测运行版本的规则匹配",
+                "预测命中规则与出站",
                 self.ui.connected && self.is_running() && !self.busy,
             ) {
                 let port = if self.ui.route_port.trim().is_empty() {
@@ -112,24 +248,51 @@ impl App {
                 if let Some(port) = port.filter(|_| ip_valid && !self.route_host.trim().is_empty())
                 {
                     let optional = |s: &str| (!s.trim().is_empty()).then(|| s.trim().to_string());
-                    let context = RouteContext {
-                        host: self.route_host.trim().into(),
-                        port,
-                        inbound_tag: optional(&self.route_inbound),
-                        network: optional(&self.route_network),
-                        target_ip: optional(&self.ui.route_ip).or_else(|| {
-                            self.route_host
-                                .trim()
-                                .parse::<std::net::IpAddr>()
-                                .ok()
-                                .map(|ip| ip.to_string())
-                        }),
-                    };
-                    if let Some(g) = self.status.as_ref().and_then(|s| s.generation.as_ref()) {
-                        self.send(Command::TestRunningRoute {
-                            generation_id: g.id.clone(),
-                            context,
-                        });
+                    let source_port = optional(&self.ui.route_source_port)
+                        .map(|v| v.parse::<u16>())
+                        .transpose();
+                    let attrs = optional(&self.ui.route_attrs)
+                        .map(|text| {
+                            text.lines()
+                                .filter(|line| !line.trim().is_empty())
+                                .map(|line| {
+                                    line.split_once('=')
+                                        .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
+                                        .ok_or(())
+                                })
+                                .collect::<std::result::Result<
+                                    std::collections::BTreeMap<String, String>,
+                                    (),
+                                >>()
+                        })
+                        .transpose();
+                    if source_port.is_err() || attrs.is_err() {
+                        self.message = "来源端口或属性格式无效；属性请使用每行 key=value。".into();
+                    } else {
+                        let context = RouteContext {
+                            host: self.route_host.trim().into(),
+                            port,
+                            inbound_tag: optional(&self.route_inbound),
+                            network: optional(&self.route_network),
+                            target_ip: optional(&self.ui.route_ip).or_else(|| {
+                                self.route_host
+                                    .trim()
+                                    .parse::<std::net::IpAddr>()
+                                    .ok()
+                                    .map(|ip| ip.to_string())
+                            }),
+                            source_ip: optional(&self.ui.route_source),
+                            source_port: source_port.unwrap_or_default(),
+                            user: optional(&self.ui.route_user),
+                            protocol: optional(&self.ui.route_protocol),
+                            attrs: attrs.unwrap_or_default(),
+                        };
+                        if let Some(g) = self.status.as_ref().and_then(|s| s.generation.as_ref()) {
+                            self.send(Command::TestRunningRoute {
+                                generation_id: g.id.clone(),
+                                context,
+                            });
+                        }
                     }
                 } else {
                     self.message = "请输入目标、1–65535 的端口和有效的目标 IP（可留空）。".into();
@@ -165,11 +328,60 @@ impl App {
                         .map(|i| (i + 1).to_string())
                         .unwrap_or_else(|| "无确定命中".into()),
                 );
-                line(ui, "实际出口", "未验证");
                 egui::CollapsingHeader::new("预测依据与限制").show(ui, |ui| {
                     ui.label(result.reason);
                     ui.monospace(&self.route_result);
                 });
+            }
+        });
+        ui.add_space(16.0);
+        card(ui, |ui| {
+            ui.label(RichText::new("出站 TCP 延迟探测").strong().size(18.0));
+            ui.label(
+                RichText::new(
+                    "仅测量到目标主机和端口的 TCP 握手时间，不经过 Xray，也不代表远端服务可用。",
+                )
+                .small()
+                .weak(),
+            );
+            ui.horizontal_wrapped(|ui| {
+                ui.label("主机");
+                ui.add(singleline(&mut self.ui.latency_host, 260.0));
+                ui.label("端口");
+                ui.add(singleline(&mut self.ui.latency_port, 80.0));
+                if primary(
+                    ui,
+                    "开始探测",
+                    self.ui.connected
+                        && !self.busy
+                        && !self.ui.latency_host.trim().is_empty()
+                        && !self.ui.latency_port.trim().is_empty(),
+                ) {
+                    match self.ui.latency_port.trim().parse::<u16>() {
+                        Ok(port) if port > 0 => {
+                            self.send(Command::TestLatency {
+                                host: self.ui.latency_host.trim().into(),
+                                port,
+                            });
+                        }
+                        _ => self.message = "端口必须是 1–65535 的数字。".into(),
+                    }
+                }
+            });
+            if let Ok(result) = serde_json::from_str::<serde_json::Value>(&self.ui.latency_result) {
+                ui.separator();
+                line(ui, "目标地址", result["address"].as_str().unwrap_or("未知"));
+                line(
+                    ui,
+                    "TCP 握手",
+                    &format!("{} ms", result["ms"].as_u64().unwrap_or_default()),
+                );
+                egui::CollapsingHeader::new("原始结果").show(ui, |ui| {
+                    ui.monospace(&self.ui.latency_result);
+                });
+            } else if !self.ui.latency_result.is_empty() {
+                ui.separator();
+                ui.monospace(&self.ui.latency_result);
             }
         });
     }

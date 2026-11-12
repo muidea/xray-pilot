@@ -70,6 +70,8 @@ async fn setup_script(
                 json: json.into(),
                 core_path: core,
                 asset_root: tmp.path().into(),
+
+                allow_dynamic: false,
             },
         )
         .await
@@ -86,6 +88,8 @@ fn apply(c: &Candidate) -> Command {
         candidate_digest: c.digest.clone(),
         proxy_mode: ProxyMode::Direct,
         http_inbound_tag: "http-in".into(),
+
+        pac: None,
     }
 }
 async fn crash(s: &mut Supervisor<FakeProxy>) {
@@ -270,6 +274,8 @@ async fn safety_stop_preserves_an_unrecorded_previous_commit() {
                 json: json.into(),
                 core_path: c.core.path,
                 asset_root: root,
+
+                allow_dynamic: false,
             },
         )
         .await
@@ -310,6 +316,7 @@ async fn failing_candidate(s: &mut Supervisor<FakeProxy>) -> Candidate {
                 json: r#"{"outbounds":[{"protocol":"freedom"}],"fixtureFailStart":true}"#.into(),
                 core_path: core,
                 asset_root: s.store.root.clone(),
+                allow_dynamic: false,
             },
         )
         .await
@@ -562,6 +569,8 @@ async fn candidate_and_history_publications_recover_lost_results_without_reexecu
                     json: s.store.profile("p").unwrap().json,
                     core_path: c.core.path,
                     asset_root: tmp.path().into(),
+
+                    allow_dynamic: false,
                 }
             };
             let request = Request::new(command, s.generation.as_ref().map(|g| g.id.clone()));
@@ -735,6 +744,7 @@ async fn failed_core_validation_keeps_raw_diagnostics_in_session_logs_only() {
             json: r#"{"outbounds":[{"protocol":"freedom"}],"fixtureReject":true}"#.into(),
             core_path: good.core.path,
             asset_root: s.store.root.clone(),
+            allow_dynamic: false,
         },
         s.generation.as_ref().map(|g| g.id.clone()),
     );

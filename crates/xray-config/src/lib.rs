@@ -1,3 +1,4 @@
+pub mod conflicts;
 mod coverage;
 mod validation;
 pub use validation::{ConfigIssue, inspect_config, parse_document};
@@ -138,6 +139,7 @@ impl Store {
             "resources",
             "cores",
             "snapshots",
+            "logs",
         ] {
             fs::create_dir_all(root.join(dir))?;
         }

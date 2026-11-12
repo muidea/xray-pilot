@@ -114,7 +114,11 @@ pub fn protect_directory(path: &Path) -> Result<()> {
 #[cfg(windows)]
 pub fn descriptor() -> Result<*mut std::ffi::c_void> {
     use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
-    let sddl = wide(format!("D:P(A;OICI;FA;;;{})(A;OICI;FA;;;SY)", principal()?));
+    // The manager is a per-user application.  Do not grant SYSTEM or any
+    // service account access: a machine service is outside this product's
+    // deployment model.  Elevated processes for the same signed-in user are
+    // still authorized by the SID check in the IPC peer validation.
+    let sddl = wide(format!("D:P(A;OICI;FA;;;{})", principal()?));
     let mut descriptor = std::ptr::null_mut();
     unsafe {
         if ConvertStringSecurityDescriptorToSecurityDescriptorW(

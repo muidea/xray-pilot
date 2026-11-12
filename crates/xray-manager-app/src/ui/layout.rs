@@ -40,6 +40,7 @@ impl App {
                 for (page, title, short) in [
                     (Page::Overview, "总览", "总览"),
                     (Page::Profiles, "配置", "配置"),
+                    (Page::Pac, "PAC", "PAC"),
                     (Page::Diagnostics, "诊断", "诊断"),
                     (Page::Logs, "日志", "日志"),
                     (Page::Settings, "设置", "设置"),
@@ -77,40 +78,10 @@ impl App {
                     ui.label(match self.ui.page {
                         Page::Overview => "总览",
                         Page::Profiles => "配置",
+                        Page::Pac => "PAC",
                         Page::Diagnostics => "诊断",
                         Page::Logs => "日志",
                         Page::Settings => "设置",
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.menu_button("程序", |ui| {
-                            if ui.button("仅退出界面，后台继续运行").clicked() {
-                                self.ui.dialog = Some(Dialog::Confirm(Action::GuiExit));
-                                ui.close();
-                            }
-                            if ui.button("退出程序（停止 Core 并恢复代理）").clicked()
-                            {
-                                self.ui.dialog = Some(Dialog::Confirm(Action::Shutdown));
-                                ui.close();
-                            }
-                        });
-                        if ui
-                            .button(if ctx.theme() == egui::Theme::Dark {
-                                "浅色"
-                            } else {
-                                "深色"
-                            })
-                            .on_hover_text("快速切换主题；设置中可选择跟随系统")
-                            .clicked()
-                        {
-                            self.set_appearance(
-                                if ctx.theme() == egui::Theme::Dark {
-                                    Appearance::Light
-                                } else {
-                                    Appearance::Dark
-                                },
-                                ctx,
-                            );
-                        }
                     });
                 });
             });
@@ -137,22 +108,6 @@ impl App {
                         } else if self.busy {
                             ui.label("操作正在执行，仍可浏览页面与日志。");
                         } else {
-                            ui.menu_button("完整消息", |ui| {
-                                ui.set_width(
-                                    (ctx.content_rect().width() - 100.0).clamp(280.0, 680.0),
-                                );
-                                if ui.button("复制完整消息").clicked() {
-                                    ui.ctx().copy_text(self.message.clone());
-                                }
-                                egui::ScrollArea::vertical()
-                                    .id_salt("feedback-message")
-                                    .max_height(
-                                        (ctx.content_rect().height() * 0.4).clamp(100.0, 400.0),
-                                    )
-                                    .show(ui, |ui| {
-                                        ui.add(egui::Label::new(&self.message).wrap());
-                                    });
-                            });
                             ui.add(
                                 egui::Label::new(RichText::new(&self.message).small()).truncate(),
                             );
@@ -185,6 +140,7 @@ impl App {
                             match self.ui.page {
                                 Page::Overview => self.overview(ui),
                                 Page::Profiles => self.profiles_page(ui, page_height),
+                                Page::Pac => self.pac_page(ui),
                                 Page::Diagnostics => self.diagnostics(ui),
                                 Page::Logs => self.logs_page(ui),
                                 Page::Settings => self.settings_page(ui),
@@ -345,6 +301,13 @@ impl App {
             } else {
                 ui.label("选择一份配置，检查后开始运行。");
             }
+            if let Some(notice) = self
+                .status
+                .as_ref()
+                .and_then(|status| status.auto_connect_notice.as_deref())
+            {
+                ui.colored_label(ui.visuals().warn_fg_color, notice);
+            }
             ui.add_space(10.0);
             ui.horizontal_wrapped(|ui| {
                 if running {
@@ -454,15 +417,24 @@ impl App {
                 .as_ref()
                 .is_some_and(|s| s.proxy_state == "Owned");
             ui.horizontal_wrapped(|ui| {
-                for mode in [ProxyMode::Direct, ProxyMode::Global] {
+                let committed = self
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.generation.as_ref())
+                    .map(|g| g.proxy_mode);
+                for mode in [ProxyMode::Direct, ProxyMode::Global, ProxyMode::Pac] {
+                    let selected = if owned {
+                        committed == Some(mode)
+                    } else {
+                        mode == ProxyMode::Direct
+                    };
                     if ui
                         .add_enabled(
                             enabled && (mode == ProxyMode::Direct || running),
-                            egui::Button::new(mode_name(mode))
-                                .selected((mode == ProxyMode::Global) == owned),
+                            egui::Button::new(mode_name(mode)).selected(selected),
                         )
                         .clicked()
-                        && ((mode == ProxyMode::Global) != owned)
+                        && !selected
                     {
                         self.ui.dialog = Some(Dialog::Confirm(Action::Proxy(mode)));
                     }

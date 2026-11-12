@@ -137,6 +137,8 @@ async fn missing_legacy_global_lease_stays_blocked_after_safety_stop_and_restart
                 files: vec![],
                 complete: true,
                 notes: vec![],
+
+                dynamic: vec![],
             },
         };
         let g = Generation {
@@ -147,6 +149,8 @@ async fn missing_legacy_global_lease_stays_blocked_after_safety_stop_and_restart
             proxy_mode: ProxyMode::Global,
             http_inbound_tag: "http-in".into(),
             running: true,
+
+            pac: None,
         };
         if phase == "committed" {
             s.publish(&g).unwrap();
@@ -235,6 +239,8 @@ async fn official_global_lease_loss_keeps_diagnostics_and_can_be_repaired() {
                     json,
                     core_path: core.clone(),
                     asset_root: tmp.path().into(),
+
+                    allow_dynamic: false,
                 },
             )
             .await
@@ -248,6 +254,8 @@ async fn official_global_lease_loss_keeps_diagnostics_and_can_be_repaired() {
                 candidate_digest: c.digest,
                 proxy_mode: ProxyMode::Global,
                 http_inbound_tag: "http-in".into(),
+
+                pac: None,
             },
         )
         .await

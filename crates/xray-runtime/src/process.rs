@@ -20,11 +20,21 @@ impl Process {
         fn drain<T: tokio::io::AsyncRead + Unpin + Send + 'static>(mut pipe: T, logs: Logs) {
             tokio::spawn(async move {
                 let mut bytes = [0; 2048];
+                let mut buffer = String::new();
                 while let Ok(n) = pipe.read(&mut bytes).await {
                     if n == 0 {
                         break;
                     }
-                    log(&logs, String::from_utf8_lossy(&bytes[..n]).into_owned());
+                    buffer.push_str(&String::from_utf8_lossy(&bytes[..n]));
+                    while let Some(end) = buffer.find('\n') {
+                        log(&logs, buffer.drain(..=end).collect::<String>());
+                    }
+                    if buffer.len() > 64 * 1024 {
+                        log(&logs, std::mem::take(&mut buffer));
+                    }
+                }
+                if !buffer.is_empty() {
+                    log(&logs, buffer);
                 }
             });
         }
@@ -187,11 +197,21 @@ impl Process {
             std::thread::spawn(move || {
                 use std::io::Read;
                 let mut bytes = [0; 2048];
+                let mut buffer = String::new();
                 while let Ok(n) = pipe.read(&mut bytes) {
                     if n == 0 {
                         break;
                     }
-                    log(&logs, String::from_utf8_lossy(&bytes[..n]).into_owned());
+                    buffer.push_str(&String::from_utf8_lossy(&bytes[..n]));
+                    while let Some(end) = buffer.find('\n') {
+                        log(&logs, buffer.drain(..=end).collect::<String>());
+                    }
+                    if buffer.len() > 64 * 1024 {
+                        log(&logs, std::mem::take(&mut buffer));
+                    }
+                }
+                if !buffer.is_empty() {
+                    log(&logs, buffer);
                 }
             });
             Ok(Self {

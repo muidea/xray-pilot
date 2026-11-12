@@ -13,7 +13,7 @@ cargo build --release --workspace --locked
 
 Linux GUI 需要图形桌面；系统代理、托盘、文件选择器和登录自启仅实现 Windows 版本。
 
-当前源码已实现用户确认的五页原生界面，流程、草稿资料及新增只读接口见 [界面实现说明](ui-implementation.md)。已发布 rc.3 仍为旧界面，复测新界面请构建当前源码。
+当前源码已补配置向导、PAC 自动代理、日志持久化、WinHTTP 只读诊断、Dynamic 依赖和编辑撤销，尚未包含在已发布的 rc.4 中；复测请构建当前源码。流程与边界见 [设计文档核对](phase0-2-design-crosscheck.md)、[本轮收口](phase0-2-remaining-closeout.md) 和 [配置交互实现](configuration-interaction.md)。
 
 ```bash
 cargo run -p xray-manager-app -- --data-dir /absolute/path/to/data
@@ -39,6 +39,10 @@ CLI 命令与源码入口见 [xrayctl.rs](../crates/xray-supervisor/src/bin/xray
 
 配置原文限制为 4 MiB，JSON 编码后请求还须满足 8 MiB 帧预算。响应超限不表示写操作未执行，应按原 request ID 查询。持久操作记录不因传输摘要而删除。
 
+## 离线维护
+
+`xrayctl --data-dir PATH maintenance` 默认只预览，无需后台。`--retain-days DAYS` 控制孤儿产物及终态压缩的最小年龄，`--apply` 才修改文件；`--compress-operations` 显式启用保留完整语义的 gzip envelope。运行时持有同一 Store 独占锁，存在恢复 / 未完成 / 损坏证据或链接时保守拒绝。压缩格式旧版不可读，降级需完整备份。引用与失败保护合同见 [维护说明](phase0-2-remaining-closeout.md)。
+
 ## 回归与平台验收
 
 ```bash
@@ -49,6 +53,14 @@ cargo test --workspace --locked -- --test-threads=4
 
 GUI 回归默认不生成截图文件。需要复核真实 egui 图元与字体图集时，将测试进程的 `XRAY_UI_CAPTURE_DIR` 指向 `target/ui-captures` 再运行 `cargo test -p xray-manager-app --locked -- --test-threads=4`；PowerShell 可先设置 `$env:XRAY_UI_CAPTURE_DIR = "target/ui-captures"`，完成后运行 `Remove-Item Env:XRAY_UI_CAPTURE_DIR`。输出的 JSON 网格和 RGBA 字体图集属于本地产物，保存在已忽略的 `target/`，不随源码提交。无窗口图元回归不能替代完整原生桌面交互验收。
 
+PAC 专项不需要官方 Core：`cargo test -p xray-pac` 与 `cargo test -p xray-supervisor --test pac_flow` 覆盖生成、校验、执行测试、不可变发布、租约、端口/版本切换、失败补偿和启动恢复。需要真实 Core 的 PAC 发布用例默认忽略，设置 `XRAY_TEST_CORE` 后运行：
+
+```bash
+XRAY_TEST_CORE=/path/to/xray cargo test -p xray-supervisor --test real_core -- --ignored
+```
+
+真实 WinINet / PAC 前后可用只读快照脚本 `scripts/windows-proxy-snapshot.ps1 -Save/-Compare` 记录并比较五个当前用户代理字段；脚本不写注册表。会话日志位于数据目录 `logs/supervisor.log`；写入时带 UTC 时间戳和操作/代次上下文，凭据字段脱敏，超过 4 MiB 轮转一个备份，旧备份保留 7 天。日志不是持久审计记录，不应作为唯一恢复凭据。
+
 官方 Core 冒烟测试默认忽略，可选择已有 Core，或运行仅用于开发测试的下载脚本（核对官方 `.dgst` 中 SHA-256）：
 
 ```bash
@@ -56,7 +68,7 @@ python3 scripts/fetch-test-core.py --destination /tmp/xray-test-core
 XRAY_TEST_CORE=/tmp/xray-test-core/xray cargo test -p xray-supervisor --test real_core -- --ignored
 ```
 
-Windows PowerShell 设置 `$env:XRAY_TEST_CORE = "C:\path\to\xray.exe"` 后执行同一测试命令。测试使用模拟系统代理，不修改本机 WinINet 设置。CI 包含 Linux / Windows 构建、回归和官方 Core 冒烟；Windows 原生 Core、Named Pipe、Job 清理及 GUI 关闭/重开已验证；计划任务的创建、外部修改保护及幂等禁用也已验证；真实 WinINet、托盘菜单全部交互、实际登录启动与权限拒绝仍需进一步验收。
+Windows PowerShell 设置 `$env:XRAY_TEST_CORE = "C:\path\to\xray.exe"` 后执行同一测试命令。测试使用模拟系统代理，不修改本机 WinINet 设置。CI 包含 Linux / Windows 构建、回归和官方 Core 冒烟；Windows 原生 Core、当前用户限定的 Named Pipe、Job 清理及 GUI 关闭/重开已验证；计划任务的创建、外部修改保护及幂等禁用也已验证；真实 WinINet、托盘菜单全部交互、实际登录启动与当前用户权限拒绝仍需进一步验收。程序不注册 Windows 服务或 SYSTEM 级后台任务。
 
 API 内部出站的导入 / 冻结 / 官方 Core 校验专项：
 
@@ -94,6 +106,8 @@ Linux 设置 `XRAY_TEST_CORE` 后可运行同一 `acceptance_edges` 命令；文
 
 当前验收状态以 [遗留清单](phase0-2-backlog.md) 为准。事务、租约、IPC 和恢复合同见 [设计文档](Xray%20Windows%20Manager架构与实现设计.md)；既有修复和复测证据见各轮收口记录。流水线配置不代表远端执行已通过。
 
+交接当前源码、验证证据和剩余验收时，先阅读 [开发交接文档](handoff.md)。
+
 ## Windows 程序包
 
 使用 Python 3.11+，在仓库根目录构建并打包：
@@ -103,9 +117,9 @@ cargo build --release --workspace --locked
 python scripts/package-windows.py --binary-dir target/release
 ```
 
-输出位于 dist，统一使用 `xray-pilot-<版本>-windows-x64.zip`，以及 SHA256SUMS。验证版本通过版本号中的 `rc.N` 区分，例如下一验证版本可使用 `xray-pilot-0.1.1-rc.4-windows-x64.zip`；正式版本例如 `xray-pilot-0.1.1-windows-x64.zip`。文件名不再附加界面名称、验证用途或时间戳。包内包含三个程序、README、版本及源码提交标识、文档、示例和 Windows 验证脚本；不包含 Core 或用户数据。脚本会逐文件核对压缩包内容。正式发布前应使用干净的、与构建输入相同的源码提交，脚本将当前 HEAD 写入 VERSION.txt。
+输出位于 dist，统一使用 `xray-pilot-<版本>-windows-x64.zip`，以及 SHA256SUMS。验证版本通过版本号中的 `rc.N` 区分，例如下一验证版本可使用 `xray-pilot-0.1.1-rc.5-windows-x64.zip`；正式版本例如 `xray-pilot-0.1.1-windows-x64.zip`。文件名不再附加界面名称、验证用途或时间戳。包内包含三个程序、README、版本及源码提交标识、文档、示例和 Windows 验证脚本；不包含 Core 或用户数据。脚本会逐文件核对压缩包内容。正式发布前应使用干净的、与构建输入相同的源码提交，脚本将当前 HEAD 写入 VERSION.txt。
 
-对外提供内容不同的验证包时，应递增预发布版本，同步更新 Cargo.toml 与 Cargo.lock，并重新构建。已发布的版本不复用为不同内容的新包；当前已发布 rc.3，新一轮交付应从 rc.4 起。脚本拒绝覆盖输出目录中的同名包；同版本重复验证构建可使用独立的 `--output-dir`。
+对外提供内容不同的验证包时，应递增预发布版本，同步更新 Cargo.toml 与 Cargo.lock，并重新构建。已发布的版本不复用为不同内容的新包；当前已发布 rc.4，新一轮交付应从 rc.5 起。脚本拒绝覆盖输出目录中的同名包；同版本重复验证构建可使用独立的 `--output-dir`。
 
 仅提供本地验证时，可显式打包尚未提交的当前源码；先构建，再执行：
 

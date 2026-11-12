@@ -1,12 +1,15 @@
 mod effects;
 pub mod ipc;
+pub mod maintenance;
 mod operations;
+mod pac_server;
 mod restart_budget;
 mod views;
 #[cfg(test)]
 use effects::EffectFault;
 
 use operations::{Operation, OperationStore};
+use pac_server::PacServer;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -60,13 +63,16 @@ pub struct Supervisor<B: ProxyBackend> {
     failed_instance: Option<String>,
     last_error: Option<Error>,
     blocked: bool,
+    auto_connect_notice: Option<String>,
     pub shutdown: bool,
     settings: Settings,
     principal: String,
     installation: String,
     restart_budget: restart_budget::RestartBudget,
+    pac_servers: Vec<PacServer>,
     #[cfg(test)]
     fail_settlement: bool,
+    listener_ready: bool,
     #[cfg(test)]
     effect_fault: Option<EffectFault>,
 }
@@ -86,6 +92,8 @@ impl<B: ProxyBackend> Supervisor<B> {
     ) -> Result<Self> {
         let store = Store::open(root)?;
         let lock = store.lock()?;
+        let logs = xray_runtime::logs_with_file(store.root.join("logs/supervisor.log"))
+            .unwrap_or_else(|_| xray_runtime::logs());
         let mut proxy = ProxyController::open(backend, &store.root)?;
         let installation_path = store.root.join("runtime/installation.json");
         let installation_result: Result<String> = (|| {
@@ -149,18 +157,21 @@ impl<B: ProxyBackend> Supervisor<B> {
             startup,
             generation,
             core: None,
-            logs: xray_runtime::logs(),
+            logs,
             epoch: id(),
             recovery_epoch: 0,
             retry: None,
             failed_instance: None,
             last_error: None,
             blocked: false,
+            auto_connect_notice: None,
             shutdown: false,
             settings,
             principal,
             installation,
             restart_budget: restart_budget::RestartBudget::default(),
+            pac_servers: Vec::new(),
+            listener_ready: false,
             #[cfg(test)]
             fail_settlement: false,
             #[cfg(test)]
@@ -185,7 +196,9 @@ impl<B: ProxyBackend> Supervisor<B> {
         if proxy.lease.is_some() || proxy.recovery_error().is_some() {
             return Ok(());
         }
-        if generation.is_some_and(|g| g.running && g.proxy_mode == ProxyMode::Global) {
+        if generation.is_some_and(|g| {
+            g.running && matches!(g.proxy_mode, ProxyMode::Global | ProxyMode::Pac)
+        }) {
             proxy.require_lease();
             return Ok(());
         }
@@ -198,8 +211,10 @@ impl<B: ProxyBackend> Supervisor<B> {
                     .lease_before
                     .as_ref()
                     .is_some_and(|l| l.state != windows_integration::LeaseState::Released);
-                let possible_acquisition = journal.generation.proxy_mode == ProxyMode::Global
-                    && proxy.snapshot()? != journal.windows_before;
+                let possible_acquisition = matches!(
+                    journal.generation.proxy_mode,
+                    ProxyMode::Global | ProxyMode::Pac
+                ) && proxy.snapshot()? != journal.windows_before;
                 if previous_owned || possible_acquisition {
                     proxy.require_lease();
                     break;
@@ -283,6 +298,20 @@ impl<B: ProxyBackend> Supervisor<B> {
             supervisor_epoch: self.epoch.clone(),
             last_error: self.last_error.clone(),
             recovery_required: self.blocked,
+            winhttp: windows_integration::winhttp_snapshot().ok(),
+            listener_state: if self.listener_ready {
+                "Ready".into()
+            } else if self.core.is_some() {
+                "Starting".into()
+            } else {
+                "Stopped".into()
+            },
+            pac_state: if self.pac_servers.is_empty() {
+                "Stopped".into()
+            } else {
+                "Serving".into()
+            },
+            auto_connect_notice: self.auto_connect_notice.clone(),
         }
     }
     fn history(&self, profile: &str) -> Result<Vec<Generation>> {
@@ -380,14 +409,7 @@ impl<B: ProxyBackend> Supervisor<B> {
                 return Ok(serde_json::to_value(history)?);
             }
             Command::GetSettings => return Ok(serde_json::to_value(&self.settings)?),
-            Command::GetLogs => {
-                return Ok(json!(
-                    self.logs
-                        .lock()
-                        .map(|l| l.iter().cloned().collect::<Vec<_>>())
-                        .unwrap_or_default()
-                ));
-            }
+            Command::GetLogs => return Ok(json!(self.logs.lines())),
             Command::GetOperation { request_id } => {
                 let result = self.operations.get(&caller, request_id);
                 let operation = self.operation_read(result)?;
@@ -421,6 +443,56 @@ impl<B: ProxyBackend> Supervisor<B> {
                     &parse_config(profile.json.as_bytes())?,
                     context,
                 ))?);
+            }
+            Command::TestPac { script, url } => {
+                let decision = xray_pac::evaluate(script, url)?;
+                let notes = xray_pac::check_result(&decision);
+                return Ok(json!({"decision": decision, "notes": notes}));
+            }
+            Command::TestLatency { host, port } => {
+                let host = host.trim();
+                if host.is_empty()
+                    || host.len() > 255
+                    || host.chars().any(|c| c.is_whitespace() || c.is_control())
+                {
+                    return Err(Error::new(
+                        "LATENCY_HOST_INVALID",
+                        "Enter a host name or IP address without spaces",
+                    ));
+                }
+                if *port == 0 {
+                    return Err(Error::new("LATENCY_PORT_INVALID", "Port must be 1–65535"));
+                }
+                let started = Instant::now();
+                let probe = async {
+                    let mut addresses = tokio::net::lookup_host((host, *port)).await?;
+                    let mut last = None;
+                    for address in addresses.by_ref().take(4) {
+                        match tokio::net::TcpStream::connect(address).await {
+                            Ok(_) => return Ok::<_, std::io::Error>(address),
+                            Err(error) => last = Some(error),
+                        }
+                    }
+                    Err(last.unwrap_or_else(|| {
+                        std::io::Error::new(std::io::ErrorKind::NotFound, "No address resolved")
+                    }))
+                };
+                return match tokio::time::timeout(std::time::Duration::from_secs(3), probe).await {
+                    Ok(Ok(address)) => Ok(json!({
+                        "host": host,
+                        "port": port,
+                        "address": address.to_string(),
+                        "ms": started.elapsed().as_millis() as u64,
+                    })),
+                    Ok(Err(error)) => Err(Error::new(
+                        "LATENCY_PROBE_FAILED",
+                        format!("TCP probe failed: {error}"),
+                    )),
+                    Err(_) => Err(Error::new(
+                        "LATENCY_PROBE_TIMEOUT",
+                        "TCP probe exceeded 3 seconds",
+                    )),
+                };
             }
             Command::TestRunningRoute {
                 generation_id,
@@ -612,6 +684,7 @@ impl<B: ProxyBackend> Supervisor<B> {
                 json,
                 core_path,
                 asset_root,
+                allow_dynamic,
             } => {
                 self.store.check_revision(profile_id, expected_revision)?;
                 let config = parse_config(json.as_bytes())?;
@@ -630,8 +703,12 @@ impl<B: ProxyBackend> Supervisor<B> {
                     }
                 }
                 let version = xray_runtime::version(&frozen).await?;
-                let resources =
-                    resources::freeze(&config, asset_root, &self.store.root.join("resources"))?;
+                let resources = resources::freeze_with(
+                    &config,
+                    asset_root,
+                    &self.store.root.join("resources"),
+                    *allow_dynamic,
+                )?;
                 let candidate_id = id();
                 let path = self.store.root.join("candidates").join(&candidate_id);
                 fs::create_dir_all(&path)?;
@@ -667,6 +744,7 @@ impl<B: ProxyBackend> Supervisor<B> {
                 candidate_digest,
                 proxy_mode,
                 http_inbound_tag,
+                pac,
             } => {
                 valid_id(candidate_id)?;
                 let candidate: Candidate = read_json(
@@ -684,8 +762,15 @@ impl<B: ProxyBackend> Supervisor<B> {
                     ));
                 }
                 self.invalidate_retry();
-                self.apply(op, candidate, *proxy_mode, http_inbound_tag.clone(), true)
-                    .await
+                self.apply(
+                    op,
+                    candidate,
+                    *proxy_mode,
+                    http_inbound_tag.clone(),
+                    true,
+                    pac.clone(),
+                )
+                .await
             }
             Command::StopCore | Command::Shutdown => {
                 self.invalidate_retry();
@@ -697,6 +782,7 @@ impl<B: ProxyBackend> Supervisor<B> {
                             ProxyMode::Direct,
                             g.http_inbound_tag,
                             false,
+                            None,
                         )
                         .await?;
                     if matches!(op.request.command, Command::Shutdown) {
@@ -708,6 +794,9 @@ impl<B: ProxyBackend> Supervisor<B> {
                         self.blocked = true;
                         self.last_error = Some(error);
                     }
+                    if matches!(self.proxy.state().as_str(), "Released" | "Unmanaged") {
+                        self.prune_pac_servers(&[]).await;
+                    }
                     if matches!(op.request.command, Command::Shutdown) {
                         self.shutdown = true;
                     }
@@ -718,15 +807,16 @@ impl<B: ProxyBackend> Supervisor<B> {
                 let old = self.generation.clone().ok_or_else(|| {
                     Error::new("NO_ACTIVE_PROFILE", "Apply a validated profile first")
                 })?;
-                let (mode, tag) = match &op.request.command {
+                let (mode, tag, pac) = match &op.request.command {
                     Command::SetProxyMode {
                         mode,
                         http_inbound_tag,
-                    } => (*mode, http_inbound_tag.clone()),
-                    _ => (old.proxy_mode, old.http_inbound_tag),
+                        pac,
+                    } => (*mode, http_inbound_tag.clone(), pac.clone()),
+                    _ => (old.proxy_mode, old.http_inbound_tag.clone(), None),
                 };
                 self.invalidate_retry();
-                self.apply(op, old.candidate, mode, tag, true).await
+                self.apply(op, old.candidate, mode, tag, true, pac).await
             }
             Command::SaveSettings { settings } => {
                 let result =
@@ -761,8 +851,14 @@ impl<B: ProxyBackend> Supervisor<B> {
     async fn start(&mut self, g: &Generation) -> Result<()> {
         Self::verify_candidate(&g.candidate)?;
         self.core = Some(ManagedCore::start(&g.candidate, &g.id, self.logs.clone()).await?);
-        if g.proxy_mode == ProxyMode::Global {
-            let config = parse_config(&fs::read(&g.candidate.config_path)?)?;
+        let config = parse_config(&fs::read(&g.candidate.config_path)?)?;
+        self.core
+            .as_mut()
+            .unwrap()
+            .wait_listeners(&config, &self.logs)
+            .await?;
+        self.listener_ready = true;
+        if matches!(g.proxy_mode, ProxyMode::Global | ProxyMode::Pac) {
             let endpoint = xray_runtime::http_endpoint(&config, &g.http_inbound_tag)?;
             self.core.as_mut().unwrap().wait_http(endpoint).await?;
         }
@@ -780,10 +876,92 @@ impl<B: ProxyBackend> Supervisor<B> {
             .map(Option::flatten)
     }
     async fn stop_process(&mut self) -> Result<()> {
+        self.listener_ready = false;
         if let Some(mut core) = self.core.take() {
             core.stop().await?;
         }
         Ok(())
+    }
+    fn prepare_pac(&self, script: &str, port: u16) -> Result<PacPublication> {
+        if !(1..=65535).contains(&port) {
+            return Err(Error::new(
+                "PAC_PORT_INVALID",
+                "PAC service port must be 1–65535",
+            ));
+        }
+        let revision = hash(script.as_bytes());
+        let directory = self.store.root.join("runtime/pac").join(&revision);
+        let path = directory.join("proxy.pac");
+        if path.exists() {
+            let bytes = fs::read(&path)?;
+            if hash(&bytes) != revision {
+                return Err(Error::new(
+                    "PAC_INTEGRITY_FAILED",
+                    "Existing PAC publication differs from its revision",
+                ));
+            }
+        } else {
+            atomic_write(&path, script.as_bytes())?;
+        }
+        Ok(PacPublication {
+            sha256: revision.clone(),
+            url: format!("http://127.0.0.1:{port}/pac/{revision}/proxy.pac"),
+            revision,
+            port,
+            path,
+        })
+    }
+    fn ensure_pac_server(&mut self, port: u16) -> Result<&mut PacServer> {
+        if let Some(index) = self.pac_servers.iter().position(|s| s.port() == port) {
+            return Ok(&mut self.pac_servers[index]);
+        }
+        let server = PacServer::start(port, self.logs.clone())?;
+        self.pac_servers.push(server);
+        Ok(self.pac_servers.last_mut().unwrap())
+    }
+    async fn ensure_pac_served(&mut self, publication: &PacPublication) -> Result<()> {
+        let bytes = fs::read(&publication.path).map_err(|_| {
+            Error::new(
+                "PAC_INTEGRITY_FAILED",
+                "PAC publication file is missing; preserve recovery evidence and re-apply",
+            )
+        })?;
+        if hash(&bytes) != publication.revision || publication.sha256 != publication.revision {
+            return Err(Error::new(
+                "PAC_INTEGRITY_FAILED",
+                "PAC publication bytes differ from the committed revision",
+            ));
+        }
+        let server = self.ensure_pac_server(publication.port)?;
+        server.publish(&publication.revision, bytes.clone());
+        server
+            .probe(&publication.revision, &bytes)
+            .await
+            .map_err(|e| {
+                Error::new(
+                    "PAC_SERVICE_UNAVAILABLE",
+                    format!("PAC publication is not reachable: {}", e.message),
+                )
+            })?;
+        Ok(())
+    }
+    async fn prune_pac_servers(&mut self, keep: &[u16]) {
+        let mut remaining = Vec::new();
+        for server in std::mem::take(&mut self.pac_servers) {
+            if keep.contains(&server.port()) {
+                remaining.push(server);
+            } else {
+                server.stop();
+            }
+        }
+        self.pac_servers = remaining;
+    }
+    fn current_pac_ports(&self) -> Vec<u16> {
+        self.generation
+            .as_ref()
+            .and_then(|g| g.pac.as_ref().map(|p| p.port))
+            .into_iter()
+            .collect()
     }
     async fn apply(
         &mut self,
@@ -792,12 +970,19 @@ impl<B: ProxyBackend> Supervisor<B> {
         mode: ProxyMode,
         tag: String,
         running: bool,
+        pac: Option<PacDraft>,
     ) -> Result<Value> {
         if !running {
             return self.stop_generation(op, candidate, tag).await;
         }
         Self::verify_candidate(&candidate)?;
         let old_profile = self.store.profile(&candidate.profile_id)?;
+        self.logs.set_context(Some(format!(
+            "profile={} rev={} tx={}",
+            candidate.profile_id,
+            &candidate.revision[..candidate.revision.len().min(12)],
+            op.transaction_id
+        )));
         let reuse = self
             .generation
             .as_ref()
@@ -813,13 +998,59 @@ impl<B: ProxyBackend> Supervisor<B> {
         if running {
             xray_runtime::validate_with_logs(&candidate, &self.logs).await?;
         }
-        let target = if running && mode == ProxyMode::Global {
-            Some(global(xray_runtime::http_endpoint(
-                &parse_config(&fs::read(&candidate.config_path)?)?,
-                &tag,
-            )?))
+        let config = parse_config(&fs::read(&candidate.config_path)?)?;
+        let endpoint = if matches!(mode, ProxyMode::Global | ProxyMode::Pac) {
+            Some(xray_runtime::http_endpoint(&config, &tag)?)
         } else {
             None
+        };
+        let mut pac_publication = None;
+        if mode == ProxyMode::Pac {
+            match pac {
+                Some(draft) => {
+                    let script = if draft.generated {
+                        let generated = xray_pac::generate(&config, endpoint.unwrap());
+                        for note in generated.notes {
+                            xray_runtime::log(&self.logs, format!("PAC: {note}"));
+                        }
+                        generated.script
+                    } else if draft.template {
+                        xray_pac::template(endpoint.unwrap(), draft.template_mode, &draft.domains)?
+                    } else if draft.script.trim().is_empty() {
+                        let generated = xray_pac::generate(&config, endpoint.unwrap());
+                        for note in generated.notes {
+                            xray_runtime::log(&self.logs, format!("PAC: {note}"));
+                        }
+                        generated.script
+                    } else {
+                        draft.script
+                    };
+                    xray_pac::validate(&script)?;
+                    pac_publication = Some(self.prepare_pac(&script, draft.port)?);
+                }
+                None => {
+                    // Restart/auto-connect of the same committed candidate may
+                    // reuse its immutable publication; a new candidate needs an
+                    // explicit script so PAC cannot silently describe the old port.
+                    let reusable = self.generation.as_ref().filter(|g| {
+                        g.proxy_mode == ProxyMode::Pac && g.candidate.id == candidate.id
+                    });
+                    pac_publication = reusable.and_then(|g| g.pac.clone());
+                    if pac_publication.is_none() {
+                        return Err(Error::new(
+                            "PAC_SCRIPT_REQUIRED",
+                            "Select a PAC script before enabling PAC mode",
+                        ));
+                    }
+                }
+            }
+        }
+        let target = match mode {
+            ProxyMode::Global => Some(global(endpoint.unwrap())),
+            ProxyMode::Pac => Some(windows_integration::pac(
+                &pac_publication.as_ref().unwrap().url,
+            )),
+            ProxyMode::Direct => None,
         };
         let generation = Generation {
             id: id(),
@@ -829,6 +1060,7 @@ impl<B: ProxyBackend> Supervisor<B> {
             proxy_mode: mode,
             http_inbound_tag: tag,
             running,
+            pac: pac_publication,
         };
         let mut journal = Journal {
             generation: generation.clone(),
@@ -853,6 +1085,9 @@ impl<B: ProxyBackend> Supervisor<B> {
             self.stop_process().await?;
             if running {
                 self.start(&generation).await?;
+            }
+            if let Some(pac) = &generation.pac {
+                self.ensure_pac_served(pac).await?;
             }
             if let Some(target) = target {
                 self.proxy.transition(target)?;
@@ -887,6 +1122,9 @@ impl<B: ProxyBackend> Supervisor<B> {
         };
         if committed.as_ref().is_some_and(|g| g.id == generation.id) {
             self.generation = Some(generation.clone());
+            if running {
+                self.auto_connect_notice = None;
+            }
             if let Err(e) = self.proxy.finalize() {
                 self.blocked = true;
                 self.last_error = Some(e);
@@ -895,6 +1133,13 @@ impl<B: ProxyBackend> Supervisor<B> {
                 self.blocked = true;
                 self.last_error = Some(e);
             }
+            let keep: Vec<u16> = generation
+                .pac
+                .as_ref()
+                .map(|p| p.port)
+                .into_iter()
+                .collect();
+            self.prune_pac_servers(&keep).await;
             return Ok(serde_json::to_value(generation)?);
         }
         if let Err(error) = result {
@@ -906,6 +1151,8 @@ impl<B: ProxyBackend> Supervisor<B> {
                 ));
             }
             self.settle(&journal_path, &mut journal)?;
+            let keep = self.current_pac_ports();
+            self.prune_pac_servers(&keep).await;
             return Err(error);
         }
         self.blocked = true;
@@ -921,6 +1168,12 @@ impl<B: ProxyBackend> Supervisor<B> {
         candidate: Candidate,
         tag: String,
     ) -> Result<Value> {
+        self.logs.set_context(Some(format!(
+            "profile={} rev={} tx={} stop",
+            candidate.profile_id,
+            &candidate.revision[..candidate.revision.len().min(12)],
+            op.transaction_id
+        )));
         let generation = Generation {
             id: id(),
             transaction_id: op.transaction_id.clone(),
@@ -929,6 +1182,7 @@ impl<B: ProxyBackend> Supervisor<B> {
             proxy_mode: ProxyMode::Direct,
             http_inbound_tag: tag,
             running: false,
+            pac: None,
         };
         let mut journal = Journal {
             generation: generation.clone(),
@@ -968,6 +1222,9 @@ impl<B: ProxyBackend> Supervisor<B> {
         if let Err(e) = self.settle(&path, &mut journal) {
             self.blocked = true;
             self.last_error = Some(e);
+        }
+        if matches!(self.proxy.state().as_str(), "Released" | "Unmanaged") {
+            self.prune_pac_servers(&[]).await;
         }
         Ok(serde_json::to_value(generation)?)
     }
@@ -1009,6 +1266,13 @@ impl<B: ProxyBackend> Supervisor<B> {
                         "Previous generation contains unclassified dependencies",
                     ));
                 }
+                if let Some(pac) = &g.pac
+                    && let Err(e) = self.ensure_pac_served(pac).await
+                {
+                    let _ = self.stop_process().await;
+                    let _ = self.proxy.release();
+                    return Err(e);
+                }
                 if let Err(e) = self.start(g).await {
                     let _ = self.stop_process().await;
                     let _ = self.proxy.release();
@@ -1031,7 +1295,19 @@ impl<B: ProxyBackend> Supervisor<B> {
         )
     }
     async fn recover(&mut self) -> Result<()> {
+        self.logs.set_context(Some(format!(
+            "startup-recovery generation={}",
+            self.generation
+                .as_ref()
+                .map(|g| g.id.chars().take(12).collect::<String>())
+                .unwrap_or_else(|| "none".into())
+        )));
         let mut recovery_error = None;
+        if let Some(pac) = self.generation.as_ref().and_then(|g| g.pac.clone())
+            && let Err(e) = self.ensure_pac_served(&pac).await
+        {
+            recovery_error = Some(e);
+        }
         let journal_recovery: Result<()> = (|| {
             for entry in fs::read_dir(self.store.root.join("runtime/transactions"))? {
                 let path = entry?.path().join("journal.json");
@@ -1148,23 +1424,69 @@ impl<B: ProxyBackend> Supervisor<B> {
         if self.settings.connect_on_start
             && let Some(old) = self.generation.clone().filter(|g| g.running)
         {
-            if !old.candidate.resources.complete {
-                return Err(Error::new(
-                    "RESOURCE_REVALIDATION_REQUIRED",
-                    "Automatic connection requires complete frozen dependencies",
-                ));
+            let incomplete = !old.candidate.resources.complete;
+            if incomplete && !old.candidate.resources.dynamic.is_empty() {
+                self.auto_connect_notice = Some(
+                    "自动连接已跳过：当前配置包含动态外部依赖。请手动检查并启动；自动恢复仍不可用。"
+                        .into(),
+                );
+                xray_runtime::log(
+                    &self.logs,
+                    "Auto-connect skipped: dynamic dependencies require manual revalidation",
+                );
+                if let Err(e) = self.proxy.release() {
+                    self.blocked = true;
+                    self.last_error = Some(e);
+                }
+                if matches!(self.proxy.state().as_str(), "Released" | "Unmanaged") {
+                    self.prune_pac_servers(&[]).await;
+                }
+            } else {
+                if incomplete {
+                    xray_runtime::log(
+                        &self.logs,
+                        "Auto-connect attempt with unclassified resources; automatic recovery stays disabled",
+                    );
+                }
+                let request = Request::new(
+                    Command::ApplyProfile {
+                        candidate_id: old.candidate.id.clone(),
+                        candidate_digest: old.candidate.digest.clone(),
+                        proxy_mode: old.proxy_mode,
+                        http_inbound_tag: old.http_inbound_tag.clone(),
+                        pac: None,
+                    },
+                    Some(old.id),
+                );
+                let response = self.handle(request).await;
+                match response.result {
+                    Ok(_) if incomplete => {
+                        self.auto_connect_notice =
+                            Some("已自动启动，但当前配置包含未分类依赖，自动恢复不可用。".into());
+                    }
+                    Ok(_) => self.auto_connect_notice = None,
+                    Err(error) if incomplete => {
+                        self.auto_connect_notice = Some(format!(
+                            "自动连接失败：{}。请手动检查并启动。",
+                            error.message
+                        ));
+                        xray_runtime::log(
+                            &self.logs,
+                            format!("Auto-connect failed: {}", error.code),
+                        );
+                        if let Err(e) = self.proxy.release() {
+                            self.blocked = true;
+                            self.last_error = Some(e);
+                        }
+                        if matches!(self.proxy.state().as_str(), "Released" | "Unmanaged") {
+                            self.prune_pac_servers(&[]).await;
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
             }
-            let request = Request::new(
-                Command::ApplyProfile {
-                    candidate_id: old.candidate.id,
-                    candidate_digest: old.candidate.digest,
-                    proxy_mode: old.proxy_mode,
-                    http_inbound_tag: old.http_inbound_tag,
-                },
-                Some(old.id),
-            );
-            let response = self.handle(request).await;
-            response.result?;
+        } else if matches!(self.proxy.state().as_str(), "Released" | "Unmanaged") {
+            self.prune_pac_servers(&[]).await;
         }
         Ok(())
     }
@@ -1173,6 +1495,7 @@ impl<B: ProxyBackend> Supervisor<B> {
             match core.process.try_wait() {
                 Ok(Some(code)) => {
                     let core = self.core.take().unwrap();
+                    self.listener_ready = false;
                     let instance = core.instance_id;
                     xray_runtime::log(&self.logs, format!("Core exited: {code}"));
                     if let Err(e) = self.proxy.release() {
@@ -1222,10 +1545,11 @@ impl<B: ProxyBackend> Supervisor<B> {
             let old = self.generation.clone().unwrap();
             let request = Request::new(
                 Command::ApplyProfile {
-                    candidate_id: old.candidate.id,
-                    candidate_digest: old.candidate.digest,
+                    candidate_id: old.candidate.id.clone(),
+                    candidate_digest: old.candidate.digest.clone(),
                     proxy_mode: old.proxy_mode,
-                    http_inbound_tag: old.http_inbound_tag,
+                    http_inbound_tag: old.http_inbound_tag.clone(),
+                    pac: None,
                 },
                 Some(old.id),
             );

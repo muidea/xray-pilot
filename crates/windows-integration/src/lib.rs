@@ -1,5 +1,5 @@
 mod platform;
-pub use platform::{SystemProxy, SystemStartup};
+pub use platform::{SystemProxy, SystemStartup, winhttp_snapshot};
 pub mod startup;
 
 use serde::{Deserialize, Serialize};
@@ -327,12 +327,59 @@ fn lease_hash(disk: &Option<Option<Lease>>) -> Result<String> {
         None => Ok("absent".into()),
     }
 }
+/// Validate settled on-disk proxy evidence without reading or writing Windows settings.
+pub fn check_offline_proxy_evidence(root: &Path) -> Result<()> {
+    let disk = optional_json::<Option<Lease>>(&root.join("runtime/proxy-lease.json"))?;
+    let witness = optional_json::<LeaseEvidence>(&root.join("runtime/proxy-lease-evidence.json"))?;
+    if let Some(witness) = witness {
+        witness.verify()?;
+        if witness.required || lease_hash(&disk)? != canonical_hash(&witness.lease)? {
+            return Err(Error::new(
+                "MAINTENANCE_BLOCKED",
+                "Proxy evidence requires recovery before maintenance",
+            ));
+        }
+    } else if disk
+        .as_ref()
+        .and_then(|l| l.as_ref())
+        .is_some_and(|l| l.evidence_version > 0)
+    {
+        return Err(Error::new(
+            "MAINTENANCE_BLOCKED",
+            "Independent proxy evidence is missing",
+        ));
+    }
+    if disk
+        .flatten()
+        .is_some_and(|l| l.state != LeaseState::Released || l.pending.is_some())
+    {
+        return Err(Error::new(
+            "MAINTENANCE_BLOCKED",
+            "Stop Core and release the proxy lease before maintenance",
+        ));
+    }
+    Ok(())
+}
 pub fn global(endpoint: std::net::SocketAddr) -> ProxySnapshot {
     ProxySnapshot {
         flags: 3,
         server: format!("http={endpoint};https={endpoint}"),
         bypass: "<local>".into(),
         pac_url: String::new(),
+    }
+}
+
+/// WinINet PAC target. `PROXY_TYPE_DIRECT` must be present so a PAC result of
+/// `DIRECT` is honored for hosts outside the proxy list; without it WinINet can
+/// continue sending those hosts through the proxy. The PAC script itself
+/// defaults to PROXY where it cannot decide, but an unreachable PAC host remains
+/// a fail-open risk that must be covered by Windows validation.
+pub fn pac(url: &str) -> ProxySnapshot {
+    ProxySnapshot {
+        flags: 1 | 4,
+        server: String::new(),
+        bypass: String::new(),
+        pac_url: url.into(),
     }
 }
 

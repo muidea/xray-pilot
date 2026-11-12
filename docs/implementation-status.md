@@ -6,6 +6,8 @@
 
 ## 已实现
 
+2026-11-11：当前源码增加配置场景 / 协议表单、托盘配置列表、多服务器 / 用户、数值草稿持久化、离线维护、DNS 资源冻结及本地 HTTP / SOCKS 就绪。尚未提交或发布，已发布 rc.4 不含这些变更；范围与验证见 [后续能力收口](phase0-2-remaining-closeout.md) 和 [配置交互实现](configuration-interaction.md)。
+
 2026-11-10 C18–C20 收口：所有正常退出入口检查草稿落盘、失败可重试 / 导出 / 明确放弃；设置重读保留用户草稿；后台应用后的草稿基准同步持久化。另补 Core 会话诊断、受限后台响应编码，清理冗余说明并统一托盘 / 标题栏 / 任务栏图标。Linux 工作区 123 项、Windows GUI 57 项 / Supervisor 18 项 / 官方 Core 专项 1 项通过，详见 [收口与证据](phase0-2-c18-20-closeout.md)。
 
 2026-11-10 运行错误刷新：新的运行操作成功且结果已持久保存、无待恢复问题后清除旧后台错误；GUI 的应用、代理切换、启停和原请求成功确认同步清理旧请求提示，保留历史失败及本地写入错误。Linux 工作区 116 项、Windows GUI 51 项、Supervisor 18 项与官方 Core 专项通过，详见 [错误刷新修复](ui-implementation.md#运行错误修复后的提示刷新2026-11-10)。
@@ -28,8 +30,8 @@
 | 配置事务 | 校验后生成不可变候选与资源清单；明确预览/应用；副作用前写 journal；正式 JSON 原子发布；`active-manifest.json` 为提交点；条件恢复正式文件、旧 Core 和代理；历史代次预览与重新校验后回滚 |
 | 文件依赖 | 按原生路由及 TLS 证书字段位置枚举证书、key、geoip/geosite 和 ext 文件，复制到冻结资源集，应用及恢复前检查清单与文件哈希；来源变化不改变冻结版本；未覆盖字段/协议降低自动恢复能力 |
 | 路由诊断 | 按原生顺序进行三态静态匹配；支持部分域名、IP/CIDR、端口、network、inboundTag；缺失上下文、sniffing 或不支持的前序条件返回 Unknown；实际出口固定 Unverified |
-| 系统代理 | WinINet 当前用户 Global / Direct；Global 解析选定 HTTP Tag 的回环地址、数值端口和无认证要求，并验证本地 HTTP CONNECT 握手；多次切换保留首次接管快照；条件释放、读回核查及外部修改 Conflict |
-| Supervisor / IPC | GUI 经 IPC 控制独立 Supervisor；Windows Named Pipe 限当前 SID/SYSTEM、拒绝远端并核查双端身份；响应接收确认后断开；数据目录单实例锁；Linux 使用 Unix socket |
+| 系统代理 | WinINet 当前用户 Direct / Global / PAC；Global 与 PAC 解析选定 HTTP Tag 的回环地址、数值端口和无认证要求，并验证本地 HTTP CONNECT 握手；PAC 发布不可变回环脚本并写入带 Revision 的 PAC URL；多次切换保留首次接管快照；条件释放、读回核查及外部修改 Conflict |
+| Supervisor / IPC | GUI 经 IPC 控制独立 Supervisor；Windows Named Pipe 仅限当前登录用户 SID、拒绝远端并核查双端身份；不授予 SYSTEM 或服务账户访问；响应接收确认后断开；数据目录单实例锁；Linux 使用 Unix socket |
 | 恢复与去重 | 启动清理独立于自动连接；代次/实例/recovery epoch 栅栏；每分钟 3 次自动恢复统一预算，校验/启动失败也计入；独立请求身份与孤立证据阻断；持久 request ID 去重先于旧代次拒绝；恢复未记账提交结果；替换清单前保存原提交凭据；停止可在快照损坏时继续清理 |
 | 界面与集成 | Windows 托盘打开/启停/切换模式/退出；只退出 GUI 保持 Core；独立自动连接和 Task Scheduler 登录自启设置；任务名绑定 SID/安装身份/数据目录，完整定义比对、条件补偿与重启结算；CLI 按 request ID 查询；连接失败不盲目重发写请求 |
 
@@ -37,10 +39,10 @@
 
 ## 当前实现的具体约束
 
-- 所有旧候选、资源、Core、事务、提交凭据及操作记录都保留。尚未启用自动回收、结果压缩或容量设置，避免删除回滚和去重证据；数据量随操作增长。
-- 自动依赖覆盖是明确白名单，支持常用 HTTP/SOCKS 入站及 freedom/blackhole/HTTP/SOCKS/VLESS/VMess/Trojan/Shadowsocks 出站的一部分字段和传输。DNS、复杂传输、未知嵌套字段等尚未声明完整覆盖；仍保留原生 JSON 并允许显式 Core 校验/应用，但禁止自动连接、异常重试及自动恢复旧 Core。实际提示以候选 `resources.notes` 为准。
+- 当前源码提供手动离线维护，回收过保留期的无引用候选 / 资源 / Core，并可显式压缩完整终态记录。事务、提交、身份和历史继续保留；自动清理、历史 / 详情过期和容量上限尚未提供。压缩后旧版无法读取，降级需恢复压缩前备份。
+- 自动依赖覆盖是明确白名单，支持常用 HTTP/SOCKS 入站及 freedom/blackhole/HTTP/SOCKS/VLESS/VMess/Trojan/Shadowsocks 出站的一部分字段和传输。常见 DNS / RAW 字段已扩展，复杂传输、未知嵌套字段等仍未完整覆盖；绝对外部文件可通过显式 Dynamic opt-in 使用并记录观察哈希，但不承诺旧内容回滚。覆盖不完整或 Dynamic 时必须人工应用，禁止自动连接、异常重试及自动恢复旧 Core。实际提示以候选 `resources.notes` 为准。
 - 文件路径必须相对于选定资源来源目录且不越界。不隐式重写绝对路径。此范围比原生 Core 更窄；用户须显式修改不兼容的路径。
-- Global 验证本地 HTTP 协议就绪；Direct 当前以 Core 通过配置校验且启动后未立即退出作为就绪条件。尚未对所有原生入站执行协议探测，也不证明远端可达、服务器身份或真实出口。
+- Direct / Global / PAC 启动均等待常用回环 HTTP / SOCKS5 入站的本地握手与认证。无入站配置仍只有短时进程存活观察；特殊传输 / 协议、非回环绑定及非数值端口等仅在日志标注未覆盖。Global / PAC 另验证选定无认证 HTTP 入口，不证明远端可达、服务器身份或真实出口。
 - 应用 journal 记录副作用前实际存活实例，补偿不会按期望清单启动原来已停止的 Core。有关联运行/设置事务日志的未解决请求保持 `response=null` 与 `recovery_required=true`；修复后重启重建已补偿终态，历史成功结果保持稳定。结算、提交凭据或响应无法落盘时阻止后续写入。
 - 创建/删除 Profile、校验候选和历史预览也保存 `runtime/transactions/<tx>/effect.json`；准备副作用与公开文件发布分离，提交点前后通过完整文件哈希/存在性判定。结果凭据保留原结果，后续文件变化不改写已完成请求；外部第三种状态保留待恢复。旧版无证据的未完成非运行写请求保守阻断并等待核对。
 - 新版 Operation 记录含内容哈希，读取核对 caller、request ID、事务 ID、请求摘要与响应关联。重复请求、结果查询、历史扫描发现损坏时统一进入 OPERATION_RECOVERY_REQUIRED；请求 ID 内容冲突仍作为普通拒绝。
@@ -53,8 +55,8 @@
 - 遇到外部代理冲突时不覆盖第三方设置。停止可完成 Core 清理并提交 Stopped，代理仍独立报告 Conflict 和错误，不报告 Released。
 - 租约以独立 proxy-lease-evidence.json 记录带校验和的生命周期意图。缺失、损坏或矛盾时提供 PROXY_RECOVERY_REQUIRED，保留状态查询、安全停止及原文件，阻断普通写入；旧版 Global 提交与未结算意图也核对。正常释放/补偿回无租约可识别，仅匹配明确记录前值时自动完成中断发布。丢失或损坏证据须人工恢复可信原件后重启核对。
 - GUI 读取及候选绑定选择代次、Profile、Revision、JSON 与验证上下文，迟到结果不覆盖新编辑；最多 32 个待完成请求，状态/日志在途合并。IPC 收发/确认独立于监督循环，最多 16 个活动连接与 16 项协调队列，I/O 各限 5 s；运行写入及长事务本身仍串行。
-- GUI 当前为中文五页界面，支持跟随系统、浅色和深色；结构化编辑保留原生层级，任意对象字段增删及未完成数值输入仍需完善，可使用原生 JSON。托盘尚无 Profile 快捷列表；在主窗口切换配置。
-- 使用独立 `xray-supervisor` 启用登录自启时，计划任务启动该独立二进制；由 GUI 启动的 Supervisor 保存的任务则启动 GUI 的后台模式。
+- GUI 当前为中文六页界面（含 PAC），支持跟随系统、浅色和深色；配置向导、协议模板、多服务器 / 用户表单、对象字段增删、数值未完成输入持久草稿、草稿级撤销/重做和 PAC 生成/测试页已提供，复杂能力保留原生编辑。托盘提供配置快捷列表和运行状态项，选择后仍需检查并确认应用。完整原生交互仍按 V08 验收。
+- 使用独立 `xray-supervisor` 启用登录自启时，计划任务以当前登录用户身份启动该独立二进制；由 GUI 启动的 Supervisor 保存的任务则启动 GUI 的后台模式。本项目不注册 Windows 服务，也不提供 SYSTEM 级后台服务。
 - PAC 生成/服务/联测、TUN、Helper、订阅管理和高级统计不在本轮范围。
 
 ## 验证记录与待验收
@@ -167,3 +169,26 @@ v0.1.1-rc.2 发布标签的 [Ubuntu/Windows MSVC 流水线](https://github.com/m
 新增 C18 / P1、C19 / P2、C20 / P2，分别为草稿写盘失败后继续退出、首次设置自动补读覆盖用户编辑、非当前草稿基准更新未持久化。三个临时探针运行实际 GUI 状态代码确认错误行为后已撤回，未修复产品或发布新包。完整触发顺序与关闭条件见 [最新复核](phase0-2-post-ui-review.md)。
 
 本轮默认并行工作区测试在启动失败补偿用例出现一次失败，单独复测通过；按 CI 的四线程配置复测，98 项常规测试通过，3 项官方 Core 专项忽略。首次失败保留为 F03 / V04 / V09 的时序不稳定待定位项，不能以最终通过关闭。新界面此前 Linux GUI 38 项、Windows GUI 40 项及原生托盘冒烟证据保持原范围，不替代新增缺陷与系统验收。
+
+## 设计文档核对与 PAC 收口（2026-11-12）
+
+按 V1.2 设计 §20 的 Phase 0–2 验收矩阵逐项核对后，既有回归仍覆盖 C01–C20 与 F04 的场景，未发现回退。随后收口了核对发现的可实现项：
+
+- **PAC**：新增 `xray-pac` crate，内置模板支持全部代理、仅代理清单和清单直连，可直接维护域名清单；另支持从原生域名规则生成、导入/编辑、语法检查、有界 `FindProxyForURL` 执行测试；Supervisor 发布不可变 `runtime/pac/<sha256>/proxy.pac`，仅监听回环，纳入 GenerationPlan/租约/端口与版本切换/失败补偿/启动恢复；Windows 目标使用 `AUTO_PROXY_URL` + `DIRECT`（允许脚本 DIRECT）；GUI 增加 PAC 页、模式选择、托盘切换和历史 Revision。
+- **诊断与运维**：WinHTTP 只读诊断、`listener_state` / `pac_state` 分层、持久化日志（UTC 时间戳、代次上下文、凭据脱敏、4 MiB 轮转、7 天备份清理）、Dynamic 外部依赖 opt-in 与重校验、草稿级撤销/重做、托盘状态、导出敏感信息确认、source/user/protocol/attrs 路由上下文。
+
+验证：全工作区 **178 项常规回归通过**、7 项需显式环境用例忽略（含官方 Core PAC 1 项）；Linux 全目标严格 Clippy 与 fmt、Windows GNU 全目标检查通过。当前环境未执行真实 WinINet/PAC URL 往返、Windows 原生 GUI、官方 Core 和远端 CI；上述证据仍按各轮收口记录保留，V01 / V02 / V04–V10 不因本轮常规测试关闭。
+
+剩余边界见 [遗留清单](phase0-2-backlog.md) 与 [设计文档核对](phase0-2-design-crosscheck.md)：真实 Windows PAC URL 与客户端缓存、完整 JScript 兼容、PAC 内存级隔离、F01 容量策略及 F02/F03/F05 的高级表单/复杂路由能力仍保留。
+
+## 代码收口补充（2026-11-12）
+
+在 PAC、日志、Dynamic 和诊断收口之后，继续补齐了可代码化的剩余能力：
+
+- **F02 依赖覆盖**：扩展 TLS / WS / gRPC / HTTPUpgrade / mKCP / QUIC / SplitHTTP / XHTTP / sockopt、DNS、balancer、API、reverse 等常见原生命名空间；未知组合仍降低自动恢复覆盖。
+- **F03 入站就绪**：新增 Xray `mixed` 入站握手（先 SOCKS 后 HTTP）以及 HTTP / Mixed 系统代理端点支持；特殊传输、非回环、Proxy Protocol 等仍明确报告未覆盖。
+- **F05 交互与诊断**：新增静态路由顺序/遮蔽冲突提示、出站 TCP 延迟探测、HTTPUpgrade / mKCP / QUIC / SplitHTTP / XHTTP 表单字段；PAC 页支持域名清单模板，诊断页移除未检测占位并补充代理模式、恢复状态、最近错误和 WinHTTP 实际会话数据。
+- **F01 维护**：`xrayctl maintenance` 现在也将 `runtime/pac/<sha256>` 纳入引用分析和超期孤儿回收；历史 / 详情过期、自动维护和容量上限仍保留。
+- **V10**：内置默认模板、冲突提示和 PAC/原生规则联合测试已补；真实 Windows PAC URL、客户端缓存、完整 JScript 和双向原生规则合并仍需 V10 验收。
+
+验证：全工作区 **208 项常规回归通过**、7 项需显式环境用例忽略；Linux 全目标 Clippy/fmt 通过，Windows GNU 全目标 Clippy/Check 通过。真实 WinINet/PAC URL、Windows 桌面和远端 CI 仍未执行。

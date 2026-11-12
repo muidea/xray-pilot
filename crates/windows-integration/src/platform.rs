@@ -210,3 +210,74 @@ impl crate::startup::StartupBackend for SystemStartup {
         Ok(())
     }
 }
+
+/// Read-only WinHTTP session proxy diagnostics. Never modifies WinHTTP.
+#[cfg(windows)]
+pub fn winhttp_snapshot() -> Result<xray_model::WinHttpConfig> {
+    unsafe {
+        use std::slice;
+        use windows_sys::Win32::{
+            Foundation::GlobalFree,
+            Networking::WinHttp::{
+                WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_ACCESS_TYPE_NAMED_PROXY,
+                WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_OPTION_PROXY, WINHTTP_PROXY_INFO,
+                WinHttpCloseHandle, WinHttpOpen, WinHttpQueryOption,
+            },
+        };
+        fn take(p: windows_sys::core::PWSTR) -> String {
+            if p.is_null() {
+                return String::new();
+            }
+            unsafe {
+                let mut n = 0;
+                while *p.add(n) != 0 {
+                    n += 1;
+                }
+                let value = String::from_utf16_lossy(slice::from_raw_parts(p, n));
+                GlobalFree(p.cast());
+                value
+            }
+        }
+        let agent = xray_config::security::wide("XrayPilotDiagnostics");
+        let session = WinHttpOpen(
+            agent.as_ptr(),
+            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        );
+        if session.is_null() {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let mut info: WINHTTP_PROXY_INFO = std::mem::zeroed();
+        let mut length = std::mem::size_of::<WINHTTP_PROXY_INFO>() as u32;
+        let ok = WinHttpQueryOption(
+            session,
+            WINHTTP_OPTION_PROXY,
+            (&mut info as *mut WINHTTP_PROXY_INFO).cast(),
+            &mut length,
+        );
+        WinHttpCloseHandle(session);
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let access_type = match info.dwAccessType {
+            WINHTTP_ACCESS_TYPE_NAMED_PROXY => "NAMED_PROXY",
+            WINHTTP_ACCESS_TYPE_NO_PROXY => "NO_PROXY",
+            _ => "DEFAULT_PROXY",
+        };
+        Ok(xray_model::WinHttpConfig {
+            access_type: access_type.into(),
+            proxy: take(info.lpszProxy),
+            bypass: take(info.lpszProxyBypass),
+        })
+    }
+}
+
+#[cfg(not(windows))]
+pub fn winhttp_snapshot() -> Result<xray_model::WinHttpConfig> {
+    Err(Error::new(
+        "UNSUPPORTED_PLATFORM",
+        "WinHTTP diagnostics are available on Windows only",
+    ))
+}

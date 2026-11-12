@@ -48,11 +48,15 @@ fn app() -> App {
                     files: vec![],
                     complete: true,
                     notes: vec![],
+
+                    dynamic: vec![],
                 },
             },
             proxy_mode: ProxyMode::Direct,
             http_inbound_tag: "http-in".into(),
             running: true,
+
+            pac: None,
         }),
         core_state: "Running".into(),
         proxy_state: "Unmanaged".into(),
@@ -60,6 +64,10 @@ fn app() -> App {
         supervisor_epoch: "epoch".into(),
         last_error: None,
         recovery_required: false,
+        winhttp: None,
+        listener_state: "Ready".into(),
+        pac_state: "Stopped".into(),
+        auto_connect_notice: None,
     });
     app.ui.runtime = Some(RuntimeConfig {
         generation_id: "generation-1".into(),
@@ -94,6 +102,7 @@ fn native_pages_and_dialogs_render_in_both_themes_at_supported_sizes() {
             for page in [
                 Page::Overview,
                 Page::Profiles,
+                Page::Pac,
                 Page::Diagnostics,
                 Page::Logs,
                 Page::Settings,
@@ -125,7 +134,7 @@ fn native_pages_and_dialogs_render_in_both_themes_at_supported_sizes() {
             }
             for dialog in [
                 Dialog::Confirm(Action::Stop),
-                Dialog::Confirm(Action::Shutdown),
+                Dialog::Confirm(Action::Restart),
                 Dialog::UnsavedExit(ExitKind::Shutdown),
                 Dialog::Rename("work".into()),
                 Dialog::Create,
@@ -576,10 +585,10 @@ fn dialogs_stay_inside_the_smallest_window_in_both_themes() {
                 "rename",
             ),
             (
-                Dialog::Confirm(Action::Shutdown),
-                "退出整个程序？",
-                "停止并退出",
-                "shutdown",
+                Dialog::Confirm(Action::Restart),
+                "启动 / 重启上次应用版本？",
+                "启动 / 重启",
+                "restart",
             ),
         ] {
             let mut app = app();
@@ -1365,6 +1374,7 @@ fn long_content_on_all_pages_keeps_visible_text_separate() {
                                 "最近查询的操作证据",
                                 "预测依据与限制",
                                 "原生字段",
+                                "高级：原生字段编辑",
                                 "依赖检查详情",
                             ]
                             .contains(&text.galley.text())
@@ -1441,8 +1451,12 @@ fn long_content_on_all_pages_keeps_visible_text_separate() {
                     ProfileTab::Inbounds | ProfileTab::Outbounds | ProfileTab::Routing
                 ) {
                     assert!(
-                        expanded.contains("原生字段"),
-                        "native fields were not exercised"
+                        expanded.contains(if profile_tab == ProfileTab::Inbounds {
+                            "原生字段"
+                        } else {
+                            "高级：原生字段编辑"
+                        }),
+                        "native fields were not exercised: {appearance:?} {width} {page:?}/{profile_tab:?} expanded={expanded:?}"
                     );
                 }
                 if page == Page::Diagnostics {
@@ -1458,7 +1472,7 @@ fn long_content_on_all_pages_keeps_visible_text_separate() {
 }
 
 #[test]
-fn long_feedback_preserves_the_workspace_and_full_message_can_be_opened() {
+fn long_feedback_preserves_the_workspace_without_a_full_message_button() {
     let ctx = egui::Context::default();
     configure(&ctx);
     let mut app = app();
@@ -1485,33 +1499,9 @@ fn long_feedback_preserves_the_workspace_and_full_message_can_be_opened() {
         heading.top() > 60.0 && heading.bottom() < 400.0,
         "feedback consumed workspace: {heading:?}"
     );
-    let pos = text_bounds(&output, "完整消息").center();
-    frame(
-        &mut app,
-        vec![
-            egui::Event::PointerMoved(pos),
-            egui::Event::PointerButton {
-                pos,
-                button: egui::PointerButton::Primary,
-                pressed: true,
-                modifiers: egui::Modifiers::NONE,
-            },
-        ],
-    );
-    frame(
-        &mut app,
-        vec![egui::Event::PointerButton {
-            pos,
-            button: egui::PointerButton::Primary,
-            pressed: false,
-            modifiers: egui::Modifiers::NONE,
-        }],
-    );
-    let output = frame(&mut app, vec![]);
-    assert!(output.shapes.iter().any(
-        |shape| matches!(&shape.shape,egui::Shape::Text(text) if text.galley.text()==app.message)
-    ));
-    assert!(text_bounds(&output, "复制完整消息").bottom() < 500.0);
+    assert!(!output.shapes.iter().any(|shape| {
+        matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == "完整消息")
+    }));
     capture_layout(&ctx, output, "audit-long-feedback", 760.0, 500.0);
 }
 
@@ -1530,9 +1520,6 @@ fn every_confirmation_dialog_keeps_actions_visible_with_long_native_names() {
                 Action::Restart,
                 Action::Proxy(ProxyMode::Global),
                 Action::Proxy(ProxyMode::Direct),
-                Action::GuiExit,
-                Action::Shutdown,
-                Action::History("history".into()),
                 Action::AdoptDraft("work".into()),
             ];
             for action in actions {
@@ -1610,7 +1597,7 @@ fn block_draft_writes(app: &mut App) -> tempfile::TempDir {
 
 #[test]
 fn all_normal_exit_entries_block_on_draft_failure_and_allow_retry_or_explicit_discard() {
-    for entry in ["tray-gui", "tray-quit", "menu-gui", "menu-quit", "window"] {
+    for entry in ["tray-gui", "tray-quit", "window"] {
         for discard in [false, true] {
             let mut app = app();
             let root = block_draft_writes(&mut app);
@@ -1618,8 +1605,6 @@ fn all_normal_exit_entries_block_on_draft_failure_and_allow_retry_or_explicit_di
             match entry {
                 "tray-gui" => app.tray_action("exit-gui", &ctx),
                 "tray-quit" => app.tray_action("quit", &ctx),
-                "menu-gui" => app.execute_action(Action::GuiExit, &ctx),
-                "menu-quit" => app.execute_action(Action::Shutdown, &ctx),
                 _ => app.request_exit(ExitKind::Gui),
             }
             app.advance_shutdown();
@@ -1715,4 +1700,747 @@ fn explicit_discard_does_not_authorize_later_edits_to_be_lost() {
     app.draft_edited();
     assert!(!app.drafts_ready_for_exit(ExitKind::Gui));
     assert!(!app.exit);
+}
+
+fn guided_frame(
+    app: &mut App,
+    ctx: &egui::Context,
+    events: Vec<egui::Event>,
+    width: f32,
+    height: f32,
+) -> egui::FullOutput {
+    ctx.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, height),
+            )),
+            events,
+            ..Default::default()
+        },
+        |ctx| app.render(ctx),
+    )
+}
+fn guided_click(app: &mut App, ctx: &egui::Context, label: &str, width: f32, height: f32) {
+    let mut output = guided_frame(app, ctx, vec![], width, height);
+    for _ in 0..12 {
+        output = guided_frame(app, ctx, vec![], width, height);
+    }
+    let pos = text_bounds(&output, label).center();
+    guided_frame(
+        app,
+        ctx,
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+        width,
+        height,
+    );
+    guided_frame(
+        app,
+        ctx,
+        vec![egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+        width,
+        height,
+    );
+}
+
+#[test]
+fn new_wizard_keeps_actions_visible_and_only_saves_incomplete_native_profiles() {
+    use crate::guided_config::{Scene, Template};
+    for appearance in [Appearance::Light, Appearance::Dark] {
+        for (width, height) in [(760.0, 500.0), (1100.0, 760.0)] {
+            for template in Template::ALL {
+                let mut app = app();
+                let (tx, requests) = mpsc::sync_channel(MAX_PENDING);
+                app.tx = tx;
+                app.pending.clear();
+                app.begin_create(false, false);
+                app.ui.new_name = "手工节点".into();
+                app.ui.new_scene = Scene::Split;
+                app.ui.new_template = template;
+                let ctx = egui::Context::default();
+                configure(&ctx);
+                appearance.apply(&ctx);
+                guided_click(&mut app, &ctx, "开始填写", width, height);
+                assert!(app.ui.new_guided_started);
+                let mut output = guided_frame(&mut app, &ctx, vec![], width, height);
+                for _ in 0..12 {
+                    output = guided_frame(&mut app, &ctx, vec![], width, height);
+                }
+                let viewport =
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, height));
+                for label in ["新建配置", "取消", "保存待补充配置"] {
+                    assert!(
+                        viewport.contains_rect(text_bounds(&output, label)),
+                        "{template:?} {label}"
+                    );
+                }
+                if template == Template::VlessReality {
+                    capture_layout(
+                        &ctx,
+                        output,
+                        &format!("{appearance:?}-{width}-guided-create"),
+                        width,
+                        height,
+                    );
+                }
+                guided_click(&mut app, &ctx, "保存待补充配置", width, height);
+                assert!(app.ui.dialog.is_none());
+                let request = requests.try_recv().unwrap();
+                let Command::CreateProfile { profile_id, json } = request.command else {
+                    panic!("wizard must only create a profile")
+                };
+                let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+                assert_eq!(value["outbounds"][0]["tag"], "node-1");
+                assert_eq!(value["routing"]["rules"], serde_json::json!([]));
+                assert!(requests.try_recv().is_err());
+                assert!(app.ui.workspace.node_names.contains_key(&profile_id));
+                assert_eq!(app.mode, ProxyMode::Direct);
+            }
+        }
+    }
+}
+
+#[test]
+fn issue_action_opens_the_node_form_and_edits_only_the_draft() {
+    let mut app = app();
+    let (tx, requests) = mpsc::sync_channel(MAX_PENDING);
+    app.tx = tx;
+    app.pending.clear();
+    let mut config: serde_json::Value = serde_json::from_str(&app.editor).unwrap();
+    config["outbounds"][0] = serde_json::json!({"tag":"node-1","protocol":"socks","settings":{"servers":[{"port":0,"custom":"preserved"}]},"extension":{"keep":true}});
+    app.editor = serde_json::to_string_pretty(&config).unwrap();
+    app.ui.page = Page::Profiles;
+    app.ui.profile_tab = ProfileTab::Summary;
+    app.ui.guided.native = true;
+    let original = app.editor.clone();
+    let runtime = app.ui.runtime.as_ref().unwrap().json.clone();
+    let ctx = egui::Context::default();
+    configure(&ctx);
+    guided_click(&mut app, &ctx, "查看 2 项补充 / 核对提示", 1100.0, 760.0);
+    guided_click(&mut app, &ctx, "去补充", 1100.0, 760.0);
+    assert_eq!(app.ui.profile_tab, ProfileTab::Outbounds);
+    for _ in 0..12 {
+        guided_frame(&mut app, &ctx, vec![], 1100.0, 760.0);
+    }
+    assert_eq!(app.editor, original);
+    guided_frame(
+        &mut app,
+        &ctx,
+        vec![egui::Event::Text("server.invalid".into())],
+        1100.0,
+        760.0,
+    );
+    let edited: serde_json::Value = serde_json::from_str(&app.editor).unwrap();
+    assert_eq!(
+        edited["outbounds"][0]["settings"]["servers"][0]["address"],
+        "server.invalid"
+    );
+    assert_eq!(
+        edited["outbounds"][0]["extension"],
+        config["outbounds"][0]["extension"]
+    );
+    assert_eq!(
+        edited["outbounds"][0]["settings"]["servers"][0]["custom"],
+        "preserved"
+    );
+    assert_eq!(app.ui.runtime.as_ref().unwrap().json, runtime);
+    assert!(requests.try_recv().is_err());
+    assert!(
+        !xray_config::inspect_config(&edited)
+            .iter()
+            .any(|i| i.path.ends_with("/address"))
+    );
+}
+
+#[test]
+fn a_new_wizard_hides_authentication_even_if_the_previous_wizard_revealed_it() {
+    use crate::guided_config::{Scene, Template};
+    let mut app = app();
+    let ctx = egui::Context::default();
+    configure(&ctx);
+    let prepare = |app: &mut App| {
+        app.begin_create(false, false);
+        app.ui.new_guided_started = true;
+        let mut value = crate::guided_config::scene(Scene::Single, Template::VlessTls);
+        value["outbounds"][0]["settings"]["vnext"][0]["users"][0]["id"] =
+            serde_json::json!("test-credential-only");
+        app.ui.new_json = serde_json::to_string(&value).unwrap();
+    };
+    prepare(&mut app);
+    guided_click(&mut app, &ctx, "显示认证信息", 1100.0, 1040.0);
+    let output = guided_frame(&mut app, &ctx, vec![], 1100.0, 1040.0);
+    assert!(output.shapes.iter().any(
+        |s| matches!(&s.shape,egui::Shape::Text(t) if t.galley.text()=="test-credential-only")
+    ));
+    prepare(&mut app);
+    let output = guided_frame(&mut app, &ctx, vec![], 1100.0, 1040.0);
+    assert!(!output.shapes.iter().any(
+        |s| matches!(&s.shape,egui::Shape::Text(t) if t.galley.text()=="test-credential-only")
+    ));
+}
+
+#[test]
+fn guided_node_and_routing_forms_fit_the_parent_without_overlapping_text() {
+    use crate::guided_config::{Scene, Template};
+    for appearance in [Appearance::Light, Appearance::Dark] {
+        for (width, height) in [(760.0, 500.0), (1100.0, 760.0), (1920.0, 1040.0)] {
+            for tab in [ProfileTab::Outbounds, ProfileTab::Routing] {
+                let mut app = app();
+                let mut value = crate::guided_config::scene(Scene::Split, Template::Socks);
+                value["outbounds"][0]["settings"]["servers"][0] =
+                    serde_json::json!({"address":"proxy.example.com","port":443});
+                value["routing"]["rules"] = serde_json::json!([
+                    {"type":"field","domain":["domain:example.com","full:only.example.org"],"outboundTag":"node-1"},
+                    {"type":"field","ip":["192.0.2.0/24"],"outboundTag":"direct"}
+                ]);
+                app.editor = serde_json::to_string_pretty(&value).unwrap();
+                app.ui.page = Page::Profiles;
+                app.ui.profile_tab = tab;
+                app.ui.guided.focus = Some("/outbounds/0/settings/servers/0/address".into());
+                app.ui.workspace.node_names.insert(
+                    "work".into(),
+                    std::collections::BTreeMap::from([("node-1".into(), "香港节点".into())]),
+                );
+                let original = app.editor.clone();
+                let ctx = egui::Context::default();
+                configure(&ctx);
+                appearance.apply(&ctx);
+                let mut output = guided_frame(&mut app, &ctx, vec![], width, height);
+                for _ in 0..12 {
+                    output = guided_frame(&mut app, &ctx, vec![], width, height);
+                }
+                assert!(
+                    overlapping_visible_text(&output).is_empty(),
+                    "{appearance:?} {width} {tab:?}: {:?}",
+                    overlapping_visible_text(&output)
+                );
+                assert_eq!(app.editor, original);
+                if tab == ProfileTab::Routing && width >= 1100.0 {
+                    let first_match = text_bounds(&output, "example.com\nfull:only.example.org");
+                    let footer = text_bounds(&output, "检查并预览");
+                    assert!(
+                        first_match.bottom() < footer.top(),
+                        "first rule input must be visible: {first_match:?} / {footer:?}"
+                    );
+                }
+                capture_layout(
+                    &ctx,
+                    output,
+                    &format!("{appearance:?}-{width}-guided-{tab:?}"),
+                    width,
+                    height,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn unfinished_number_notice_locates_its_field_without_losing_input_or_overlapping_controls() {
+    for appearance in [Appearance::Light, Appearance::Dark] {
+        for (width, height) in [(760.0, 500.0), (1100.0, 760.0), (1920.0, 1040.0)] {
+            let mut app = app();
+            app.ui.page = Page::Profiles;
+            app.ui.profile_tab = ProfileTab::Json;
+            let path = "/inbounds/0/port";
+            let source = serde_json::from_str::<serde_json::Value>(&app.editor)
+                .unwrap()
+                .pointer(path)
+                .unwrap()
+                .to_string();
+            app.ui.number_inputs.insert(
+                path.into(),
+                crate::workspace::NumberInput {
+                    source,
+                    text: "-".into(),
+                },
+            );
+            app.draft_edited();
+            let before = app.editor.clone();
+            let ctx = egui::Context::default();
+            configure(&ctx);
+            appearance.apply(&ctx);
+            for _ in 0..4 {
+                guided_frame(&mut app, &ctx, vec![], width, height);
+            }
+            // The smallest window stacks the picker above the editor; scroll the page to its body.
+            if width < 1100.0 {
+                guided_frame(
+                    &mut app,
+                    &ctx,
+                    vec![
+                        egui::Event::PointerMoved(egui::pos2(width - 80.0, height - 100.0)),
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: egui::vec2(0.0, -240.0),
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    width,
+                    height,
+                );
+                for _ in 0..12 {
+                    guided_frame(&mut app, &ctx, vec![], width, height);
+                }
+            }
+            guided_click(&mut app, &ctx, "定位未完成数值", width, height);
+            assert_eq!(app.ui.profile_tab, ProfileTab::Inbounds);
+            assert!(app.ui.guided.native);
+            let mut output = guided_frame(&mut app, &ctx, vec![], width, height);
+            for _ in 0..4 {
+                output = guided_frame(&mut app, &ctx, vec![], width, height);
+            }
+            assert!(
+                overlapping_visible_text(&output).is_empty(),
+                "{appearance:?} {width}: {:?}",
+                overlapping_visible_text(&output)
+            );
+            assert_eq!(app.editor, before);
+            assert_eq!(app.ui.number_inputs[path].text, "-");
+        }
+    }
+}
+
+#[test]
+fn pac_draft_is_per_profile_persisted_and_can_be_tested() {
+    let mut app = app();
+    app.ui.page = Page::Pac;
+    let mut draft = app.pac_draft();
+    assert_eq!(draft.port, xray_model::DEFAULT_PAC_PORT);
+    assert!(draft.template);
+    draft.template = false;
+    draft.generated = false;
+    draft.script = "function FindProxyForURL(){ return 'DIRECT'; }".into();
+    draft.port = 18081;
+    app.save_pac_draft(draft.clone());
+    assert_eq!(app.pac_draft().script, draft.script);
+    assert_eq!(app.pac_draft().port, 18081);
+    let ctx = egui::Context::default();
+    configure(&ctx);
+    app.ui.connected = true;
+    render(&mut app, &ctx, 1100.0, 760.0);
+}
+
+#[test]
+fn structured_edits_can_be_undone_and_redone() {
+    let mut app = app();
+    let original = app.editor.clone();
+    let edited = original.replace("\"loglevel\": \"warning\"", "\"loglevel\": \"info\"");
+    assert_ne!(edited, original);
+    app.editor = edited.clone();
+    app.draft_edited();
+    assert_eq!(app.ui.undo.len(), 1);
+    app.undo_edit();
+    assert_eq!(app.editor, original);
+    app.redo_edit();
+    assert_eq!(app.editor, edited);
+}
+
+#[test]
+fn proxy_mode_switch_uses_the_running_profile_pac_draft() {
+    let mut app = app();
+    app.ui.workspace.pac.insert(
+        "work".into(),
+        PacDraft {
+            generated: false,
+            template: false,
+            template_mode: Default::default(),
+            domains: Vec::new(),
+            script: "function FindProxyForURL(){ return 'DIRECT'; }".into(),
+            port: 18080,
+        },
+    );
+    app.ui.workspace.pac.insert(
+        "other".into(),
+        PacDraft {
+            generated: false,
+            template: false,
+            template_mode: Default::default(),
+            domains: Vec::new(),
+            script: "function FindProxyForURL(){ return 'PROXY 127.0.0.1:1'; }".into(),
+            port: 18081,
+        },
+    );
+    app.profile_id = "other".into();
+    assert_eq!(app.pac_draft().port, 18081);
+    assert_eq!(app.running_pac_draft().port, 18080);
+}
+
+#[test]
+fn pac_endpoint_refreshes_after_config_adds_or_renames_an_http_inbound() {
+    let mut app = app();
+    app.http_tag = "http-in".into();
+    app.editor = r#"{"outbounds":[{"tag":"direct","protocol":"freedom"}]}"#.into();
+    assert!(app.pac_endpoint().is_err());
+    app.editor = r#"{"inbounds":[{"tag":"new-http","listen":"127.0.0.1","port":18089,"protocol":"http"}],"outbounds":[{"tag":"direct","protocol":"freedom"}]}"#.into();
+    let endpoint = app.pac_endpoint().unwrap();
+    assert_eq!(endpoint.port(), 18089);
+    assert_eq!(app.http_tag, "new-http");
+}
+
+#[test]
+fn pac_template_domain_list_is_saved_per_profile() {
+    let mut app = app();
+    let mut draft = app.pac_draft();
+    assert_eq!(draft.template_mode, xray_model::PacTemplateMode::All);
+    draft.template_mode = xray_model::PacTemplateMode::ProxyList;
+    draft.domains = vec!["example.com".into(), "*.internal.test".into()];
+    app.save_pac_draft(draft);
+    let loaded = app.pac_draft();
+    assert_eq!(loaded.template_mode, xray_model::PacTemplateMode::ProxyList);
+    assert_eq!(loaded.domains, ["example.com", "*.internal.test"]);
+}
+
+#[test]
+fn stopped_core_is_restarted_when_the_last_state_was_running() {
+    let mut app = app();
+    app.ui.connected = true;
+    app.ui.settings_loaded = true;
+    app.settings.restore_last_state = true;
+    app.ui.workspace.last_core_running = true;
+    if let Some(status) = app.status.as_mut() {
+        status.core_state = "Stopped".into();
+        status.recovery_required = false;
+        if let Some(generation) = status.generation.as_mut() {
+            generation.running = false;
+        }
+    }
+    app.maybe_restore_core();
+    assert!(app.ui.restore_attempted);
+}
+
+#[test]
+fn explicit_stop_clears_the_restore_intent() {
+    let mut app = app();
+    app.ui.connected = true;
+    app.ui.workspace.last_core_running = true;
+    app.send(Command::StopCore);
+    assert!(!app.ui.workspace.last_core_running);
+}
+
+#[test]
+fn diagnostics_avoids_unverified_placeholders_and_shows_recovery_context() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    configure(&ctx);
+    app.ui.page = Page::Diagnostics;
+    let output = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1100.0, 760.0),
+            )),
+            ..Default::default()
+        },
+        |ctx| app.render(ctx),
+    );
+    let labels: Vec<&str> = output
+        .shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) => Some(text.galley.text()),
+            _ => None,
+        })
+        .collect();
+    assert!(!labels.contains(&"真实网络连通性"));
+    assert!(!labels.contains(&"实际出口"));
+    assert!(labels.contains(&"恢复状态"));
+    assert!(labels.contains(&"代理模式"));
+}
+
+#[test]
+fn tray_exit_opens_one_confirmation_with_remembered_default() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    app.ui.workspace.exit_default = crate::workspace::ExitDefault::Shutdown;
+    app.tray_action("exit", &ctx);
+    assert!(matches!(app.ui.dialog, Some(Dialog::ExitChoice)));
+    assert_eq!(app.ui.exit_choice, ExitKind::Shutdown);
+    assert!(app.ui.exit_remember);
+}
+
+#[test]
+fn empty_pac_page_does_not_show_a_json_parse_error() {
+    let mut app = app();
+    app.profile_id.clear();
+    app.selected_profile.clear();
+    app.editor.clear();
+    app.ui.page = Page::Pac;
+    let ctx = egui::Context::default();
+    configure(&ctx);
+    let output = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1100.0, 760.0),
+            )),
+            ..Default::default()
+        },
+        |ctx| app.render(ctx),
+    );
+    let labels: Vec<&str> = output
+        .shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) => Some(text.galley.text()),
+            _ => None,
+        })
+        .collect();
+    assert!(!labels.iter().any(|label| label.contains("无法解析")));
+    assert!(!labels.iter().any(|label| label.contains("EOF")));
+    assert!(labels.iter().any(|label| label.contains("尚未选择配置")));
+}
+
+#[test]
+fn onboarding_actions_share_one_row() {
+    let mut app = app();
+    app.ui.onboarding = true;
+    app.ui.setup_step = 0;
+    app.core_path = "C:\\Xray\\xray.exe".into();
+    let ctx = egui::Context::default();
+    configure(&ctx);
+    let output = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1100.0, 760.0),
+            )),
+            ..Default::default()
+        },
+        |ctx| app.render(ctx),
+    );
+    let save = text_bounds(&output, "保存并继续");
+    let later = text_bounds(&output, "稍后设置，进入总览");
+    assert!((save.center().y - later.center().y).abs() < 4.0);
+}
+
+#[test]
+fn selecting_proxy_list_mode_persists_direct_template() {
+    let mut app = app();
+    app.ui.page = Page::Pac;
+    let ctx = egui::Context::default();
+    configure(&ctx);
+    let frame = |app: &mut App, events| {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1100.0, 760.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| app.render(ctx),
+        )
+    };
+    let first = frame(&mut app, vec![]);
+    let mode = text_bounds(&first, "全部代理（本地/局域网直连）").center();
+    let click = |pos| {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    };
+    frame(&mut app, click(mode));
+    let opened = frame(&mut app, vec![]);
+    let choice = text_bounds(&opened, "仅代理清单中的域名").center();
+    frame(&mut app, click(choice));
+    frame(&mut app, vec![]);
+    let draft = app.pac_draft();
+    assert_eq!(draft.template_mode, xray_model::PacTemplateMode::ProxyList);
+    assert!(draft.template);
+    assert!(draft.domains.is_empty());
+    assert!(draft.script.contains("return \"DIRECT\""));
+}
+
+#[test]
+fn adding_a_domain_reactivates_and_saves_the_template() {
+    let mut app = app();
+    app.ui.page = Page::Pac;
+    let mut draft = app.pac_draft();
+    draft.template = false;
+    draft.generated = true;
+    draft.script = "function FindProxyForURL(){ return 'PROXY 127.0.0.1:1'; }".into();
+    app.save_pac_draft(draft);
+    app.ui.pac_domain_input = "example.com".into();
+    let ctx = egui::Context::default();
+    configure(&ctx);
+    let frame = |app: &mut App, events| {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1100.0, 760.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| app.render(ctx),
+        )
+    };
+    let output = frame(&mut app, vec![]);
+    let add = text_bounds(&output, "添加").center();
+    let events = vec![
+        egui::Event::PointerMoved(add),
+        egui::Event::PointerButton {
+            pos: add,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        },
+        egui::Event::PointerButton {
+            pos: add,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        },
+    ];
+    frame(&mut app, events);
+    frame(&mut app, vec![]);
+    let saved = app.pac_draft();
+    assert!(saved.template);
+    assert!(!saved.generated);
+    assert_eq!(saved.template_mode, xray_model::PacTemplateMode::ProxyList);
+    assert_eq!(saved.domains, ["example.com"]);
+    assert!(saved.script.contains(r#"return "PROXY"#));
+    assert!(saved.script.contains(r#"return "DIRECT""#));
+}
+
+#[test]
+fn pac_page_exposes_numbered_workflow_steps() {
+    let mut app = app();
+    app.ui.page = Page::Pac;
+    let ctx = egui::Context::default();
+    configure(&ctx);
+    let output = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1100.0, 1600.0),
+            )),
+            ..Default::default()
+        },
+        |ctx| app.render(ctx),
+    );
+    let labels: Vec<&str> = output
+        .shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) => Some(text.galley.text()),
+            _ => None,
+        })
+        .collect();
+    for step in [
+        "步骤 1 · 选择代理范围",
+        "步骤 2 · 添加代理域名",
+        "步骤 3 · 生成并检查模板",
+        "步骤 4 · 执行 FindProxyForURL 测试",
+        "步骤 5 · 应用到运行版本",
+    ] {
+        assert!(labels.contains(&step), "missing {step}");
+    }
+    assert!(labels.contains(&"生成并检查模板"));
+    assert!(labels.contains(&"测试当前模板"));
+    assert!(labels.contains(&"检查并预览 PAC 应用"));
+}
+
+#[test]
+fn history_diff_dialog_loads_only_after_confirmation() {
+    let mut app = app();
+    let before = app.editor.clone();
+    let historical = before.replace("\"loglevel\": \"warning\"", "\"loglevel\": \"info\"");
+    app.ui.history_preview = Some(HistoryPreview {
+        json: historical.clone(),
+        core: "Xray historical".into(),
+    });
+    app.ui.dialog = Some(Dialog::HistoryDiff);
+    let ctx = egui::Context::default();
+    configure(&ctx);
+    let _output = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1100.0, 760.0),
+            )),
+            ..Default::default()
+        },
+        |ctx| app.render(ctx),
+    );
+    for _ in 0..3 {
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1100.0, 760.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| app.render(ctx),
+        );
+    }
+    let output = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1100.0, 760.0),
+            )),
+            ..Default::default()
+        },
+        |ctx| app.render(ctx),
+    );
+    assert!(text_bounds(&output, "比较历史版本与当前草稿").top() > 0.0);
+    let load = text_bounds(&output, "载入历史为草稿").center();
+    assert_eq!(app.editor, before);
+    let output = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1100.0, 760.0),
+            )),
+            events: vec![
+                egui::Event::PointerMoved(load),
+                egui::Event::PointerButton {
+                    pos: load,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: load,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        },
+        |ctx| app.render(ctx),
+    );
+    let _ = output;
+    assert_eq!(app.editor, historical);
+    assert!(app.ui.history_preview.is_none());
 }

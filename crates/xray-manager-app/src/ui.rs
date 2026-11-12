@@ -13,9 +13,11 @@ mod configuration;
 mod diagnostics;
 #[path = "ui/dialogs.rs"]
 mod dialogs;
-use configuration::{config_review, json_editor, json_viewer};
+use configuration::{config_review, config_review_action, json_editor, json_viewer};
 #[path = "ui/layout.rs"]
 mod layout;
+#[path = "ui/pac.rs"]
+mod pac;
 #[path = "ui/profiles.rs"]
 mod profiles;
 #[path = "ui/settings.rs"]
@@ -29,6 +31,7 @@ pub(super) enum Page {
     #[default]
     Overview,
     Profiles,
+    Pac,
     Diagnostics,
     Logs,
     Settings,
@@ -55,25 +58,35 @@ enum SettingsTab {
 pub(super) enum Action {
     Switch(String),
     Discard(String),
-    Delete { profile: String, revision: String },
+    Delete {
+        profile: String,
+        revision: String,
+    },
     Stop,
     Restart,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    ExportJson,
     Proxy(ProxyMode),
-    GuiExit,
-    Shutdown,
-    History(String),
     AdoptDraft(String),
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ExitKind {
     Gui,
     Shutdown,
 }
-enum Dialog {
+pub(super) enum Dialog {
     UnsavedExit(ExitKind),
     Confirm(Action),
+    HistoryDiff,
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
+    ExitChoice,
     Create,
     Rename(String),
+}
+#[derive(Clone)]
+pub(super) struct HistoryPreview {
+    pub json: String,
+    pub core: String,
 }
 pub(super) struct Uncertain {
     pub request_id: String,
@@ -116,13 +129,20 @@ pub(super) struct UiState {
     pub(super) drafts: HashMap<String, Draft>,
     pub(super) profile_cache: HashMap<String, Profile>,
     draft_dirty_since: Option<Instant>,
+    pub(super) number_inputs: crate::workspace::NumberInputs,
     pending_draft_writes: std::collections::HashSet<String>,
     discarded_draft_state: Option<String>,
     draft_conflict: bool,
-    dialog: Option<Dialog>,
+    pub(super) dialog: Option<Dialog>,
     new_name: String,
     new_json: String,
     import_json: bool,
+    new_scene: crate::guided_config::Scene,
+    new_template: crate::guided_config::Template,
+    new_guided_started: bool,
+    new_editor_epoch: u64,
+    new_node_names: std::collections::BTreeMap<String, String>,
+    pub(super) guided: crate::guided_config::State,
     import_error: Option<String>,
     import_source: Option<PathBuf>,
     import_use_source_assets: bool,
@@ -139,7 +159,30 @@ pub(super) struct UiState {
     events: Vec<Event>,
     route_port: String,
     route_ip: String,
+    route_source: String,
+    route_source_port: String,
+    route_user: String,
+    route_protocol: String,
+    route_attrs: String,
     pub route_tested: Option<(String, RouteContext)>,
+    pub pac_test_url: String,
+    pub pac_domain_input: String,
+    pub restore_attempted: bool,
+    pub exit_choice: ExitKind,
+    pub exit_remember: bool,
+    pub pac_test: String,
+    pub pac_notes: Vec<String>,
+    pub pac_checked: bool,
+    pub history_preview: Option<HistoryPreview>,
+    pub latency_host: String,
+    pub latency_port: String,
+    pub latency_result: String,
+    undo: Vec<String>,
+    redo: Vec<String>,
+    undo_at: Option<Instant>,
+    last_seen_editor: String,
+    restoring_undo: bool,
+    pub(super) allow_dynamic: bool,
 }
 impl Default for UiState {
     fn default() -> Self {
@@ -166,6 +209,7 @@ impl Default for UiState {
             drafts: HashMap::new(),
             profile_cache: HashMap::new(),
             draft_dirty_since: None,
+            number_inputs: Default::default(),
             pending_draft_writes: Default::default(),
             discarded_draft_state: None,
             draft_conflict: false,
@@ -173,6 +217,12 @@ impl Default for UiState {
             new_name: String::new(),
             new_json: String::new(),
             import_json: false,
+            new_scene: Default::default(),
+            new_template: Default::default(),
+            new_guided_started: false,
+            new_editor_epoch: 0,
+            new_node_names: Default::default(),
+            guided: Default::default(),
             import_error: None,
             import_source: None,
             import_use_source_assets: false,
@@ -189,7 +239,30 @@ impl Default for UiState {
             events: vec![],
             route_port: "443".into(),
             route_ip: String::new(),
+            route_source: String::new(),
+            route_source_port: String::new(),
+            route_user: String::new(),
+            route_protocol: String::new(),
+            route_attrs: String::new(),
             route_tested: None,
+            pac_test_url: "https://example.com/".into(),
+            pac_domain_input: String::new(),
+            restore_attempted: false,
+            exit_choice: ExitKind::Gui,
+            exit_remember: true,
+            pac_test: String::new(),
+            pac_notes: vec![],
+            pac_checked: false,
+            history_preview: None,
+            latency_host: String::new(),
+            latency_port: "443".into(),
+            latency_result: String::new(),
+            undo: vec![],
+            redo: vec![],
+            undo_at: None,
+            last_seen_editor: String::new(),
+            restoring_undo: false,
+            allow_dynamic: false,
         }
     }
 }
@@ -353,6 +426,7 @@ fn mode_name(mode: ProxyMode) -> &'static str {
     match mode {
         ProxyMode::Direct => "不接管系统代理",
         ProxyMode::Global => "使用本机 HTTP 代理",
+        ProxyMode::Pac => "使用 PAC 自动代理",
     }
 }
 pub(super) fn command_name(command: &Command) -> &'static str {
@@ -368,6 +442,8 @@ pub(super) fn command_name(command: &Command) -> &'static str {
         Command::SetProxyMode { .. } => "切换系统代理",
         Command::Shutdown => "退出程序",
         Command::TestRoute { .. } | Command::TestRunningRoute { .. } => "路由静态预测",
+        Command::TestPac { .. } => "PAC 执行测试",
+        Command::TestLatency { .. } => "TCP 延迟探测",
         Command::GetOperation { .. } | Command::GetOperationDetails { .. } => "查询操作结果",
         _ => "读取后台状态",
     }
@@ -503,7 +579,8 @@ impl App {
         self.ui.settings_dirty = self.core_path != settings.core_path.display().to_string()
             || self.asset_root != assets
             || self.settings.start_on_logon != settings.start_on_logon
-            || self.settings.connect_on_start != settings.connect_on_start;
+            || self.settings.connect_on_start != settings.connect_on_start
+            || self.settings.restore_last_state != settings.restore_last_state;
         self.finish_setup_save(&settings);
         self.ui.saved_settings = Some(settings);
         self.save_workspace();
@@ -521,14 +598,68 @@ impl App {
             self.fail(error, String::new());
         }
     }
+    pub(super) fn has_draft_edits(&self) -> bool {
+        self.editor != self.saved_json || !self.ui.number_inputs.is_empty()
+    }
     pub(super) fn draft_edited(&mut self) {
+        if !self.ui.restoring_undo {
+            let now = Instant::now();
+            let new_group = self
+                .ui
+                .undo_at
+                .is_none_or(|at| now.duration_since(at) > Duration::from_millis(600));
+            if new_group && self.editor != self.ui.last_seen_editor {
+                self.ui.undo.push(self.ui.last_seen_editor.clone());
+                if self.ui.undo.len() > 50 {
+                    self.ui.undo.remove(0);
+                }
+                self.ui.redo.clear();
+            }
+            self.ui.undo_at = Some(now);
+            self.ui.last_seen_editor = self.editor.clone();
+        }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&self.editor) {
+            self.ui
+                .number_inputs
+                .retain(|path, input| value.pointer(path).is_some_and(|n| input.matches(n)));
+        }
         self.invalidate_candidate();
         self.ui.draft_dirty_since = Some(Instant::now());
+    }
+    pub(super) fn reset_undo(&mut self, editor: &str) {
+        self.ui.undo.clear();
+        self.ui.redo.clear();
+        self.ui.undo_at = None;
+        self.ui.last_seen_editor = editor.into();
+    }
+    pub(super) fn undo_edit(&mut self) {
+        if let Some(previous) = self.ui.undo.pop() {
+            let current = std::mem::replace(&mut self.editor, previous);
+            self.ui.redo.push(current);
+            self.ui.restoring_undo = true;
+            self.draft_edited();
+            self.ui.restoring_undo = false;
+            self.ui.last_seen_editor = self.editor.clone();
+            self.ui.undo_at = None;
+            self.message = "已撤销上一步编辑。".into();
+        }
+    }
+    pub(super) fn redo_edit(&mut self) {
+        if let Some(next) = self.ui.redo.pop() {
+            let current = std::mem::replace(&mut self.editor, next);
+            self.ui.undo.push(current);
+            self.ui.restoring_undo = true;
+            self.draft_edited();
+            self.ui.restoring_undo = false;
+            self.ui.last_seen_editor = self.editor.clone();
+            self.ui.undo_at = None;
+            self.message = "已重做编辑。".into();
+        }
     }
     /// Snapshot the visible editor and retry every pending write, including other profiles.
     pub(super) fn stash_draft(&mut self) -> bool {
         if !self.profile_id.is_empty() && !self.ui.deleted_profiles.contains(&self.profile_id) {
-            let dirty = self.editor != self.saved_json || self.ui.draft_conflict;
+            let dirty = self.has_draft_edits() || self.ui.draft_conflict;
             if dirty {
                 let base_revision = if self.ui.draft_conflict {
                     self.ui
@@ -542,6 +673,7 @@ impl App {
                 self.ui.drafts.insert(
                     self.profile_id.clone(),
                     Draft {
+                        number_inputs: self.ui.number_inputs.clone(),
                         base_revision,
                         json: self.editor.clone(),
                     },
@@ -605,8 +737,40 @@ impl App {
     fn draft_state(&self) -> String {
         let drafts: std::collections::BTreeMap<_, _> = self.ui.drafts.iter().collect();
         hash(
-            &serde_json::to_vec(&(&self.profile_id, &self.editor, &self.revision, drafts)).unwrap(),
+            &serde_json::to_vec(&(
+                &self.profile_id,
+                &self.editor,
+                &self.revision,
+                &self.ui.number_inputs,
+                drafts,
+            ))
+            .unwrap(),
         )
+    }
+    pub(super) fn open_history_diff(&mut self, preview: HistoryPreview) {
+        self.ui.history_preview = Some(preview);
+        self.ui.dialog = Some(Dialog::HistoryDiff);
+    }
+    pub(super) fn load_history_preview(&mut self) -> bool {
+        let Some(preview) = self.ui.history_preview.take() else {
+            return false;
+        };
+        self.editor = preview.json;
+        self.ui.number_inputs.clear();
+        self.invalidate_candidate();
+        self.draft_edited();
+        self.stash_draft();
+        self.message = "历史版本已载入为草稿；请重新检查并预览。".into();
+        true
+    }
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
+    pub(super) fn open_exit_dialog(&mut self) {
+        self.ui.exit_choice = match self.ui.workspace.exit_default {
+            crate::workspace::ExitDefault::Gui => ExitKind::Gui,
+            crate::workspace::ExitDefault::Shutdown => ExitKind::Shutdown,
+        };
+        self.ui.exit_remember = true;
+        self.ui.dialog = Some(Dialog::ExitChoice);
     }
     pub(super) fn request_exit(&mut self, kind: ExitKind) {
         if self.exit
@@ -616,6 +780,13 @@ impl App {
             return;
         }
         if matches!(kind, ExitKind::Shutdown) {
+            if let Some(status) = &self.status {
+                let running = status.core_state == "Running";
+                if self.ui.workspace.last_core_running != running {
+                    self.ui.workspace.last_core_running = running;
+                    self.save_workspace();
+                }
+            }
             self.shutdown_requested = true;
         } else if self.drafts_ready_for_exit(kind) {
             self.exit = true;
@@ -674,6 +845,7 @@ impl App {
         }
     }
     pub(super) fn restore_draft(&mut self) {
+        self.ui.number_inputs.clear();
         self.ui.deleted_profiles.remove(&self.profile_id);
         self.ui.profile_cache.insert(
             self.profile_id.clone(),
@@ -697,8 +869,9 @@ impl App {
         }
         self.ui.draft_conflict = false;
         if let Some(draft) = self.ui.drafts.get(&self.profile_id) {
-            if draft.json != self.saved_json {
+            if draft.json != self.saved_json || !draft.number_inputs.is_empty() {
                 self.editor = draft.json.clone();
+                self.ui.number_inputs = draft.number_inputs.clone();
                 self.ui.draft_conflict = draft.base_revision != self.revision;
             } else {
                 self.ui.drafts.remove(&self.profile_id);
@@ -722,6 +895,7 @@ impl App {
         self.ui.drafts.remove(profile);
         self.ui.profile_cache.remove(profile);
         self.ui.workspace.names.remove(profile);
+        self.ui.workspace.node_names.remove(profile);
         self.save_workspace();
         if self.ui.persistence
             && let Err(error) = Draft::remove(&self.root, profile)
@@ -733,6 +907,7 @@ impl App {
             self.selected_profile.clear();
             self.saved_json.clear();
             self.editor.clear();
+            self.ui.number_inputs.clear();
             self.revision.clear();
             self.view_epoch = self.view_epoch.wrapping_add(1);
             self.invalidate_candidate();
@@ -750,7 +925,7 @@ impl App {
             self.ui.draft_conflict = false;
             self.stash_draft();
         } else if let Some(draft) = self.ui.drafts.get_mut(profile_id) {
-            if draft.json == json {
+            if draft.json == json && draft.number_inputs.is_empty() {
                 self.ui.drafts.remove(profile_id);
             } else {
                 draft.base_revision = revision;
@@ -767,6 +942,27 @@ impl App {
             },
         );
     }
+    #[cfg(any(windows, test))]
+    pub(super) fn open_profile_from_tray(&mut self, profile: &str, ctx: &egui::Context) {
+        if self.busy
+            || self.shutdown_requested
+            || self.ui.uncertain.is_some()
+            || !self.profiles.iter().any(|p| p.id == profile)
+        {
+            return;
+        }
+        self.ui.page = Page::Profiles;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        if self.selected_profile == profile {
+            return;
+        }
+        if self.has_draft_edits() {
+            self.ui.dialog = Some(Dialog::Confirm(Action::Switch(profile.into())));
+        } else {
+            self.switch_profile(profile.into());
+        }
+    }
     pub(super) fn begin_create(&mut self, import: bool, duplicate: bool) {
         self.ui.new_name = if duplicate {
             format!("{} 副本", self.ui.workspace.name(&self.profile_id))
@@ -779,6 +975,20 @@ impl App {
             default_config()
         };
         self.ui.import_json = import || duplicate;
+        self.ui.new_scene = Default::default();
+        self.ui.new_template = Default::default();
+        self.ui.new_guided_started = false;
+        self.ui.new_editor_epoch = self.ui.new_editor_epoch.wrapping_add(1);
+        self.ui.new_node_names = if duplicate {
+            self.ui
+                .workspace
+                .node_names
+                .get(&self.profile_id)
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            Default::default()
+        };
         self.ui.import_error = None;
         self.ui.import_source = None;
         self.ui.import_use_source_assets = false;
@@ -806,6 +1016,10 @@ impl App {
         }
     }
     pub(super) fn validate_draft(&mut self) {
+        if !self.ui.number_inputs.is_empty() {
+            self.message = "有未完成的数值输入，请在高级字段中补全或明确放弃草稿后再检查。".into();
+            return;
+        }
         if self.ui.draft_conflict {
             self.message = "草稿基于旧版本，请先确认如何处理草稿冲突。".into();
             return;
@@ -816,6 +1030,7 @@ impl App {
             json: self.editor.clone(),
             core_path: self.core_path.clone().into(),
             asset_root: self.asset_root.clone().into(),
+            allow_dynamic: self.ui.allow_dynamic,
         });
     }
     pub(super) fn finish_setup_save(&mut self, settings: &Settings) {

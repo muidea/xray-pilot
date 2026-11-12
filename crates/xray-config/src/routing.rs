@@ -93,6 +93,29 @@ fn ip_match(pattern: &str, target: Option<&str>) -> Match {
     };
     if matched { Match::Yes } else { Match::No }
 }
+fn port_match(value: &Value, port: u16) -> Match {
+    let text = value
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| value.to_string());
+    let mut unknown = false;
+    for spec in text.split(',') {
+        let bounds = spec
+            .trim()
+            .split_once('-')
+            .map(|(a, b)| (a.parse::<u16>(), b.parse::<u16>()))
+            .unwrap_or_else(|| (spec.trim().parse(), spec.trim().parse()));
+        match bounds {
+            (Ok(a), Ok(b)) if a <= b => {
+                if (a..=b).contains(&port) {
+                    return Match::Yes;
+                }
+            }
+            _ => unknown = true,
+        }
+    }
+    if unknown { Match::Unknown } else { Match::No }
+}
 pub fn simulate(config: &Value, context: &RouteContext) -> RouteResult {
     let result = |state: &str, index, outbound, reason: String| RouteResult {
         kind: "StaticSimulation".into(),
@@ -155,30 +178,58 @@ pub fn simulate(config: &Value, context: &RouteContext) -> RouteResult {
                         .unwrap_or(Match::Unknown),
                     "port" => context
                         .port
-                        .map(|port| {
-                            let text = value
-                                .as_str()
-                                .map(str::to_owned)
-                                .unwrap_or_else(|| value.to_string());
-                            let mut unknown = false;
-                            for spec in text.split(',') {
-                                let bounds = spec
-                                    .split_once('-')
-                                    .map(|(a, b)| (a.parse::<u16>(), b.parse::<u16>()))
-                                    .unwrap_or_else(|| (spec.parse(), spec.parse()));
-                                match bounds {
-                                    (Ok(a), Ok(b)) if a <= b => {
-                                        if (a..=b).contains(&port) {
-                                            return Match::Yes;
-                                        }
-                                    }
-                                    _ => unknown = true,
-                                }
-                            }
-                            if unknown { Match::Unknown } else { Match::No }
-                        })
+                        .map(|port| port_match(value, port))
                         .unwrap_or(Match::Unknown),
                     "ip" => any(value, |s| ip_match(s, context.target_ip.as_deref())),
+                    "source" => context
+                        .source_ip
+                        .as_deref()
+                        .map(|source| any(value, |s| ip_match(s, Some(source))))
+                        .unwrap_or(Match::Unknown),
+                    "sourcePort" => context
+                        .source_port
+                        .map(|port| port_match(value, port))
+                        .unwrap_or(Match::Unknown),
+                    "user" => context
+                        .user
+                        .as_deref()
+                        .map(|user| any(value, |s| if s == user { Match::Yes } else { Match::No }))
+                        .unwrap_or(Match::Unknown),
+                    "protocol" => context
+                        .protocol
+                        .as_deref()
+                        .map(|protocol| {
+                            any(value, |s| {
+                                if s.eq_ignore_ascii_case(protocol) {
+                                    Match::Yes
+                                } else {
+                                    Match::No
+                                }
+                            })
+                        })
+                        .unwrap_or(Match::Unknown),
+                    "attrs" => context
+                        .attrs
+                        .as_ref()
+                        .map(|attrs| match value.as_object() {
+                            Some(expected) => {
+                                expected.iter().fold(Match::Yes, |state, (key, value)| {
+                                    let Some(value) = value.as_str() else {
+                                        return Match::Unknown;
+                                    };
+                                    and(
+                                        state,
+                                        match attrs.get(key) {
+                                            Some(actual) if actual == value => Match::Yes,
+                                            Some(_) => Match::No,
+                                            None => Match::Unknown,
+                                        },
+                                    )
+                                })
+                            }
+                            None => Match::Unknown,
+                        })
+                        .unwrap_or(Match::Unknown),
                     _ => Match::Unknown,
                 };
                 matched = and(matched, m);
@@ -257,5 +308,72 @@ mod tests {
         config["routing"]["rules"] = serde_json::json!([]);
         config["inbounds"] = serde_json::json!([{"tag":"http-in","sniffing":{"enabled":true}}]);
         assert_eq!(simulate(&config, &context).match_state, "Unknown");
+    }
+}
+
+#[cfg(test)]
+mod extended_tests {
+    use super::*;
+    fn matches(rule: serde_json::Value, context: RouteContext) -> Option<String> {
+        let config = serde_json::json!({"outbounds":[{"tag":"a"}],"routing":{"rules":[rule]}});
+        simulate(&config, &context).expected_outbound
+    }
+    #[test]
+    fn source_user_protocol_and_attrs_are_matched_or_unknown() {
+        let base = RouteContext {
+            host: "example.com".into(),
+            ..Default::default()
+        };
+        assert_eq!(simulate(&serde_json::json!({"outbounds":[{"tag":"a"}],"routing":{"rules":[{"type":"field","source":["10.0.0.0/8"],"outboundTag":"a"}]}}), &base).match_state, "Unknown");
+        assert_eq!(
+            matches(
+                serde_json::json!({"type":"field","source":["10.0.0.0/8"],"outboundTag":"a"}),
+                RouteContext {
+                    source_ip: Some("10.1.2.3".into()),
+                    ..base.clone()
+                }
+            ),
+            Some("a".into())
+        );
+        assert_eq!(
+            matches(
+                serde_json::json!({"type":"field","sourcePort":"1000-2000","outboundTag":"a"}),
+                RouteContext {
+                    source_port: Some(1500),
+                    ..base.clone()
+                }
+            ),
+            Some("a".into())
+        );
+        assert_eq!(
+            matches(
+                serde_json::json!({"type":"field","user":["alice"],"outboundTag":"a"}),
+                RouteContext {
+                    user: Some("alice".into()),
+                    ..base.clone()
+                }
+            ),
+            Some("a".into())
+        );
+        assert_eq!(
+            matches(
+                serde_json::json!({"type":"field","protocol":["http"],"outboundTag":"a"}),
+                RouteContext {
+                    protocol: Some("HTTP".into()),
+                    ..base.clone()
+                }
+            ),
+            Some("a".into())
+        );
+        assert_eq!(
+            matches(
+                serde_json::json!({"type":"field","attrs":{"v":"1"},"outboundTag":"a"}),
+                RouteContext {
+                    attrs: Some(std::collections::BTreeMap::from([("v".into(), "1".into())])),
+                    ..base
+                }
+            ),
+            Some("a".into())
+        );
     }
 }
