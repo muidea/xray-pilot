@@ -2,7 +2,7 @@
 
 Xray Pilot 是 Windows 上的 Xray 配置与运行管理工具。你可以导入原生 JSON、检查配置、预览修改、启动 Core，并通过托盘管理系统代理。
 
-最新已发布版本为 **0.1.1-rc.4 验证版（Pre-release）**，主要面向 Windows x64。仓库当前源码对应 **v0.1.1-rc.17 本地验证包（尚未发布到 Release 页）**；本包的版本与源码指纹以 `VERSION.txt` / `SOURCE-MANIFEST.json` 为准。已发布版本支持 Global / Direct、配置历史和登录自启；**当前源码新增启动状态恢复、PAC 自动代理与域名清单模板、日志持久化、WinHTTP 只读诊断、动态依赖和编辑撤销，尚未发布**。TUN、Windows 服务部署及自动更新尚未提供。完整验收仍在进行，见 [已知限制](#已知限制)。
+最新已发布版本为 **0.1.1-rc.4 验证版（Pre-release）**，主要面向 Windows x64。仓库当前源码已提交为 **v0.1.1-rc.17（`367f96c`，尚未发布到 Release 页）**；本地验证包版本与指纹以 `VERSION.txt` / `SOURCE-MANIFEST.json` 为准。已发布版本支持 Global / Direct、配置历史和登录自启；**当前源码新增启动状态恢复、PAC 自动代理与域名清单模板、日志持久化、WinHTTP 只读诊断、动态依赖和编辑撤销，尚未发布**。TUN、Windows 服务部署及自动更新尚未提供。完整验收仍在进行，见 [已知限制](#已知限制)。
 
 ## 界面版本说明
 
