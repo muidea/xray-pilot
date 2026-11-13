@@ -107,7 +107,7 @@ pub struct App {
     tray: Option<crate::tray::Tray>,
 }
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>, root: PathBuf) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, root: PathBuf, background: bool) -> Self {
         let (tx, requests) = mpsc::sync_channel::<Request>(MAX_PENDING);
         let (responses, rx) = mpsc::channel();
         let worker_root = root.clone();
@@ -192,12 +192,19 @@ impl App {
         #[cfg(windows)]
         {
             app.tray = crate::tray::Tray::new(wakeup).ok();
+            if background && app.tray.is_some() {
+                // `eframe` always reveals the viewport after rendering frame 1; cloak via DWM until frame 2 hides it.
+                app.ui.background_hide = ui::BackgroundHide::HideAfterFirstFrame;
+                if let Some(wakeup) = &app.wakeup {
+                    wakeup.set_cloaked(true);
+                }
+            } else if app.tray.is_none() {
+                cc.egui_ctx
+                    .send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            }
         }
-        #[cfg(windows)]
-        if app.tray.is_none() {
-            cc.egui_ctx
-                .send_viewport_cmd(egui::ViewportCommand::Visible(true));
-        }
+        #[cfg(not(windows))]
+        let _ = background;
         app.send(Command::GetStatus);
         app.refresh_profiles();
         app.send(Command::GetSettings);
@@ -887,6 +894,12 @@ impl App {
         self.reset_undo(&self.editor.clone());
         self.ui.pac_notes.clear();
         self.ui.pac_test.clear();
+        self.ui.pac_checked = false;
+        self.ui.pac_domain_filter.clear();
+        self.ui.pac_domain_kind_filter = Default::default();
+        self.ui.pac_selected_domains.clear();
+        self.ui.pac_batch_report = None;
+        self.ui.pac_template_key = None;
         self.ui.allow_dynamic = false;
         self.invalidate_candidate();
         self.history.clear();
@@ -963,6 +976,44 @@ impl App {
             Err(error) => self.dependency_message = error.to_string(),
         }
     }
+    /// Uncloaks (if still in background startup), reveals, and focuses the main viewport.
+    #[cfg(any(windows, test))]
+    pub(super) fn reveal_window(&mut self, ctx: &egui::Context) {
+        self.ui.background_hide = ui::BackgroundHide::None;
+        if let Some(wakeup) = &self.wakeup {
+            wakeup.set_cloaked(false);
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        ctx.request_repaint();
+    }
+
+    /// Completes the `--background` hide-after-frame-1 sequence without flashing on Windows.
+    pub(super) fn advance_background_hide(&mut self, ctx: &egui::Context) {
+        match self.ui.background_hide {
+            ui::BackgroundHide::None => {}
+            ui::BackgroundHide::HideAfterFirstFrame => {
+                if ctx.cumulative_pass_nr() == 0 {
+                    ctx.request_repaint();
+                } else {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                    self.ui.background_hide = ui::BackgroundHide::UncloakAfterHide;
+                    if let Some(wakeup) = &self.wakeup {
+                        wakeup.request();
+                    } else {
+                        ctx.request_repaint();
+                    }
+                }
+            }
+            ui::BackgroundHide::UncloakAfterHide => {
+                if let Some(wakeup) = &self.wakeup {
+                    wakeup.set_cloaked(false);
+                }
+                self.ui.background_hide = ui::BackgroundHide::None;
+            }
+        }
+    }
+
     #[cfg(any(windows, test))]
     fn tray_action(&mut self, action: &str, ctx: &egui::Context) {
         if let Some(profile) = action.strip_prefix("profile:") {
@@ -970,16 +1021,11 @@ impl App {
             return;
         }
         match action {
-            "open" => {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            }
+            "open" => self.reveal_window(ctx),
             "exit" => {
                 if !self.shutdown_requested {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    self.reveal_window(ctx);
                     self.open_exit_dialog();
-                    ctx.request_repaint();
                 }
             }
             "exit-gui" => {
@@ -989,10 +1035,8 @@ impl App {
             }
             "quit" => {
                 self.request_exit(ui::ExitKind::Shutdown);
-                if (!self.ui.connected || self.ui.uncertain.is_some())
-                    && let Some(wakeup) = &self.wakeup
-                {
-                    wakeup.reveal();
+                if !self.ui.connected || self.ui.uncertain.is_some() {
+                    self.reveal_window(ctx);
                 }
             }
             _ if self.shutdown_requested => {}
@@ -1002,7 +1046,7 @@ impl App {
                     self.send(Command::RestartCore);
                 } else {
                     self.ui.page = Page::Profiles;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    self.reveal_window(ctx);
                 }
             }
             "direct" => self.send(Command::SetProxyMode {
@@ -1085,6 +1129,7 @@ impl eframe::App for App {
                 self.tray_action(&action, ctx);
             }
         }
+        self.advance_background_hide(ctx);
         self.advance_shutdown();
         if self.exit {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);

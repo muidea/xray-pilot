@@ -21,7 +21,10 @@ impl App {
                 SettingsTab::Startup => {
                     ui.label(RichText::new("启动行为").strong().size(18.0));
                     ui.add_enabled_ui(self.write_blocker().is_none(), |ui| {
-                        ui.checkbox(&mut self.settings.start_on_logon, "登录 Windows 后启动界面");
+                        ui.checkbox(
+                            &mut self.settings.start_on_logon,
+                            "登录 Windows 后自启（隐藏到系统托盘）",
+                        );
                         ui.label(RichText::new("登录自启不等同于启动 Core。").small().weak());
                         ui.add_space(10.0);
                         ui.checkbox(
@@ -91,7 +94,21 @@ impl App {
                     ui.label("草稿与配置显示名称保存在本数据目录中，草稿不改变已应用的原生配置。草稿可能包含节点认证信息，请与正式配置一起妥善保管。");
                     ui.separator();
                     ui.label("会话日志");
-                    ui.monospace(display_path(&self.root.join("logs/supervisor.log")));
+                    let log_path = self.root.join("logs/supervisor.log");
+                    ui.monospace(display_path(&log_path));
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("复制日志路径").clicked() {
+                            ui.ctx().copy_text(display_path(&log_path));
+                            self.message = "已复制会话日志路径到剪贴板。".into();
+                        }
+                        if ui.button("复制日志内容").clicked() {
+                            self.copy_session_logs(ui.ctx());
+                        }
+                        #[cfg(windows)]
+                        if ui.button("导出会话日志…").clicked() {
+                            self.export_session_logs_with_dialog();
+                        }
+                    });
                     ui.label(
                         RichText::new(
                             "日志带 UTC 时间戳与操作/代次上下文，凭据字段自动脱敏；超过 4 MiB 轮转一个备份，备份保留 7 天。",

@@ -74,6 +74,11 @@ impl Action {
                 "保留草稿内容，将最新已保存版本作为新的基准。请在预览中仔细核对差异，确认后才会应用。",
                 "保留草稿内容",
             ),
+            Action::ClearPacDomains(_) => (
+                "清空 PAC 代理域名清单？",
+                "将移除当前配置 PAC 模板中的全部域名，并立即更新草稿；运行版本需在步骤 5 应用后才会变化。",
+                "确认清空",
+            ),
         }
     }
 }
@@ -84,7 +89,7 @@ impl App {
             return;
         };
         let response = egui::Modal::new(egui::Id::new("workspace-dialog")).show(ctx, |ui| {
-            let width = if matches!(dialog, Dialog::Create) {
+            let width = if matches!(dialog, Dialog::Create | Dialog::PacBatch) {
                 900.0
             } else {
                 680.0
@@ -97,6 +102,7 @@ impl App {
                 Dialog::HistoryDiff => self.history_diff_dialog_contents(ui),
                 Dialog::ExitChoice => self.exit_choice_dialog_contents(ui),
                 Dialog::UnsavedExit(kind) => self.unsaved_exit_dialog_contents(ui, *kind),
+                Dialog::PacBatch => self.pac_batch_dialog_contents(ui),
             }
         });
         if response.inner && !response.should_close() {
@@ -497,6 +503,13 @@ impl App {
                 self.draft_edited();
                 self.stash_draft();
             }
+            Action::ClearPacDomains(profile) => {
+                if self.selected_profile != profile || self.profile_id != profile {
+                    self.message = "编辑对象已变化，请重新确认清空域名。".into();
+                    return;
+                }
+                self.clear_all_pac_domains();
+            }
             Action::Delete { profile, revision } => self.send(Command::DeleteProfile {
                 profile_id: profile,
                 expected_revision: revision,
@@ -760,6 +773,68 @@ impl App {
             }
         });
         ui.label(RichText::new("已由真实 Core 执行配置校验；这不代表远端节点可连接。正式应用时仍需检查依赖和入口。").small().weak());
+    }
+    fn pac_batch_dialog_contents(&mut self, ui: &mut egui::Ui) -> bool {
+        dialog_title(
+            ui,
+            "批量导入 / 编辑 PAC 域名",
+            "每行一个域名，或用逗号、分号、空格分隔；支持 example.com、*.example.com、full:example.com，自动忽略空行与 # / // 注释。",
+        );
+        let body_height = (ui.ctx().content_rect().height() - 260.0).max(160.0);
+        egui::ScrollArea::vertical()
+            .id_salt("pac-batch-body")
+            .max_height(body_height)
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal_wrapped(|ui| {
+                    ui.radio_value(
+                        &mut self.ui.pac_batch_replace,
+                        false,
+                        "追加到现有清单（自动去重）",
+                    );
+                    ui.radio_value(&mut self.ui.pac_batch_replace, true, "替换当前全部清单");
+                    if ui.button("填入当前清单").clicked() {
+                        self.ui.pac_batch_input =
+                            xray_pac::format_domain_list(&self.pac_draft().domains);
+                        self.ui.pac_batch_report = None;
+                    }
+                });
+                ui.add_space(6.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("pac-batch-text")
+                    .max_height((body_height - 90.0).clamp(120.0, 320.0))
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.ui.pac_batch_input)
+                                .code_editor()
+                                .desired_rows(12)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("example.com\n*.internal.example\nfull:api.example.org"),
+                        );
+                    });
+                if let Some(report) = &self.ui.pac_batch_report {
+                    ui.add_space(6.0);
+                    ui.colored_label(ui.visuals().warn_fg_color, report);
+                }
+            });
+        dialog_actions(ui);
+        let mut keep_open = true;
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("取消").clicked() {
+                keep_open = false;
+            }
+            let can_apply = !self.ui.pac_batch_input.trim().is_empty() || self.ui.pac_batch_replace;
+            if primary(ui, "导入并保存", can_apply) {
+                let batch = self.ui.pac_batch_input.clone();
+                let replace = self.ui.pac_batch_replace;
+                if self.apply_pac_batch(&batch, replace) {
+                    self.ui.pac_batch_input.clear();
+                    self.ui.pac_batch_report = None;
+                    keep_open = false;
+                }
+            }
+        });
+        keep_open
     }
 }
 

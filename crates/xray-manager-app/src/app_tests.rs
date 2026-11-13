@@ -1185,3 +1185,76 @@ fn tray_profile_selection_opens_editor_without_applying_and_preserves_draft_conf
     );
     assert_eq!(h.app.editor, "{\"draft\":true}");
 }
+
+#[test]
+fn background_hide_waits_for_first_eframe_show_then_hides_and_uncloaks() {
+    use eframe::egui::{ViewportCommand, ViewportId};
+
+    let mut h = Harness::new();
+    h.app.ui.background_hide = crate::app::ui::BackgroundHide::HideAfterFirstFrame;
+    let ctx = eframe::egui::Context::default();
+
+    let first = ctx.run(Default::default(), |ctx| {
+        assert_eq!(ctx.cumulative_pass_nr(), 0);
+        h.app.advance_background_hide(ctx);
+    });
+    assert_eq!(
+        h.app.ui.background_hide,
+        crate::app::ui::BackgroundHide::HideAfterFirstFrame
+    );
+    assert!(
+        !first.viewport_output[&ViewportId::ROOT]
+            .commands
+            .contains(&ViewportCommand::Visible(false))
+    );
+
+    let second = ctx.run(Default::default(), |ctx| {
+        assert_eq!(ctx.cumulative_pass_nr(), 1);
+        h.app.advance_background_hide(ctx);
+    });
+    assert_eq!(
+        h.app.ui.background_hide,
+        crate::app::ui::BackgroundHide::UncloakAfterHide
+    );
+    assert!(
+        second.viewport_output[&ViewportId::ROOT]
+            .commands
+            .contains(&ViewportCommand::Visible(false))
+    );
+
+    let third = ctx.run(Default::default(), |ctx| {
+        h.app.advance_background_hide(ctx);
+    });
+    assert_eq!(
+        h.app.ui.background_hide,
+        crate::app::ui::BackgroundHide::None
+    );
+    assert!(
+        !third.viewport_output[&ViewportId::ROOT]
+            .commands
+            .contains(&ViewportCommand::Visible(true))
+    );
+}
+
+#[test]
+fn tray_open_cancels_pending_background_hide_and_reveals_window() {
+    use eframe::egui::{ViewportCommand, ViewportId};
+
+    let mut h = Harness::new();
+    let ctx = eframe::egui::Context::default();
+    let _ = ctx.run(Default::default(), |_| {});
+    h.app.ui.background_hide = crate::app::ui::BackgroundHide::HideAfterFirstFrame;
+
+    let output = ctx.run(Default::default(), |ctx| {
+        h.app.tray_action("open", ctx);
+        h.app.advance_background_hide(ctx);
+    });
+    assert_eq!(
+        h.app.ui.background_hide,
+        crate::app::ui::BackgroundHide::None
+    );
+    let commands = &output.viewport_output[&ViewportId::ROOT].commands;
+    assert!(commands.contains(&ViewportCommand::Visible(true)));
+    assert!(commands.contains(&ViewportCommand::Focus));
+    assert!(!commands.contains(&ViewportCommand::Visible(false)));
+}

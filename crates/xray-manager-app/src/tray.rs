@@ -1,5 +1,5 @@
 use tray_icon::{
-    Icon, TrayIcon, TrayIconBuilder,
+    Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent,
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
 };
 type Bindings =
@@ -63,13 +63,27 @@ impl Tray {
                 .collect::<std::collections::HashMap<_, _>>(),
         ));
         let events = bindings.clone();
+        let menu_tx = tx.clone();
+        let menu_wakeup = wakeup.clone();
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
             let action = events
                 .lock()
                 .ok()
                 .and_then(|ids| ids.get(&event.id).cloned());
             if let Some(action) = action {
-                let _ = tx.send(action);
+                let _ = menu_tx.send(action);
+                menu_wakeup.request();
+            }
+        }));
+        TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
+            if matches!(
+                event,
+                TrayIconEvent::DoubleClick {
+                    button: MouseButton::Left,
+                    ..
+                }
+            ) {
+                let _ = tx.send("open".into());
                 wakeup.request();
             }
         }));

@@ -6,11 +6,154 @@
 use boa_engine::{Context, JsNativeError, JsValue, Source, js_string};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::{BTreeSet, HashSet};
 use std::net::SocketAddr;
 use url::Url;
 use xray_model::{Error, PacTemplateMode, Result};
 
 pub const DEFAULT_PAC_PORT: u16 = 18080;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PacDomainKind {
+    /// Matches only the exact hostname (`full:example.com`).
+    Exact,
+    /// Matches only subdomains (`*.example.com`).
+    Subdomain,
+    /// Matches the domain and all of its subdomains (`example.com`).
+    DomainAndSub,
+}
+
+/// Classify a normalized or raw PAC template domain rule.
+pub fn domain_kind(domain: &str) -> PacDomainKind {
+    let trimmed = domain.trim();
+    if trimmed
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("full:"))
+    {
+        PacDomainKind::Exact
+    } else if trimmed.starts_with("*.") {
+        PacDomainKind::Subdomain
+    } else {
+        PacDomainKind::DomainAndSub
+    }
+}
+
+/// Result of parsing a bulk domain list against an existing list.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BatchImportResult {
+    pub added: Vec<String>,
+    pub duplicates: usize,
+    pub invalid: Vec<(usize, String, String)>,
+}
+
+/// Parse multiline or delimiter-separated domains, ignoring blank lines and `#` / `//` comments.
+pub fn parse_domain_batch(input: &str, existing: &[String]) -> BatchImportResult {
+    let mut seen: HashSet<String> = existing.iter().map(|d| d.to_ascii_lowercase()).collect();
+    let mut result = BatchImportResult::default();
+    for (idx, raw_line) in input.lines().enumerate() {
+        let line_no = idx + 1;
+        let line = strip_line_comment(raw_line).trim();
+        if line.is_empty() {
+            continue;
+        }
+        for token in line
+            .split(|c: char| c.is_whitespace() || matches!(c, ',' | ';'))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            match normalize_domain(token) {
+                Ok(domain) => {
+                    let key = domain.to_ascii_lowercase();
+                    if seen.insert(key) {
+                        result.added.push(domain);
+                    } else {
+                        result.duplicates += 1;
+                    }
+                }
+                Err(error) => {
+                    result
+                        .invalid
+                        .push((line_no, token.to_owned(), error.message));
+                }
+            }
+        }
+    }
+    result
+}
+
+fn strip_line_comment(line: &str) -> &str {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('#') || trimmed.starts_with("//") {
+        return "";
+    }
+    let without_hash = line.split(" #").next().unwrap_or(line);
+    without_hash.split(" //").next().unwrap_or(without_hash)
+}
+
+/// Format domains as a plain newline-separated list for editing or export.
+pub fn format_domain_list(domains: &[String]) -> String {
+    domains.join("\n")
+}
+
+/// Result of extracting plain/wildcard/full domains from native routing rules.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExtractedConfigDomains {
+    pub domains: Vec<String>,
+    pub skipped_geosite: usize,
+    pub skipped_regexp: usize,
+    pub skipped_ext: usize,
+    pub skipped_other: usize,
+}
+
+/// Extract template-compatible domain entries from `/routing/rules[*]/domain`.
+/// Rules relying on `geosite:`, `regexp:`, `ext:`, or keyword substrings cannot
+/// be represented directly by the PAC domain template and are counted as skipped.
+pub fn extract_domains_from_config(config: &Value) -> ExtractedConfigDomains {
+    let mut out = ExtractedConfigDomains::default();
+    let mut seen = HashSet::new();
+    let Some(rules) = config.pointer("/routing/rules").and_then(Value::as_array) else {
+        return out;
+    };
+    for rule in rules {
+        let Some(entries) = rule.get("domain").and_then(Value::as_array) else {
+            continue;
+        };
+        for entry in entries.iter().filter_map(Value::as_str) {
+            let trimmed = entry.trim();
+            let lower = trimmed.to_ascii_lowercase();
+            if lower.starts_with("geosite:") {
+                out.skipped_geosite += 1;
+                continue;
+            }
+            if lower.starts_with("regexp:") {
+                out.skipped_regexp += 1;
+                continue;
+            }
+            if lower.starts_with("ext:") || lower.starts_with("ext-ip:") {
+                out.skipped_ext += 1;
+                continue;
+            }
+            // Bare entries without a prefix are keyword substrings in Xray native routing,
+            // unless they look like a domain name (contain a dot).
+            if !(lower.starts_with("domain:")
+                || lower.starts_with("full:")
+                || (!lower.contains(':') && trimmed.contains('.')))
+            {
+                out.skipped_other += 1;
+                continue;
+            }
+            match normalize_domain(trimmed) {
+                Ok(domain) => {
+                    if seen.insert(domain.to_ascii_lowercase()) {
+                        out.domains.push(domain);
+                    }
+                }
+                Err(_) => out.skipped_other += 1,
+            }
+        }
+    }
+    out
+}
 
 /// Validate and normalize a domain used by the built-in PAC template.
 /// Accepts plain domains, `*.example.com`, `full:example.com` and
@@ -53,55 +196,122 @@ pub fn normalize_domain(input: &str) -> Result<String> {
     }
 }
 
-fn template_domain_condition(input: &str) -> Result<String> {
-    let value = normalize_domain(input)?;
-    if let Some(full) = value.strip_prefix("full:") {
-        return Ok(format!("host === {}", string_literal(full)));
+fn js_domain_set(entries: &BTreeSet<String>) -> String {
+    let mut out = String::from("{");
+    for (idx, item) in entries.iter().enumerate() {
+        if idx > 0 {
+            out.push(',');
+        }
+        out.push_str(&string_literal(item));
+        out.push_str(":1");
     }
-    if let Some(suffix) = value.strip_prefix("*.") {
-        return Ok(format!(
-            "dnsDomainIs(host, {})",
-            string_literal(&format!(".{suffix}"))
-        ));
-    }
-    Ok(format!(
-        "(host === {p} || dnsDomainIs(host, {d}))",
-        p = string_literal(&value),
-        d = string_literal(&format!(".{value}"))
-    ))
+    out.push('}');
+    out
 }
 
 /// Build a built-in template with an optional domain list.
+///
+/// Uses ES3-compatible object maps and dot-segment lookup so large domain lists
+/// stay compact, avoid deep `||` expression trees, and evaluate in O(labels).
 pub fn template(endpoint: SocketAddr, mode: PacTemplateMode, domains: &[String]) -> Result<String> {
-    let mut conditions = vec![];
+    let mut exact = BTreeSet::new();
+    let mut sub = BTreeSet::new();
+    let mut suffix = BTreeSet::new();
     for domain in domains {
-        let condition = template_domain_condition(domain)?;
-        if !conditions.contains(&condition) {
-            conditions.push(condition);
+        let value = normalize_domain(domain)?;
+        if let Some(full) = value.strip_prefix("full:") {
+            exact.insert(full.to_owned());
+        } else if let Some(wild) = value.strip_prefix("*.") {
+            sub.insert(wild.to_owned());
+        } else {
+            suffix.insert(value);
         }
     }
-    let matches = if conditions.is_empty() {
-        "false".to_owned()
-    } else {
-        conditions.join(" || ")
-    };
-    let branch = match mode {
-        PacTemplateMode::All => format!("return \"PROXY {endpoint}\";"),
-        PacTemplateMode::ProxyList => {
-            format!("if ({matches}) {{ return \"PROXY {endpoint}\"; }}\n    return \"DIRECT\";")
-        }
-        PacTemplateMode::DirectList => {
-            format!("if ({matches}) {{ return \"DIRECT\"; }}\n    return \"PROXY {endpoint}\";")
-        }
-    };
-    Ok(format!(
-        r#"function FindProxyForURL(url, host) {{
+
+    let empty = exact.is_empty() && sub.is_empty() && suffix.is_empty();
+    if mode == PacTemplateMode::All || empty {
+        let branch = match mode {
+            PacTemplateMode::All | PacTemplateMode::DirectList => {
+                format!("return \"PROXY {endpoint}\";")
+            }
+            PacTemplateMode::ProxyList => "return \"DIRECT\";".to_owned(),
+        };
+        return Ok(format!(
+            r#"function FindProxyForURL(url, host) {{
     host = host.toLowerCase();
     if (host === "localhost" || host === "127.0.0.1" || host === "::1" ||
         isPlainHostName(host) || dnsDomainIs(host, ".lan") || dnsDomainIs(host, ".local")) {{
         return "DIRECT";
     }}
     {branch}
+}}
+"#
+        ));
+    }
+
+    let mut globals = String::new();
+    let mut direct_checks = Vec::new();
+    let mut parent_checks = Vec::new();
+    if !exact.is_empty() {
+        globals.push_str(&format!("var __PAC_EXACT = {};\n", js_domain_set(&exact)));
+        direct_checks.push("__PAC_OWN.call(__PAC_EXACT, host)");
+    }
+    if !sub.is_empty() {
+        globals.push_str(&format!("var __PAC_SUB = {};\n", js_domain_set(&sub)));
+        parent_checks.push("__PAC_OWN.call(__PAC_SUB, parent)");
+    }
+    if !suffix.is_empty() {
+        globals.push_str(&format!("var __PAC_SUFFIX = {};\n", js_domain_set(&suffix)));
+        direct_checks.push("__PAC_OWN.call(__PAC_SUFFIX, host)");
+        parent_checks.push("__PAC_OWN.call(__PAC_SUFFIX, parent)");
+    }
+
+    let direct_expr = if direct_checks.is_empty() {
+        "false".to_owned()
+    } else {
+        direct_checks.join(" || ")
+    };
+    let parent_loop = if parent_checks.is_empty() {
+        String::new()
+    } else {
+        let cond = parent_checks.join(" || ");
+        format!(
+            r#"    if (!matched) {{
+        var pos = host.indexOf(".");
+        while (pos !== -1) {{
+            var parent = host.substring(pos + 1);
+            if ({cond}) {{
+                matched = true;
+                break;
+            }}
+            pos = host.indexOf(".", pos + 1);
+        }}
+    }}
+"#
+        )
+    };
+    let (hit, miss) = match mode {
+        PacTemplateMode::ProxyList => (format!("\"PROXY {endpoint}\""), "\"DIRECT\"".to_owned()),
+        PacTemplateMode::DirectList => ("\"DIRECT\"".to_owned(), format!("\"PROXY {endpoint}\"")),
+        PacTemplateMode::All => unreachable!(),
+    };
+
+    Ok(format!(
+        r#"{globals}var __PAC_OWN = Object.prototype.hasOwnProperty;
+function __pacMatch(host) {{
+    var matched = {direct_expr};
+{parent_loop}    return matched;
+}}
+function FindProxyForURL(url, host) {{
+    host = host.toLowerCase();
+    if (host === "localhost" || host === "127.0.0.1" || host === "::1" ||
+        isPlainHostName(host) || dnsDomainIs(host, ".lan") || dnsDomainIs(host, ".local")) {{
+        return "DIRECT";
+    }}
+    if (__pacMatch(host)) {{
+        return {hit};
+    }}
+    return {miss};
 }}
 "#
     ))

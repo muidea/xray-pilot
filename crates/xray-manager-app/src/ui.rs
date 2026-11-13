@@ -54,6 +54,14 @@ enum SettingsTab {
     Appearance,
     Storage,
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum PacDomainFilter {
+    #[default]
+    All,
+    DomainAndSub,
+    Subdomain,
+    Exact,
+}
 #[derive(Clone)]
 pub(super) enum Action {
     Switch(String),
@@ -68,11 +76,22 @@ pub(super) enum Action {
     ExportJson,
     Proxy(ProxyMode),
     AdoptDraft(String),
+    ClearPacDomains(String),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ExitKind {
     Gui,
     Shutdown,
+}
+
+/// Two-frame state machine that keeps `--background` launches hidden despite `eframe` showing frame 1.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub(super) enum BackgroundHide {
+    #[default]
+    None,
+    HideAfterFirstFrame,
+    UncloakAfterHide,
 }
 pub(super) enum Dialog {
     UnsavedExit(ExitKind),
@@ -82,6 +101,7 @@ pub(super) enum Dialog {
     ExitChoice,
     Create,
     Rename(String),
+    PacBatch,
 }
 #[derive(Clone)]
 pub(super) struct HistoryPreview {
@@ -167,7 +187,20 @@ pub(super) struct UiState {
     pub route_tested: Option<(String, RouteContext)>,
     pub pac_test_url: String,
     pub pac_domain_input: String,
+    pub pac_domain_filter: String,
+    pub pac_domain_kind_filter: PacDomainFilter,
+    pub pac_selected_domains: std::collections::BTreeSet<String>,
+    pub pac_batch_input: String,
+    pub pac_batch_replace: bool,
+    pub pac_batch_report: Option<String>,
+    pub pac_template_key: Option<(
+        String,
+        std::net::SocketAddr,
+        xray_model::PacTemplateMode,
+        u64,
+    )>,
     pub restore_attempted: bool,
+    pub background_hide: BackgroundHide,
     pub exit_choice: ExitKind,
     pub exit_remember: bool,
     pub pac_test: String,
@@ -247,7 +280,15 @@ impl Default for UiState {
             route_tested: None,
             pac_test_url: "https://example.com/".into(),
             pac_domain_input: String::new(),
+            pac_domain_filter: String::new(),
+            pac_domain_kind_filter: PacDomainFilter::default(),
+            pac_selected_domains: Default::default(),
+            pac_batch_input: String::new(),
+            pac_batch_replace: false,
+            pac_batch_report: None,
+            pac_template_key: None,
             restore_attempted: false,
+            background_hide: BackgroundHide::None,
             exit_choice: ExitKind::Gui,
             exit_remember: true,
             pac_test: String::new(),
@@ -952,8 +993,7 @@ impl App {
             return;
         }
         self.ui.page = Page::Profiles;
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        self.reveal_window(ctx);
         if self.selected_profile == profile {
             return;
         }

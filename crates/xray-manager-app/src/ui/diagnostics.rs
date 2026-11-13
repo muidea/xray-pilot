@@ -426,6 +426,92 @@ impl App {
         }
         rows
     }
+
+    pub(super) fn format_log_rows(rows: &[(String, String)]) -> String {
+        rows.iter()
+            .map(|(_, text)| text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Reads persisted `logs/supervisor.log.1` (if present) and `logs/supervisor.log` in chronological order.
+    pub(super) fn read_session_logs(&self) -> std::result::Result<Option<String>, String> {
+        let logs_dir = self.root.join("logs");
+        let mut combined = String::new();
+        for name in ["supervisor.log.1", "supervisor.log"] {
+            let path = logs_dir.join(name);
+            match std::fs::read(&path) {
+                Ok(bytes) => {
+                    let chunk = String::from_utf8_lossy(&bytes);
+                    if !combined.is_empty() && !combined.ends_with('\n') && !chunk.is_empty() {
+                        combined.push('\n');
+                    }
+                    combined.push_str(&chunk);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("{}: {error}", display_path(&path))),
+            }
+        }
+        if combined.trim().is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(combined))
+        }
+    }
+
+    #[cfg(any(windows, test))]
+    pub(super) fn write_log_export(
+        path: &std::path::Path,
+        content: &str,
+    ) -> std::result::Result<(), String> {
+        std::fs::write(path, content).map_err(|error| error.to_string())
+    }
+
+    pub(super) fn copy_session_logs(&mut self, ctx: &egui::Context) {
+        match self.read_session_logs() {
+            Ok(Some(text)) => {
+                ctx.copy_text(text);
+                self.message = "已复制持久化会话日志到剪贴板。".into();
+            }
+            Ok(None) => self.message = "暂无已落盘的会话日志。".into(),
+            Err(error) => self.message = format!("读取会话日志失败：{error}"),
+        }
+    }
+
+    #[cfg(windows)]
+    pub(super) fn export_text_with_dialog(
+        &mut self,
+        default_name: &str,
+        content: &str,
+        ok_message: &str,
+    ) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("日志文件", &["log", "txt"])
+            .set_file_name(default_name)
+            .save_file()
+        {
+            match Self::write_log_export(&path, content) {
+                Ok(()) => self.message = ok_message.into(),
+                Err(error) => self.message = format!("导出日志失败：{error}"),
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    pub(super) fn export_session_logs_with_dialog(&mut self) {
+        match self.read_session_logs() {
+            Ok(Some(text)) => {
+                self.export_text_with_dialog(
+                    "xray-pilot-supervisor.log",
+                    &text,
+                    "已导出持久化会话日志。",
+                );
+            }
+            Ok(None) => self.message = "暂无已落盘的会话日志。".into(),
+            Err(error) => self.message = format!("读取会话日志失败：{error}"),
+        }
+    }
+
     pub(in crate::app) fn logs_page(&mut self, ui: &mut egui::Ui) {
         heading(
             ui,
@@ -482,13 +568,25 @@ impl App {
                 .weak(),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("复制筛选结果").clicked() {
-                    ui.ctx().copy_text(
-                        rows.iter()
-                            .map(|(_, text)| text.as_str())
-                            .collect::<Vec<_>>()
-                            .join("\n"),
+                #[cfg(windows)]
+                if ui
+                    .add_enabled(!rows.is_empty(), egui::Button::new("导出日志…"))
+                    .clicked()
+                {
+                    let content = Self::format_log_rows(&rows);
+                    let count = rows.len();
+                    self.export_text_with_dialog(
+                        "xray-pilot-logs.txt",
+                        &content,
+                        &format!("已导出 {count} 条日志。"),
                     );
+                }
+                if ui
+                    .add_enabled(!rows.is_empty(), egui::Button::new("复制筛选结果"))
+                    .clicked()
+                {
+                    ui.ctx().copy_text(Self::format_log_rows(&rows));
+                    self.message = format!("已复制 {} 条日志到剪贴板。", rows.len());
                 }
                 if ui.button("读取 Core 日志").clicked() {
                     self.send(Command::GetLogs);
@@ -514,10 +612,10 @@ impl App {
                 ui.label(RichText::new("暂无匹配的日志。").weak());
             }
             egui::ScrollArea::vertical()
-                .max_height(470.0)
+                .max_height(450.0)
                 .id_salt("log-content")
                 .show(ui, |ui| {
-                    for (level, text) in rows {
+                    for (idx, (level, text)) in rows.iter().enumerate() {
                         let color = if level == "错误" {
                             ui.visuals().error_fg_color
                         } else if level == "警告" {
@@ -525,10 +623,45 @@ impl App {
                         } else {
                             ui.visuals().text_color()
                         };
-                        ui.label(RichText::new(text).monospace().color(color));
+                        ui.push_id(idx, |ui| {
+                            ui.horizontal(|ui| {
+                                let text_width = (ui.available_width() - 56.0).max(120.0);
+                                ui.allocate_ui(egui::vec2(text_width, 0.0), |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(text).monospace().color(color),
+                                        )
+                                        .wrap(),
+                                    );
+                                });
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::TOP),
+                                    |ui| {
+                                        if ui
+                                            .small_button("复制")
+                                            .on_hover_text("复制此条日志")
+                                            .clicked()
+                                        {
+                                            ui.ctx().copy_text(text.clone());
+                                            self.message = "已复制该条日志到剪贴板。".into();
+                                        }
+                                    },
+                                );
+                            });
+                        });
                         ui.separator();
                     }
                 });
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("持久化会话日志：").small().weak());
+            if ui.button("复制会话日志").clicked() {
+                self.copy_session_logs(ui.ctx());
+            }
+            #[cfg(windows)]
+            if ui.button("导出会话日志…").clicked() {
+                self.export_session_logs_with_dialog();
+            }
         });
         ui.label(RichText::new("Core 输出与操作记录有容量上限，重启后不保留本次界面的操作列表。日志可能包含目标地址或认证信息。").small().weak());
     }

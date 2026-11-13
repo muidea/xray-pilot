@@ -280,3 +280,130 @@ fn pac_test_url_accepts_host_without_scheme_and_rejects_relative_input() {
     assert!(normalize_test_url("/relative").is_err());
     assert!(normalize_test_url("ftp://example.com/").is_err());
 }
+
+#[test]
+fn large_template_domain_list_evaluates_without_recursion_overflow() {
+    let domains: Vec<String> = (0..5000)
+        .map(|i| match i % 3 {
+            0 => format!("site{i}.example.com"),
+            1 => format!("*.wild{i}.example.net"),
+            _ => format!("full:exact{i}.example.org"),
+        })
+        .collect();
+    let script = template(endpoint(), xray_model::PacTemplateMode::ProxyList, &domains).unwrap();
+    assert!(script.len() < 512 * 1024);
+    assert!(compat_notes(&script).is_empty());
+    validate(&script).unwrap();
+    assert_eq!(
+        evaluate(&script, "https://sub.site0.example.com/")
+            .unwrap()
+            .kind,
+        "PROXY"
+    );
+    assert_eq!(
+        evaluate(&script, "https://wild1.example.net/")
+            .unwrap()
+            .kind,
+        "DIRECT"
+    );
+    assert_eq!(
+        evaluate(&script, "https://a.wild1.example.net/")
+            .unwrap()
+            .kind,
+        "PROXY"
+    );
+    assert_eq!(
+        evaluate(&script, "https://exact2.example.org/")
+            .unwrap()
+            .kind,
+        "PROXY"
+    );
+    assert_eq!(
+        evaluate(&script, "https://sub.exact2.example.org/")
+            .unwrap()
+            .kind,
+        "DIRECT"
+    );
+    assert_eq!(
+        evaluate(&script, "https://constructor.example.com/")
+            .unwrap()
+            .kind,
+        "DIRECT"
+    );
+}
+
+#[test]
+fn template_does_not_match_object_prototype_keys() {
+    let script = template(
+        endpoint(),
+        xray_model::PacTemplateMode::ProxyList,
+        &["full:exact.example".into()],
+    )
+    .unwrap();
+    assert_eq!(
+        evaluate(&script, "https://toString/").unwrap().kind,
+        "DIRECT"
+    );
+    assert_eq!(
+        evaluate(&script, "https://constructor/").unwrap().kind,
+        "DIRECT"
+    );
+}
+
+#[test]
+fn batch_domain_parser_handles_delimiters_comments_duplicates_and_errors() {
+    let existing = vec!["existing.com".into()];
+    let input = r#"
+# comment line
+// another comment
+Example.COM, *.sub.example.net; full:exact.org # inline comment
+EXISTING.com
+bad/domain
+"#;
+    let parsed = parse_domain_batch(input, &existing);
+    assert_eq!(
+        parsed.added,
+        vec![
+            "example.com".to_owned(),
+            "*.sub.example.net".to_owned(),
+            "full:exact.org".to_owned()
+        ]
+    );
+    assert_eq!(parsed.duplicates, 1);
+    assert_eq!(parsed.invalid.len(), 1);
+    assert_eq!(parsed.invalid[0].0, 6);
+    assert_eq!(parsed.invalid[0].1, "bad/domain");
+}
+
+#[test]
+fn extract_domains_from_config_skips_geosite_and_non_domain_rules() {
+    let cfg = json!({
+        "routing": {
+            "rules": [
+                {
+                    "type": "field",
+                    "domain": [
+                        "geosite:cn",
+                        "geosite:geolocation-!cn",
+                        "domain:example.com",
+                        "full:api.example.org",
+                        "cdn.example.net",
+                        "regexp:^.*\\.ads\\.",
+                        "ext:custom.dat:ads",
+                        "keyword-only"
+                    ],
+                    "outboundTag": "direct"
+                }
+            ]
+        }
+    });
+    let extracted = extract_domains_from_config(&cfg);
+    assert_eq!(
+        extracted.domains,
+        vec!["example.com", "full:api.example.org", "cdn.example.net"]
+    );
+    assert_eq!(extracted.skipped_geosite, 2);
+    assert_eq!(extracted.skipped_regexp, 1);
+    assert_eq!(extracted.skipped_ext, 1);
+    assert_eq!(extracted.skipped_other, 1);
+}

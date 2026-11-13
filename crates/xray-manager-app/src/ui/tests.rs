@@ -2444,3 +2444,307 @@ fn history_diff_dialog_loads_only_after_confirmation() {
     assert_eq!(app.editor, historical);
     assert!(app.ui.history_preview.is_none());
 }
+
+fn pointer_click(pos: egui::Pos2) -> Vec<egui::Event> {
+    vec![
+        egui::Event::PointerMoved(pos),
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        },
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        },
+    ]
+}
+
+#[test]
+fn pac_batch_dialog_imports_and_replaces_domains_with_error_protection() {
+    let mut app = app();
+    app.ui.page = Page::Pac;
+    app.ui.dialog = Some(Dialog::PacBatch);
+    app.ui.pac_batch_input =
+        "# comment\nexample.com, *.sub.example.net\nfull:api.example.org\n".into();
+    let ctx = egui::Context::default();
+    configure(&ctx);
+    let frame = |app: &mut App, events| {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1100.0, 900.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| app.render(ctx),
+        )
+    };
+    for _ in 0..3 {
+        let _ = frame(&mut app, vec![]);
+    }
+    let output = frame(&mut app, vec![]);
+    let import = text_bounds(&output, "导入并保存").center();
+    frame(&mut app, pointer_click(import));
+    frame(&mut app, vec![]);
+    assert!(app.ui.dialog.is_none());
+    let draft = app.pac_draft();
+    assert_eq!(
+        draft.domains,
+        vec!["example.com", "*.sub.example.net", "full:api.example.org"]
+    );
+    assert_eq!(draft.template_mode, xray_model::PacTemplateMode::ProxyList);
+
+    // Invalid-only replacement preserves existing domains and reports error.
+    assert!(!app.apply_pac_batch("bad/domain", true));
+    assert_eq!(app.pac_draft().domains.len(), 3);
+    assert!(app.ui.pac_batch_report.is_some());
+
+    // Valid replacement updates the list cleanly.
+    assert!(app.apply_pac_batch("only.example.org", true));
+    assert_eq!(app.pac_draft().domains, vec!["only.example.org"]);
+}
+
+#[test]
+fn pac_large_domain_list_uses_bounded_virtualized_viewport_and_filters() {
+    let mut app = app();
+    app.ui.page = Page::Pac;
+    let mut draft = app.pac_draft();
+    draft.template_mode = xray_model::PacTemplateMode::ProxyList;
+    draft.domains = (0..2000)
+        .map(|i| match i % 3 {
+            0 => format!("site{i}.example.com"),
+            1 => format!("*.wild{i}.example.net"),
+            _ => format!("full:exact{i}.example.org"),
+        })
+        .collect();
+    app.save_pac_draft(draft);
+    let ctx = egui::Context::default();
+    configure(&ctx);
+    let frame = |app: &mut App, events| {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1100.0, 1400.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| app.render(ctx),
+        )
+    };
+    let output = frame(&mut app, vec![]);
+    let labels: Vec<&str> = output
+        .shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) => Some(text.galley.text()),
+            _ => None,
+        })
+        .collect();
+    assert!(labels.iter().any(|l| l.contains("共 2000 条")));
+    // Virtualized scroll area renders only the visible rows, not all 2000 items.
+    let rendered_domains = labels
+        .iter()
+        .filter(|l| {
+            l.ends_with(".example.com")
+                || l.ends_with(".example.net")
+                || l.ends_with(".example.org")
+        })
+        .count();
+    assert!(
+        rendered_domains > 0 && rendered_domains < 40,
+        "expected virtualized slice, got {rendered_domains}"
+    );
+    // Bounded scroll area keeps Step 3–5 reachable without stretching the page.
+    let step3 = text_bounds(&output, "步骤 3 · 生成并检查模板");
+    assert!(
+        step3.top() < 1100.0,
+        "step 3 pushed too far down: {}",
+        step3.top()
+    );
+
+    // Search + kind filter + bulk selection removal.
+    app.ui.pac_domain_filter = "exact199".into();
+    app.ui.pac_domain_kind_filter = PacDomainFilter::Exact;
+    let filtered = frame(&mut app, vec![]);
+    let select_all = text_bounds(&filtered, "全选当前").center();
+    frame(&mut app, pointer_click(select_all));
+    let after_select = frame(&mut app, vec![]);
+    let selected_count = app.ui.pac_selected_domains.len();
+    assert!(selected_count > 0 && selected_count < 20);
+    let remove_btn_label = format!("移除所选 ({selected_count})");
+    let remove_pos = text_bounds(&after_select, &remove_btn_label).center();
+    frame(&mut app, pointer_click(remove_pos));
+    frame(&mut app, vec![]);
+    assert_eq!(app.pac_draft().domains.len(), 2000 - selected_count);
+    assert!(app.ui.pac_selected_domains.is_empty());
+}
+
+#[test]
+fn pac_extract_from_config_skips_geosite_and_explains_boundary() {
+    let mut app = app();
+    app.ui.page = Page::Pac;
+    app.editor = r#"{
+        "inbounds": [{"tag": "http-in", "listen": "127.0.0.1", "port": 10809, "protocol": "http"}],
+        "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+        "routing": {"rules": [
+            {"type": "field", "domain": ["geosite:cn", "domain:example.com", "full:api.example.org"], "outboundTag": "direct"}
+        ]}
+    }"#
+    .into();
+    let ctx = egui::Context::default();
+    configure(&ctx);
+    let frame = |app: &mut App, events| {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1100.0, 900.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| app.render(ctx),
+        )
+    };
+    let output = frame(&mut app, vec![]);
+    let extract = text_bounds(&output, "从路由规则提取").center();
+    frame(&mut app, pointer_click(extract));
+    frame(&mut app, vec![]);
+    let draft = app.pac_draft();
+    assert_eq!(draft.domains, vec!["example.com", "full:api.example.org"]);
+    assert!(app.message.contains("geosite"));
+    assert!(app.message.contains("geosite.dat"));
+}
+
+#[test]
+fn pac_clear_all_requires_confirmation_and_empties_list() {
+    let mut app = app();
+    app.ui.page = Page::Pac;
+    let mut draft = app.pac_draft();
+    draft.template_mode = xray_model::PacTemplateMode::ProxyList;
+    draft.domains = vec!["a.example.com".into(), "b.example.com".into()];
+    app.save_pac_draft(draft);
+    let ctx = egui::Context::default();
+    configure(&ctx);
+    let frame = |app: &mut App, events| {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1100.0, 1200.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| app.render(ctx),
+        )
+    };
+    let output = frame(&mut app, vec![]);
+    let clear = text_bounds(&output, "清空全部").center();
+    frame(&mut app, pointer_click(clear));
+    for _ in 0..3 {
+        let _ = frame(&mut app, vec![]);
+    }
+    let confirm_dialog = frame(&mut app, vec![]);
+    assert!(matches!(
+        app.ui.dialog,
+        Some(Dialog::Confirm(Action::ClearPacDomains(_)))
+    ));
+    let confirm = text_bounds(&confirm_dialog, "确认清空").center();
+    frame(&mut app, pointer_click(confirm));
+    frame(&mut app, vec![]);
+    assert!(app.pac_draft().domains.is_empty());
+}
+
+#[test]
+fn logs_copy_buttons_and_session_log_export_helpers_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let logs_dir = dir.path().join("logs");
+    std::fs::create_dir_all(&logs_dir).unwrap();
+    std::fs::write(logs_dir.join("supervisor.log.1"), "older line").unwrap();
+    std::fs::write(logs_dir.join("supervisor.log"), "newer line\n").unwrap();
+
+    let mut app = app();
+    app.root = dir.path().into();
+    app.logs = vec!["2026-11-13 [Info] core ready".into()];
+    app.ui.page = Page::Logs;
+
+    let ctx = egui::Context::default();
+    configure(&ctx);
+    let frame = |app: &mut App, events| {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1100.0, 900.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| app.render(ctx),
+        )
+    };
+    let copied_text = |output: &egui::FullOutput| -> Option<String> {
+        output.platform_output.commands.iter().find_map(|cmd| {
+            if let egui::OutputCommand::CopyText(text) = cmd {
+                Some(text.clone())
+            } else {
+                None
+            }
+        })
+    };
+
+    let output = frame(&mut app, vec![]);
+    let copy_filtered = text_bounds(&output, "复制筛选结果").center();
+    let click_out = frame(&mut app, pointer_click(copy_filtered));
+    assert_eq!(
+        copied_text(&click_out).as_deref(),
+        Some("[Core] 2026-11-13 [Info] core ready")
+    );
+    assert!(app.message.contains("已复制 1 条日志"));
+
+    let output = frame(&mut app, vec![]);
+    let copy_row = text_bounds(&output, "复制").center();
+    let click_out = frame(&mut app, pointer_click(copy_row));
+    assert_eq!(
+        copied_text(&click_out).as_deref(),
+        Some("[Core] 2026-11-13 [Info] core ready")
+    );
+    assert!(app.message.contains("已复制该条日志"));
+
+    let output = frame(&mut app, vec![]);
+    let copy_session = text_bounds(&output, "复制会话日志").center();
+    let click_out = frame(&mut app, pointer_click(copy_session));
+    assert_eq!(
+        copied_text(&click_out).as_deref(),
+        Some("older line\nnewer line\n")
+    );
+    assert!(app.message.contains("已复制持久化会话日志"));
+
+    let exported = dir.path().join("exported.log");
+    let content = app.read_session_logs().unwrap().unwrap();
+    App::write_log_export(&exported, &content).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&exported).unwrap(),
+        "older line\nnewer line\n"
+    );
+    assert!(App::write_log_export(dir.path(), &content).is_err());
+
+    app.ui.page = Page::Settings;
+    app.ui.settings_tab = SettingsTab::Storage;
+    let output = frame(&mut app, vec![]);
+    let copy_storage_log = text_bounds(&output, "复制日志内容").center();
+    let click_out = frame(&mut app, pointer_click(copy_storage_log));
+    assert_eq!(
+        copied_text(&click_out).as_deref(),
+        Some("older line\nnewer line\n")
+    );
+}

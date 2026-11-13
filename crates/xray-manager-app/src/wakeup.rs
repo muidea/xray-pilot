@@ -39,7 +39,30 @@ impl Wakeup {
         }
     }
 
+    pub fn set_cloaked(&self, cloaked: bool) {
+        #[cfg(windows)]
+        {
+            use std::sync::atomic::Ordering;
+            use windows_sys::Win32::Graphics::Dwm::{DWMWA_CLOAK, DwmSetWindowAttribute};
+            let window = self.window.load(Ordering::Acquire);
+            if window != 0 {
+                let value: u32 = u32::from(cloaked);
+                unsafe {
+                    let _ = DwmSetWindowAttribute(
+                        window as _,
+                        DWMWA_CLOAK as u32,
+                        (&raw const value).cast(),
+                        std::mem::size_of::<u32>() as u32,
+                    );
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = cloaked;
+    }
+
     pub fn reveal(&self) {
+        self.set_cloaked(false);
         self.context
             .send_viewport_cmd(egui::ViewportCommand::Visible(true));
         self.context.send_viewport_cmd(egui::ViewportCommand::Focus);
