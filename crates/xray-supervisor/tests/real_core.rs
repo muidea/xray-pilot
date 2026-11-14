@@ -356,12 +356,10 @@ async fn official_core_serves_immutable_pac_and_releases() {
             proxy_mode: ProxyMode::Pac,
             http_inbound_tag: "http-in".into(),
             pac: Some(PacDraft {
-                generated: false,
-                template: false,
-                template_mode: Default::default(),
-                domains: Vec::new(),
+                mode: xray_model::PacMode::Custom,
                 script: script.into(),
                 port: pac_port,
+                ..Default::default()
             }),
         },
     )

@@ -546,10 +546,15 @@ impl<B: ProxyBackend> Supervisor<B> {
                     ));
                 }
                 let config = self.runtime_config(generation_id)?;
-                return Ok(serde_json::to_value(xray_config::routing::simulate(
-                    &parse_config(config.json.as_bytes())?,
-                    context,
-                ))?);
+                let parsed = parse_config(config.json.as_bytes())?;
+                let geo = self
+                    .generation
+                    .as_ref()
+                    .filter(|g| g.id == *generation_id)
+                    .map(|g| Self::load_candidate_geodata(&g.candidate, &parsed));
+                return Ok(serde_json::to_value(
+                    xray_config::routing::simulate_with_geo(&parsed, context, geo.as_ref()),
+                )?);
             }
             _ => {}
         }
@@ -768,6 +773,12 @@ impl<B: ProxyBackend> Supervisor<B> {
                 let candidate_id = id();
                 let path = self.store.root.join("candidates").join(&candidate_id);
                 fs::create_dir_all(&path)?;
+                if let Ok(resolved_asset_root) = fs::canonicalize(asset_root) {
+                    let _ = atomic_write(
+                        &path.join("asset_root.txt"),
+                        resolved_asset_root.to_string_lossy().as_bytes(),
+                    );
+                }
                 let config_path = path.join("config.json");
                 atomic_write(&config_path, json.as_bytes())?;
                 let mut candidate = Candidate {
@@ -896,6 +907,37 @@ impl<B: ProxyBackend> Supervisor<B> {
             )),
         }
     }
+    fn load_candidate_geodata(
+        candidate: &Candidate,
+        config: &serde_json::Value,
+    ) -> xray_config::geodata::GeoData {
+        let mut geo =
+            xray_config::geodata::GeoData::load_from_asset_root(&candidate.resources.root)
+                .unwrap_or_default();
+        geo.preload_ext_from_config(config);
+        if geo.geosite.is_none()
+            && let Ok(raw_root) =
+                fs::read_to_string(candidate.config_path.with_file_name("asset_root.txt"))
+        {
+            let root = PathBuf::from(raw_root.trim());
+            let geosite_path = root.join("geosite.dat");
+            if geosite_path.is_file()
+                && let Ok(index) = xray_config::geodata::GeoSiteIndex::load(&geosite_path)
+            {
+                geo.geosite = Some(index);
+            }
+            if geo.geoip.is_none() {
+                let geoip_path = root.join("geoip.dat");
+                if geoip_path.is_file()
+                    && let Ok(index) = xray_config::geodata::GeoIpIndex::load(&geoip_path)
+                {
+                    geo.geoip = Some(index);
+                }
+            }
+        }
+        geo
+    }
+
     fn verify_candidate(candidate: &Candidate) -> Result<()> {
         let mut check = candidate.clone();
         check.digest.clear();
@@ -1067,25 +1109,27 @@ impl<B: ProxyBackend> Supervisor<B> {
         if mode == ProxyMode::Pac {
             match pac {
                 Some(draft) => {
-                    let script = if draft.generated {
-                        let generated = xray_pac::generate(&config, endpoint.unwrap());
-                        for note in generated.notes {
-                            xray_runtime::log(&self.logs, format!("PAC: {note}"));
-                        }
-                        generated.script
-                    } else if draft.template {
-                        xray_pac::template(endpoint.unwrap(), draft.template_mode, &draft.domains)?
-                    } else if draft.script.trim().is_empty() {
-                        let generated = xray_pac::generate(&config, endpoint.unwrap());
-                        for note in generated.notes {
-                            xray_runtime::log(&self.logs, format!("PAC: {note}"));
-                        }
-                        generated.script
-                    } else {
-                        draft.script
-                    };
-                    xray_pac::validate(&script)?;
-                    pac_publication = Some(self.prepare_pac(&script, draft.port)?);
+                    let geo = Self::load_candidate_geodata(&candidate, &config);
+                    let generated =
+                        xray_pac::compile_draft(&config, endpoint.unwrap(), &draft, Some(&geo))?;
+                    for note in generated.notes {
+                        xray_runtime::log(&self.logs, format!("PAC: {note}"));
+                    }
+                    xray_runtime::log(
+                        &self.logs,
+                        format!(
+                            "PAC: 已编译模式 {:?}（{} 域/{} 精确/{} 通配/{} 关键词，折叠 {} 条，{} B）",
+                            draft.mode,
+                            generated.stats.domain_count,
+                            generated.stats.full_count,
+                            generated.stats.subdomain_count,
+                            generated.stats.keyword_count,
+                            generated.stats.folded_count,
+                            generated.stats.script_bytes,
+                        ),
+                    );
+                    xray_pac::validate(&generated.script)?;
+                    pac_publication = Some(self.prepare_pac(&generated.script, draft.port)?);
                 }
                 None => {
                     // Restart/auto-connect of the same committed candidate may

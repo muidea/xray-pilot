@@ -71,30 +71,30 @@ fn default_pac_port() -> u16 {
     DEFAULT_PAC_PORT
 }
 
-/// Built-in PAC template strategy.
+/// PAC compilation and traffic-splitting strategy.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub enum PacTemplateMode {
-    /// Proxy everything except local/LAN hosts.
+pub enum PacMode {
+    /// Automatically compile from the active config's `/routing/rules` + `geosite.dat`.
     #[default]
-    All,
-    /// Proxy only the listed domains; everything else is direct.
-    ProxyList,
-    /// Proxy everything except the listed domains.
+    AutoRules,
+    /// Selected geosite categories and custom domains go direct; everything else proxies.
     DirectList,
+    /// Selected geosite categories and custom domains proxy; everything else goes direct.
+    ProxyList,
+    /// Proxy everything except local/LAN hosts.
+    All,
+    /// User-supplied custom JavaScript `FindProxyForURL`.
+    Custom,
 }
 
 /// PAC editor draft. The script is frozen into an immutable publication only
 /// when a PAC generation is applied; drafts never change the running setting.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PacDraft {
-    /// Generated drafts are recomputed from the candidate config at apply time.
     #[serde(default)]
-    pub generated: bool,
-    /// Built-in default-template drafts are recomputed from the HTTP endpoint at apply time.
+    pub mode: PacMode,
     #[serde(default)]
-    pub template: bool,
-    #[serde(default)]
-    pub template_mode: PacTemplateMode,
+    pub geosites: Vec<String>,
     #[serde(default)]
     pub domains: Vec<String>,
     #[serde(default)]
@@ -102,12 +102,12 @@ pub struct PacDraft {
     #[serde(default = "default_pac_port")]
     pub port: u16,
 }
+
 impl Default for PacDraft {
     fn default() -> Self {
         Self {
-            generated: false,
-            template: true,
-            template_mode: PacTemplateMode::All,
+            mode: PacMode::AutoRules,
+            geosites: Vec::new(),
             domains: Vec::new(),
             script: String::new(),
             port: DEFAULT_PAC_PORT,

@@ -24,6 +24,12 @@ pub struct Workspace {
     /// Last observed Core running state, used to restore it after a normal exit.
     #[serde(default)]
     pub last_core_running: bool,
+    /// Last committed proxy connection mode before exiting, used during startup restore.
+    #[serde(default)]
+    pub last_proxy_mode: xray_model::ProxyMode,
+    /// Last applied PAC configuration, used to restore PAC auto-proxy on startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_pac: Option<xray_model::PacDraft>,
     /// Last reminder choice for the single tray exit action.
     #[serde(default)]
     pub exit_default: ExitDefault,
@@ -115,9 +121,8 @@ mod tests {
         );
         workspace.last_core_running = true;
         let pac_draft = xray_model::PacDraft {
-            generated: false,
-            template: true,
-            template_mode: xray_model::PacTemplateMode::ProxyList,
+            mode: xray_model::PacMode::ProxyList,
+            geosites: vec!["geosite:cn".into()],
             domains: vec!["example.com".into()],
             script: "function FindProxyForURL(){ return 'DIRECT'; }".into(),
             port: xray_model::DEFAULT_PAC_PORT,

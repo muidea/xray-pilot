@@ -2,7 +2,7 @@
 
 更新时间：2026-11-14
 
-本文用于把当前工作区交给下一位开发者、评审者或 Windows 验证人员。当前已发布基线为 `efe1fcf`（`v0.1.1-rc.4`）；当前源码版本为 `v0.1.1-rc.23`（对应本次提交）。不能把已发布的 `v0.1.1-rc.4` 当作当前源码版本。
+本文用于把当前工作区交给下一位开发者、评审者或 Windows 验证人员。当前已发布基线为 `efe1fcf`（`v0.1.1-rc.4`）；当前源码版本为 `v0.1.1-rc.28`。不能把已发布的 `v0.1.1-rc.4` 当作当前源码版本。
 
 ## 当前产品边界
 
@@ -13,7 +13,7 @@ Windows Global / PAC 模式只接管当前用户的 WinINet 设置。Linux 主�
 ## 已完成的源码收口
 
 - 配置交互：协议模板、节点独立名称、多服务器/用户/账号编辑、原生字段编辑、未完成数值草稿持久化、缺项定位、草稿级撤销/重做和三种显示主题。
-- PAC：内置模板支持全部代理、仅代理域名清单和清单直连；支持单行分隔符多条添加、**批量粘贴 / 编辑**对话框、导入/导出纯文本列表、复制列表、**从路由规则提取**（遇 `geosite:` / `regexp:` / `ext:` 自动跳过并明确提示仅在 Xray Core 内部生效）、去重排序、清空确认、关键词与类型筛选、全选/反选批量移除、固定高度虚拟滚动大列表（`ScrollArea::show_rows`），以及顶层 ES3 对象字面量查表式 PAC 生成，兼容 WinINet JScript 并支持原生规则生成、导入/编辑、语法检查、有界 `FindProxyForURL` 执行测试、不可变回环 HTTP 发布、Windows PAC 租约目标、端口/版本切换、失败补偿和启动恢复；PAC 发布已纳入离线维护清理。
+- PAC 与 GeoSite：`xray-config::geodata` 提供零外部依赖 `geosite.dat`（含 `@attr`/`@!attr`）与 `geoip.dat` 解析及静态路由预测（`simulate_with_geo`）；PAC 模型统一为 `PacMode`（`AutoRules`/`DirectList`/`ProxyList`/`All`/`Custom`）与 `PacDraft { mode, geosites, domains, script, port }`；`xray-pac` 编译支持 `geosite:`/`ext:` 展开、母域折叠、512 KiB 体积警示、ES3 哈希查表与故障关闭安全守卫；PAC 页自动编译与语法校验并支持 GeoSite 速选芯片/分组浏览器，路由编辑器提供一键国内外分流预设。
 - 诊断与运维：静态顺序/遮蔽冲突提示、出站 TCP 延迟探测、Mixed 入站就绪、HTTP/Mixed 代理端点、WinHTTP 只读诊断、本地入口/PAC 服务状态分层、持久化日志（时间戳、代次上下文、凭据脱敏、4 MiB 轮转备份）、动态外部依赖 opt-in 与重校验；**日志**页新增单条复制、空列表保护的筛选复制/导出（`.log`/`.txt`）与持久化会话日志（自动按序拼接 `logs/supervisor.log.1` + `logs/supervisor.log`）一键复制/导出，**设置 → 数据与存储**同步支持复制日志路径、复制日志内容与导出会话日志。
 - 配置校验：API/反向代理内部目标识别；常见节点参数提示；Reality/TLS 和路由字段提示；SOCKS/HTTP 账号 `user`/`pass` 缺项及错误类型提示。提示不回显凭据，不替代官方 Core 校验。
 - 依赖与资源：常见 DNS、geo、ext、RAW 字段冻结；未分类字段会尝试启动和恢复，显式动态外部文件会跳过自动连接/恢复，不会静默猜测路径。
@@ -34,7 +34,7 @@ cargo fmt --all -- --check
 git diff --check
 ```
 
-最近一次全工作区回归为 **227 项通过，7 项需显式环境用例忽略**（含官方 Core PAC 专项）；`xray-manager` 单元/无窗口回归 **100 项通过**（1 项需显式 Core 忽略），覆盖 PAC 5,000 条域名与 2,000 条虚拟滚动、开机 `--background` 二帧隐藏与托盘唤醒、后台 IPC 并发就绪检测与只读重连、日志复制与持久化日志导出、外部代理冲突解除及恢复期取消开机自启等场景。已交叉编译构建 `v0.1.1-rc.23` Windows x64 本地验证包并完成 CRC 与逐文件一致性校验。
+最近一次全工作区回归为 **233 项通过，7 项需显式环境用例忽略**（含官方 Core PAC 专项）；`xray-manager` 单元/无窗口回归 **101 项通过**（1 项需显式 Core 忽略），覆盖 `geosite.dat`/`geoip.dat` 解析与母域折叠、`AutoRules` 与清单模式展开、`geosite` 速选与路由预设、PAC 5,000 条域名与 2,000 条虚拟滚动、开机 `--background` 二帧隐藏与托盘唤醒、后台 IPC 并发就绪检测与只读重连、日志复制与持久化日志导出、外部代理冲突解除及恢复期取消开机自启等场景。已交叉编译构建 `v0.1.1-rc.24` Windows x64 本地验证包并完成 CRC 与逐文件一致性校验。
 
 Windows GNU 原生验证使用用户指定的 `C:\v2rayN\bin\Xray\xray.exe`，已通过：
 
@@ -84,8 +84,8 @@ Windows GNU 原生验证使用用户指定的 `C:\v2rayN\bin\Xray\xray.exe`，�
 ## 重要文件入口
 
 - [README.md](../README.md)：用户安装、配置和部署说明。
-- [validation-guide.md](validation-guide.md)：当前验证包实操指南（`v0.1.1-rc.23`）。
-- [releases/v0.1.1-rc.23.md](releases/v0.1.1-rc.23.md)：`rc.23` 变更与测试摘要（另见 `v0.1.1-rc.19.md`–`v0.1.1-rc.22.md`）。
+- [validation-guide.md](validation-guide.md)：当前验证包实操指南（`v0.1.1-rc.28`）。
+- [releases/v0.1.1-rc.28.md](releases/v0.1.1-rc.28.md)：`rc.28` 变更与测试摘要（另见 `v0.1.1-rc.19.md`–`v0.1.1-rc.27.md`）。
 - [phase0-2-backlog.md](phase0-2-backlog.md)：验收编号和剩余能力清单。
 - [phase0-2-remaining-closeout.md](phase0-2-remaining-closeout.md)：本轮收口内容与证据。
 - [phase0-2-design-crosscheck.md](phase0-2-design-crosscheck.md)：按设计文档逐项核对后的剩余项、未登记设计项和证据边界。
@@ -106,8 +106,8 @@ Windows GNU 原生验证使用用户指定的 `C:\v2rayN\bin\Xray\xray.exe`，�
 ## 接手后的建议顺序
 
 1. 保持当前用户模式不变，先运行 Linux 全工作区测试和双目标 Clippy。
-2. 在干净 Windows 测试账户中实机验证 `v0.1.1-rc.23`：包括 smoke/便携目录、Windows 冷启动自动自启（确认不再出现 `CONNECTION_LOST (os error 2)` 且后台 Core 正常就绪）、`--background` 仅驻留系统托盘（`DWMWA_CLOAK` 防闪烁）与托盘左键双击唤醒、`PROXY_LEASE_CONFLICT` 外部代理冲突解除与冲突期内取消/保存开机自启、日志筛选/单条/会话日志复制与 `rfd` 导出、PAC 批量管理。
+2. 在干净 Windows 测试账户与原有 `rc.23` 保留 `data/` 目录上实机验证 `v0.1.1-rc.28`：包括主动退出前处于 PAC / 全局代理模式后重启自动恢复原连接方式、日志本地时区时间显示（操作记录与 Core/Supervisor 日志、`logs/supervisor.log`）、单实例防重复托盘图标（`--background` 自启后再次打开 `xray-manager.exe` 唤醒唯一窗口）、历史操作免误报恢复启动、smoke/便携目录、PAC GeoSite 展开与 `AutoRules`/清单分流、路由国内外分流预设、Windows 冷启动自动自启、`--background` 仅驻留系统托盘与唤醒、`PROXY_LEASE_CONFLICT` 外部代理冲突解除与冲突期内取消/保存开机自启、日志复制与导出。
 3. 单独安排真实 WinINet、注销/登录、跨 SID、磁盘满和断电测试；测试前保存代理设置及数据目录备份。
-4. 当前源码已准备提交（`v0.1.1-rc.23`）；提交后运行远端 CI，再生成正式发布包和 SHA-256 校验文件。
+4. 当前源码尚未提交（`v0.1.1-rc.28`）；提交后运行远端 CI，再生成正式发布包和 SHA-256 校验文件。
 5. 只有在对应证据完成后，才更新 V01/V02/V04–V10 状态；不要用单元测试或 GNU 本机构建替代 MSVC、真实系统代理、PAC 客户端和人工交互验收。
 6. 当前源码（含开机自启 IPC 服务就绪保护、外部代理冲突解除、PAC 批量优化、`--background` 托盘隐藏与日志复制导出）尚未正式发布（已发布基线仍为 `v0.1.1-rc.4`）；发布前仍需完成 V09 的远端 CI、MSVC 和正式包验收。

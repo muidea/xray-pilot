@@ -398,3 +398,75 @@ fn focus_selects_later_servers_users_and_accounts_without_changing_neighbors() {
         assert_eq!(node, expected, "{protocol}");
     }
 }
+
+#[test]
+fn geosite_routing_preset_adds_domestic_bypass_and_adblock_rules() {
+    use eframe::egui;
+    let ctx = egui::Context::default();
+    let mut cfg = scene(Scene::Single, Template::VlessReality);
+    cfg["outbounds"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"tag": "block", "protocol": "blackhole"}));
+    let names = BTreeMap::new();
+    let mut state = State::default();
+    let output = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(820.0, 900.0),
+            )),
+            ..Default::default()
+        },
+        |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                super::ui::edit_routes(ui, &mut cfg, &names, &mut state);
+            });
+        },
+    );
+    let preset_pos = output
+        .shapes
+        .iter()
+        .find_map(|s| match &s.shape {
+            egui::Shape::Text(t) if t.galley.text() == "国内外分流预设 (GeoSite)" => {
+                Some(s.shape.visual_bounding_rect().center())
+            }
+            _ => None,
+        })
+        .expect("preset button visible");
+    let _ = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(820.0, 900.0),
+            )),
+            events: vec![
+                egui::Event::PointerMoved(preset_pos),
+                egui::Event::PointerButton {
+                    pos: preset_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: preset_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        },
+        |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let outcome = super::ui::edit_routes(ui, &mut cfg, &names, &mut state);
+                assert!(outcome.changed);
+            });
+        },
+    );
+    let rules = cfg.pointer("/routing/rules").unwrap().as_array().unwrap();
+    assert_eq!(rules.len(), 3);
+    assert_eq!(rules[0]["domain"], json!(["geosite:private", "geosite:cn"]));
+    assert_eq!(rules[1]["domain"], json!(["geosite:category-ads-all"]));
+    assert_eq!(rules[2]["ip"], json!(["geoip:private", "geoip:cn"]));
+}

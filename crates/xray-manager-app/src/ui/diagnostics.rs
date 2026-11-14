@@ -400,8 +400,9 @@ impl App {
                 rows.push((
                     event.level.into(),
                     format!(
-                        "[操作 / {}] {}{}",
+                        "[操作 / {}] [{}] {}{}",
                         event.level,
+                        event.timestamp,
                         event.message,
                         if event.request.is_empty() {
                             String::new()
@@ -425,7 +426,8 @@ impl App {
                     } else {
                         "未标级别"
                     };
-                    rows.push((level.into(), format!("[Core] {line}")));
+                    let formatted = xray_runtime::localize_log_line(line);
+                    rows.push((level.into(), format!("[Core] {formatted}")));
                 }
             }
         }
@@ -451,7 +453,14 @@ impl App {
                     if !combined.is_empty() && !combined.ends_with('\n') && !chunk.is_empty() {
                         combined.push('\n');
                     }
-                    combined.push_str(&chunk);
+                    for segment in chunk.split_inclusive('\n') {
+                        let (line, ending) = match segment.strip_suffix('\n') {
+                            Some(stripped) => (stripped, "\n"),
+                            None => (segment, ""),
+                        };
+                        combined.push_str(&xray_runtime::localize_log_line(line));
+                        combined.push_str(ending);
+                    }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(format!("{}: {error}", display_path(&path))),

@@ -4,11 +4,12 @@ pub use process::Process;
 pub use readiness::listener_plan;
 
 use std::{
+    borrow::Cow,
     collections::VecDeque,
     fs::OpenOptions,
     io::Write,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, SystemTime},
 };
 use tokio::{
@@ -118,10 +119,70 @@ impl Logs {
         }
     }
 }
+const LOCAL_STAMP_FORMAT: &[time::format_description::FormatItem<'_>] = time::macros::format_description!(
+    "[year]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:3] [offset_hour sign:mandatory]:[offset_minute]"
+);
+
+static FALLBACK_LOCAL_OFFSET: OnceLock<time::UtcOffset> = OnceLock::new();
+
+/// Captures the process's initial local UTC offset before worker threads start.
+/// Needed on Unix targets where `time` refuses multi-threaded `localtime_r` lookups.
+pub fn init_local_offset() {
+    if let Ok(offset) = time::UtcOffset::current_local_offset() {
+        let _ = FALLBACK_LOCAL_OFFSET.set(offset);
+    }
+}
+
+pub fn format_timestamp(dt: time::OffsetDateTime) -> String {
+    dt.format(LOCAL_STAMP_FORMAT)
+        .unwrap_or_else(|_| "unknown-time".into())
+}
+
+fn local_offset_for(utc: time::OffsetDateTime) -> time::UtcOffset {
+    time::UtcOffset::local_offset_at(utc)
+        .ok()
+        .or_else(|| FALLBACK_LOCAL_OFFSET.get().copied())
+        .unwrap_or(time::UtcOffset::UTC)
+}
+
+pub fn local_timestamp() -> String {
+    let utc = time::OffsetDateTime::now_utc();
+    let dt = match time::OffsetDateTime::now_local() {
+        Ok(local) => local,
+        Err(_) => utc.to_offset(local_offset_for(utc)),
+    };
+    format_timestamp(dt)
+}
+
+/// Converts a leading `[<RFC3339>]` log timestamp prefix into the host's local timezone.
+pub fn localize_log_line(line: &str) -> Cow<'_, str> {
+    localize_log_line_with_offset(line, None)
+}
+
+pub fn localize_log_line_with_offset(line: &str, offset: Option<time::UtcOffset>) -> Cow<'_, str> {
+    if let Some(rest) = line.strip_prefix('[')
+        && let Some(end) = rest.find(']')
+        && end <= 48
+        && let Ok(parsed) = time::OffsetDateTime::parse(
+            &rest[..end],
+            &time::format_description::well_known::Rfc3339,
+        )
+    {
+        let target = match offset {
+            Some(off) => parsed.to_offset(off),
+            None => parsed.to_offset(local_offset_for(parsed)),
+        };
+        return Cow::Owned(format!(
+            "[{}]{}",
+            format_timestamp(target),
+            &rest[end + 1..]
+        ));
+    }
+    Cow::Borrowed(line)
+}
+
 pub fn log(logs: &Logs, text: impl Into<String>) {
-    let stamp = time::OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| "unknown-time".into());
+    let stamp = local_timestamp();
     let text = redact(&text.into());
     let Ok(mut inner) = logs.inner.lock() else {
         return;
@@ -639,5 +700,46 @@ mod log_tests {
         drop(inner);
         assert!(path.exists());
         assert!(tmp.path().join("logs/supervisor.log.1").exists());
+    }
+    #[test]
+    fn timestamps_and_legacy_utc_prefixes_format_with_timezone_offset() {
+        let utc = time::OffsetDateTime::parse(
+            "2026-11-14T04:04:50.5837401Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        let plus_8 = time::UtcOffset::from_hms(8, 0, 0).unwrap();
+        assert_eq!(
+            format_timestamp(utc.to_offset(plus_8)),
+            "2026-11-14 12:04:50.583 +08:00"
+        );
+        let minus_5 = time::UtcOffset::from_hms(-5, 0, 0).unwrap();
+        assert_eq!(
+            format_timestamp(utc.to_offset(minus_5)),
+            "2026-11-13 23:04:50.583 -05:00"
+        );
+
+        let converted = localize_log_line_with_offset(
+            "[2026-11-14T04:04:50.5837401Z] profile=p 2026/11/14 12:04:50 accepted",
+            Some(plus_8),
+        );
+        assert_eq!(
+            converted,
+            "[2026-11-14 12:04:50.583 +08:00] profile=p 2026/11/14 12:04:50 accepted"
+        );
+        assert!(matches!(
+            localize_log_line_with_offset("2026-11-13 [Info] core ready", Some(plus_8)),
+            Cow::Borrowed("2026-11-13 [Info] core ready")
+        ));
+        assert!(matches!(
+            localize_log_line_with_offset("[2026-11-14 12:04:50.583 +08:00] already", Some(plus_8)),
+            Cow::Borrowed("[2026-11-14 12:04:50.583 +08:00] already")
+        ));
+
+        let logs = logs();
+        log(&logs, "check stamp");
+        let lines = logs.lines();
+        assert!(!lines[0].contains("Z]"));
+        assert!(lines[0].contains(':'));
     }
 }

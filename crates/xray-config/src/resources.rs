@@ -20,55 +20,8 @@ pub fn freeze_with(
     let source = fs::canonicalize(source)?;
     let root = output.join(id());
     fs::create_dir_all(&root)?;
-    let mut names: BTreeSet<String> = BTreeSet::new();
+    let mut names = collect_referenced_geo_files(value);
     let notes = crate::coverage::uncovered(value);
-    // Resource prefixes have meaning only in native dependency-bearing fields.
-    if let Some(rules) = value.pointer("/routing/rules").and_then(Value::as_array) {
-        for rule in rules {
-            for field in ["domain", "ip", "source"] {
-                for entry in rule
-                    .get(field)
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                {
-                    let Some(s) = entry.as_str() else { continue };
-                    if field == "domain" && s.starts_with("geosite:") {
-                        names.insert("geosite.dat".into());
-                    }
-                    if field != "domain" && s.starts_with("geoip:") {
-                        names.insert("geoip.dat".into());
-                    }
-                    if let Some(rest) = s.strip_prefix("ext:").or_else(|| s.strip_prefix("ext-ip:"))
-                        && let Some((file, _)) = rest.split_once(':')
-                    {
-                        names.insert(file.into());
-                    }
-                }
-            }
-        }
-    }
-    // Native DNS geo references participate in the same immutable snapshot as routing.
-    if let Some(servers) = value.pointer("/dns/servers").and_then(Value::as_array) {
-        for server in servers {
-            for (field, domain) in [("domains", true), ("expectIPs", false)] {
-                for entry in server
-                    .get(field)
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
-                {
-                    collect_geo(entry, domain, &mut names);
-                }
-            }
-        }
-    }
-    if let Some(hosts) = value.pointer("/dns/hosts").and_then(Value::as_object) {
-        for key in hosts.keys() {
-            collect_geo(key, true, &mut names);
-        }
-    }
     for direction in ["inbounds", "outbounds"] {
         for endpoint in value
             .get(direction)
@@ -161,6 +114,49 @@ pub fn freeze_with(
     write_json(&resources.root.join("manifest.json"), &resources)?;
     Ok(resources)
 }
+/// Collect `.dat` geo resource filenames referenced in routing and DNS sections.
+pub(crate) fn collect_referenced_geo_files(value: &Value) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    // Resource prefixes have meaning only in native dependency-bearing fields.
+    if let Some(rules) = value.pointer("/routing/rules").and_then(Value::as_array) {
+        for rule in rules {
+            for field in ["domain", "ip", "source"] {
+                for entry in rule
+                    .get(field)
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                {
+                    collect_geo(entry, field == "domain", &mut names);
+                }
+            }
+        }
+    }
+    // Native DNS geo references participate in the same immutable snapshot as routing.
+    if let Some(servers) = value.pointer("/dns/servers").and_then(Value::as_array) {
+        for server in servers {
+            for (field, domain) in [("domains", true), ("expectIPs", false)] {
+                for entry in server
+                    .get(field)
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                {
+                    collect_geo(entry, domain, &mut names);
+                }
+            }
+        }
+    }
+    if let Some(hosts) = value.pointer("/dns/hosts").and_then(Value::as_object) {
+        for key in hosts.keys() {
+            collect_geo(key, true, &mut names);
+        }
+    }
+    names
+}
+
 fn collect_geo(entry: &str, domain: bool, names: &mut BTreeSet<String>) {
     if domain && entry.starts_with("geosite:") {
         names.insert("geosite.dat".into());

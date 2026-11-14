@@ -185,7 +185,7 @@ fn template_domain_lists_manage_proxy_targets() {
     let endpoint = endpoint();
     let proxy = template(
         endpoint,
-        xray_model::PacTemplateMode::ProxyList,
+        PacMode::ProxyList,
         &[
             "example.com".into(),
             "*.internal.test".into(),
@@ -219,12 +219,7 @@ fn template_domain_lists_manage_proxy_targets() {
         "DIRECT"
     );
 
-    let direct = template(
-        endpoint,
-        xray_model::PacTemplateMode::DirectList,
-        &["example.com".into()],
-    )
-    .unwrap();
+    let direct = template(endpoint, PacMode::DirectList, &["example.com".into()]).unwrap();
     assert_eq!(
         evaluate(&direct, "https://example.com/").unwrap().kind,
         "DIRECT"
@@ -250,7 +245,7 @@ fn template_domain_validation_rejects_unsafe_input() {
 
 #[test]
 fn empty_proxy_list_returns_direct_for_regular_hosts() {
-    let script = template(endpoint(), xray_model::PacTemplateMode::ProxyList, &[]).unwrap();
+    let script = template(endpoint(), PacMode::ProxyList, &[]).unwrap();
     validate(&script).unwrap();
     assert_eq!(
         evaluate(&script, "https://example.com/").unwrap().kind,
@@ -290,7 +285,7 @@ fn large_template_domain_list_evaluates_without_recursion_overflow() {
             _ => format!("full:exact{i}.example.org"),
         })
         .collect();
-    let script = template(endpoint(), xray_model::PacTemplateMode::ProxyList, &domains).unwrap();
+    let script = template(endpoint(), PacMode::ProxyList, &domains).unwrap();
     assert!(script.len() < 512 * 1024);
     assert!(compat_notes(&script).is_empty());
     validate(&script).unwrap();
@@ -336,7 +331,7 @@ fn large_template_domain_list_evaluates_without_recursion_overflow() {
 fn template_does_not_match_object_prototype_keys() {
     let script = template(
         endpoint(),
-        xray_model::PacTemplateMode::ProxyList,
+        PacMode::ProxyList,
         &["full:exact.example".into()],
     )
     .unwrap();
@@ -376,7 +371,7 @@ bad/domain
 }
 
 #[test]
-fn extract_domains_from_config_skips_geosite_and_non_domain_rules() {
+fn extract_domains_from_config_extracts_geosite_and_skips_regexp() {
     let cfg = json!({
         "routing": {
             "rules": [
@@ -402,8 +397,150 @@ fn extract_domains_from_config_skips_geosite_and_non_domain_rules() {
         extracted.domains,
         vec!["example.com", "full:api.example.org", "cdn.example.net"]
     );
-    assert_eq!(extracted.skipped_geosite, 2);
+    assert_eq!(
+        extracted.geosites,
+        vec![
+            "geosite:cn",
+            "geosite:geolocation-!cn",
+            "ext:custom.dat:ads"
+        ]
+    );
     assert_eq!(extracted.skipped_regexp, 1);
-    assert_eq!(extracted.skipped_ext, 1);
     assert_eq!(extracted.skipped_other, 1);
+}
+
+#[test]
+fn compile_draft_expands_geosites_and_folds_redundant_subdomains() {
+    use xray_config::geodata::{GeoSiteIndex, test_encoder::encode_geosite_list};
+    // Build a geosite.dat index with domain:baidu.com, redundant tieba.baidu.com,
+    // full:www.baidu.com (covered by suffix), plain keyword "internal", and 1 regex.
+    // Domain types: 0 = Plain, 1 = Regex, 2 = Domain, 3 = Full.
+    let bytes = encode_geosite_list(&[(
+        "cn",
+        &[
+            (2, "baidu.com", &[]),
+            (2, "tieba.baidu.com", &[]),
+            (3, "www.baidu.com", &[]),
+            (0, "internal", &[]),
+            (1, "^ads\\.", &[]),
+        ],
+    )]);
+    let geo = GeoData::from_indexes(Some(GeoSiteIndex::parse(&bytes).unwrap()), None);
+
+    let cfg = json!({
+        "outbounds": [
+            {"tag": "proxy", "protocol": "vless"},
+            {"tag": "direct", "protocol": "freedom"},
+            {"tag": "block", "protocol": "blackhole"}
+        ],
+        "routing": {
+            "rules": [
+                {"type": "field", "domain": ["geosite:cn"], "outboundTag": "direct"}
+            ]
+        }
+    });
+    let draft = PacDraft {
+        mode: PacMode::AutoRules,
+        ..Default::default()
+    };
+    let generated = compile_draft(&cfg, endpoint(), &draft, Some(&geo)).unwrap();
+    validate(&generated.script).unwrap();
+    // tieba.baidu.com and www.baidu.com folded under baidu.com!
+    assert_eq!(generated.stats.folded_count, 2);
+    assert_eq!(generated.stats.domain_count, 1);
+    assert_eq!(generated.stats.keyword_count, 1);
+    assert_eq!(generated.stats.skipped_regex_count, 1);
+    assert_eq!(generated.stats.resolved_geosites, vec!["geosite:cn"]);
+    assert_eq!(
+        evaluate(&generated.script, "https://map.baidu.com/")
+            .unwrap()
+            .kind,
+        "DIRECT"
+    );
+    assert_eq!(
+        evaluate(&generated.script, "https://my-internal-host.org/")
+            .unwrap()
+            .kind,
+        "DIRECT"
+    );
+    assert_eq!(
+        evaluate(&generated.script, "https://google.com/")
+            .unwrap()
+            .kind,
+        "PROXY"
+    );
+
+    // DirectList with geosites also expands and respects non-listed sites as PROXY.
+    let list_draft = PacDraft {
+        mode: PacMode::DirectList,
+        geosites: vec!["geosite:cn".into()],
+        domains: vec!["custom.local.example".into()],
+        ..Default::default()
+    };
+    let compiled_list = compile_draft(&cfg, endpoint(), &list_draft, Some(&geo)).unwrap();
+    validate(&compiled_list.script).unwrap();
+    assert_eq!(
+        evaluate(&compiled_list.script, "https://zhidao.baidu.com/")
+            .unwrap()
+            .kind,
+        "DIRECT"
+    );
+    assert_eq!(
+        evaluate(&compiled_list.script, "https://custom.local.example/")
+            .unwrap()
+            .kind,
+        "DIRECT"
+    );
+    assert_eq!(
+        evaluate(&compiled_list.script, "https://example.org/")
+            .unwrap()
+            .kind,
+        "PROXY"
+    );
+}
+
+#[test]
+fn autorules_with_unexpressible_regex_in_proxy_rule_suppresses_later_direct() {
+    use xray_config::geodata::{GeoSiteIndex, test_encoder::encode_geosite_list};
+    let bytes = encode_geosite_list(&[
+        (
+            "ads",
+            &[(1, "^ad[0-9]+\\.", &[][..]), (2, "ad.example", &[][..])][..],
+        ),
+        ("cn", &[(2, "cn.example", &[][..])][..]),
+    ]);
+    let geo = GeoData::from_indexes(Some(GeoSiteIndex::parse(&bytes).unwrap()), None);
+
+    // Default outbound is direct (freedom), preceded by blackhole rule with regex.
+    let cfg = json!({
+        "outbounds": [
+            {"tag": "direct", "protocol": "freedom"},
+            {"tag": "block", "protocol": "blackhole"}
+        ],
+        "routing": {
+            "rules": [
+                {"type": "field", "domain": ["geosite:ads"], "outboundTag": "block"},
+                {"type": "field", "domain": ["geosite:cn"], "outboundTag": "direct"}
+            ]
+        }
+    });
+    let draft = PacDraft {
+        mode: PacMode::AutoRules,
+        ..Default::default()
+    };
+    let generated = compile_draft(&cfg, endpoint(), &draft, Some(&geo)).unwrap();
+    validate(&generated.script).unwrap();
+    // Traffic must enter PROXY so Xray can apply the ads regex safely.
+    assert_eq!(
+        evaluate(&generated.script, "https://ad1.example/")
+            .unwrap()
+            .kind,
+        "PROXY"
+    );
+    assert_eq!(
+        evaluate(&generated.script, "https://cn.example/")
+            .unwrap()
+            .kind,
+        "PROXY"
+    );
 }

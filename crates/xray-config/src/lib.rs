@@ -1,5 +1,6 @@
 pub mod conflicts;
 mod coverage;
+pub mod geodata;
 mod validation;
 pub use validation::{ConfigIssue, inspect_config, parse_document};
 pub mod resources;

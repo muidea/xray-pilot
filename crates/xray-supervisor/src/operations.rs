@@ -20,7 +20,10 @@ struct Archive {
 }
 impl Operation {
     pub(super) fn archive(&self) -> Result<Vec<u8>> {
-        let bytes = serde_json::to_vec(self)?;
+        let bytes = match &self.raw {
+            Some(raw) => serde_json::to_vec(raw)?,
+            None => serde_json::to_vec(self)?,
+        };
         if bytes.len() > MAX_RECORD_BYTES {
             return Err(OperationStore::corrupt());
         }
@@ -48,7 +51,7 @@ fn read_operation(path: &Path) -> Result<Option<Operation>> {
         return Err(OperationStore::corrupt());
     }
     let value: serde_json::Value = serde_json::from_slice(&bytes)?;
-    if value.get("operation_archive").is_some() {
+    let raw = if value.get("operation_archive").is_some() {
         let archive: Archive = serde_json::from_value(value)?;
         if archive.operation_archive != 1 || archive.uncompressed_bytes > MAX_RECORD_BYTES {
             return Err(OperationStore::corrupt());
@@ -60,10 +63,13 @@ fn read_operation(path: &Path) -> Result<Option<Operation>> {
         if decoded.len() != archive.uncompressed_bytes || hash(&decoded) != archive.sha256 {
             return Err(OperationStore::corrupt());
         }
-        Ok(Some(serde_json::from_slice(&decoded)?))
+        serde_json::from_slice(&decoded)?
     } else {
-        Ok(Some(serde_json::from_value(value)?))
-    }
+        value
+    };
+    let mut op: Operation = serde_json::from_value(raw.clone())?;
+    op.raw = Some(raw);
+    Ok(Some(op))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -79,6 +85,10 @@ pub struct Operation {
     pub evidence_version: u32,
     #[serde(default)]
     pub record_hash: String,
+    /// Exact persisted JSON value used to verify schema-migrated legacy records and preserve
+    /// their original payloads across archives or final status writes.
+    #[serde(skip)]
+    raw: Option<serde_json::Value>,
 }
 #[derive(Serialize, Deserialize)]
 struct Identity {
@@ -174,6 +184,7 @@ impl OperationStore {
             recovery_required: false,
             evidence_version: 2,
             record_hash: String::new(),
+            raw: None,
         };
         // Keep an independent identity before the primary record or any side effect.
         write_json(
@@ -188,10 +199,30 @@ impl OperationStore {
         Ok(op)
     }
     pub fn save(&self, op: &Operation) -> Result<()> {
-        let mut record = op.clone();
-        record.record_hash.clear();
-        record.record_hash = canonical_hash(&record)?;
-        write_json(&self.path(&op.caller, &op.request.request_id), &record)
+        let mut value = match &op.raw {
+            Some(raw) => raw.clone(),
+            None => serde_json::to_value(op)?,
+        };
+        let obj = value.as_object_mut().ok_or_else(Self::corrupt)?;
+        obj.insert("response".to_owned(), serde_json::to_value(&op.response)?);
+        obj.insert(
+            "recovery_required".to_owned(),
+            serde_json::to_value(op.recovery_required)?,
+        );
+        obj.insert(
+            "evidence_version".to_owned(),
+            serde_json::to_value(op.evidence_version)?,
+        );
+        obj.insert(
+            "record_hash".to_owned(),
+            serde_json::Value::String(String::new()),
+        );
+        let record_hash = canonical_hash(&value)?;
+        value.as_object_mut().ok_or_else(Self::corrupt)?.insert(
+            "record_hash".to_owned(),
+            serde_json::Value::String(record_hash),
+        );
+        write_json(&self.path(&op.caller, &op.request.request_id), &value)
     }
     fn corrupt() -> Error {
         Error::new(
@@ -200,20 +231,28 @@ impl OperationStore {
         )
     }
     fn verify(&self, path: &Path, op: &Operation) -> Result<()> {
-        let mut record = op.clone();
-        record.record_hash.clear();
+        let raw = op.raw.as_ref().ok_or_else(Self::corrupt)?;
+        let raw_request = raw.get("request").ok_or_else(Self::corrupt)?;
+        let mut raw_record = raw.clone();
+        raw_record
+            .as_object_mut()
+            .ok_or_else(Self::corrupt)?
+            .insert(
+                "record_hash".to_owned(),
+                serde_json::Value::String(String::new()),
+            );
         if path != self.path(&op.caller, &op.request.request_id)
             || op.request.request_id.is_empty()
             || op.request.request_id.len() > 160
             || valid_id(&op.transaction_id).is_err()
             || op.evidence_version > 2
-            || op.digest != canonical_hash(&op.request)?
+            || op.digest != canonical_hash(raw_request)?
             || op
                 .response
                 .as_ref()
                 .is_some_and(|r| r.request_id != op.request.request_id)
             || (op.evidence_version > 0 && op.record_hash.is_empty())
-            || (!op.record_hash.is_empty() && op.record_hash != canonical_hash(&record)?)
+            || (!op.record_hash.is_empty() && op.record_hash != canonical_hash(&raw_record)?)
         {
             return Err(Self::corrupt());
         }

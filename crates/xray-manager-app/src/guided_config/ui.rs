@@ -815,6 +815,77 @@ pub fn edit_nodes(
     out
 }
 
+fn find_outbound_tag(config: &Value, protocol: &str) -> Option<String> {
+    config
+        .get("outbounds")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|n| n.get("protocol").and_then(Value::as_str) == Some(protocol))
+        .and_then(|n| n.get("tag"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+fn apply_geosite_bypass_preset(config: &mut Value, state: &mut State) -> bool {
+    let direct_tag = match find_outbound_tag(config, "freedom") {
+        Some(tag) => tag,
+        None => {
+            if config.get("outbounds").and_then(Value::as_array).is_none() {
+                let _ = patch(config, "/outbounds", json!([]));
+            }
+            if let Some(outbounds) = config.get_mut("outbounds").and_then(Value::as_array_mut) {
+                outbounds.push(json!({"tag": "direct", "protocol": "freedom"}));
+                "direct".to_owned()
+            } else {
+                state.notice = Some("出站字段不是数组，无法自动添加直连出站。".into());
+                return false;
+            }
+        }
+    };
+    let block_tag = find_outbound_tag(config, "blackhole");
+    if config.pointer("/routing/rules").is_none() {
+        let _ = patch(config, "/routing/rules", json!([]));
+    }
+    let Some(rules) = config
+        .pointer_mut("/routing/rules")
+        .and_then(Value::as_array_mut)
+    else {
+        state.notice = Some("路由规则字段不是数组，请使用原始 JSON 修正。".into());
+        return false;
+    };
+
+    let mut additions = vec![json!({
+        "type": "field",
+        "domain": ["geosite:private", "geosite:cn"],
+        "outboundTag": direct_tag
+    })];
+    if let Some(block) = block_tag {
+        additions.push(json!({
+            "type": "field",
+            "domain": ["geosite:category-ads-all"],
+            "outboundTag": block
+        }));
+    }
+    additions.push(json!({
+        "type": "field",
+        "ip": ["geoip:private", "geoip:cn"],
+        "outboundTag": direct_tag
+    }));
+
+    let mut changed = false;
+    for candidate in additions {
+        if !rules.contains(&candidate) {
+            rules.push(candidate);
+            changed = true;
+        }
+    }
+    if !changed {
+        state.notice = Some("当前配置已包含同类 GeoSite/GeoIP 国内外分流规则。".into());
+    }
+    changed
+}
+
 pub fn edit_routes(
     ui: &mut egui::Ui,
     config: &mut Value,
@@ -868,6 +939,13 @@ pub fn edit_routes(
                 }
             }
         }
+        if ui
+            .button("国内外分流预设 (GeoSite)")
+            .on_hover_text("添加 geosite:private / geosite:cn / geoip:private / geoip:cn 直连与广告拦截（若存在 blackhole 出站）规则")
+            .clicked()
+        {
+            out.changed |= apply_geosite_bypass_preset(config, state);
+        }
     });
     let mut action = None;
     if let Some(rules) = config
@@ -908,6 +986,38 @@ pub fn edit_routes(
                     if response.changed() {
                         rule[path.trim_start_matches('/')] = if path == "/domain" { domain_lines(&text) } else { Value::Array(text.split('\n').map(|line| Value::String(line.trim().to_owned())).collect()) };
                         out.changed = true;
+                    }
+                    if path == "/domain" {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new("快捷 GeoSite：").small().weak());
+                            for preset in [
+                                "geosite:private",
+                                "geosite:cn",
+                                "geosite:geolocation-!cn",
+                                "geosite:category-ads-all",
+                                "geosite:google",
+                            ] {
+                                if ui.small_button(format!("+ {preset}")).clicked() {
+                                    let already = rule
+                                        .pointer("/domain")
+                                        .and_then(Value::as_array)
+                                        .is_some_and(|arr| {
+                                            arr.iter()
+                                                .filter_map(Value::as_str)
+                                                .any(|s| s.eq_ignore_ascii_case(preset))
+                                        });
+                                    if !already {
+                                        let mut updated = text.trim_end().to_owned();
+                                        if !updated.is_empty() {
+                                            updated.push('\n');
+                                        }
+                                        updated.push_str(preset);
+                                        rule["domain"] = domain_lines(&updated);
+                                        out.changed = true;
+                                    }
+                                }
+                            }
+                        });
                     }
                     if text.trim().is_empty() || text.lines().any(|s| s.trim().is_empty()) { ui.colored_label(ui.visuals().warn_fg_color, "请补充匹配项，移除空行后检查。"); }
                     out.changed |= choice(ui, rule, "/outboundTag", "处理方式", "", &targets.iter().map(|(tag,name)| (tag.as_str(),name.as_str())).collect::<Vec<_>>());

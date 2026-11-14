@@ -1357,3 +1357,36 @@ fn connection_lost_advice_distinguishes_read_startup_polls_from_writes() {
         "后台响应中断，请先查询原操作结果，再进行其他变更。"
     );
 }
+
+#[test]
+fn single_instance_activation_cancels_background_hide_and_reveals_window() {
+    use eframe::egui::{ViewportCommand, ViewportId};
+
+    let mut h = Harness::new();
+    let activation = crate::single_instance::ActivationHandle::new();
+    h.app.activation = Some(activation.clone());
+    h.app.ui.background_hide = crate::app::ui::BackgroundHide::HideAfterFirstFrame;
+
+    let ctx = eframe::egui::Context::default();
+    let _ = ctx.run(Default::default(), |_| {});
+    activation.request_open();
+
+    let output = ctx.run(Default::default(), |ctx| {
+        if h.app
+            .activation
+            .as_ref()
+            .is_some_and(crate::single_instance::ActivationHandle::take_open)
+        {
+            h.app.reveal_window(ctx);
+        }
+        h.app.advance_background_hide(ctx);
+    });
+    assert_eq!(
+        h.app.ui.background_hide,
+        crate::app::ui::BackgroundHide::None
+    );
+    let commands = &output.viewport_output[&ViewportId::ROOT].commands;
+    assert!(commands.contains(&ViewportCommand::Visible(true)));
+    assert!(commands.contains(&ViewportCommand::Focus));
+    assert!(!commands.contains(&ViewportCommand::Visible(false)));
+}

@@ -9,9 +9,12 @@ use serde_json::Value;
 use std::collections::{BTreeSet, HashSet};
 use std::net::SocketAddr;
 use url::Url;
-use xray_model::{Error, PacTemplateMode, Result};
+use xray_config::geodata::GeoData;
+use xray_model::{Error, PacDraft, PacMode, Result};
 
 pub const DEFAULT_PAC_PORT: u16 = 18080;
+/// Threshold above which Windows / Chromium PAC parsers may show noticeable startup latency.
+pub const PAC_SIZE_WARNING_BYTES: usize = 512 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PacDomainKind {
@@ -95,22 +98,21 @@ pub fn format_domain_list(domains: &[String]) -> String {
     domains.join("\n")
 }
 
-/// Result of extracting plain/wildcard/full domains from native routing rules.
+/// Result of extracting plain/wildcard/full domains and `geosite:` tags from native routing rules.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ExtractedConfigDomains {
     pub domains: Vec<String>,
-    pub skipped_geosite: usize,
+    pub geosites: Vec<String>,
     pub skipped_regexp: usize,
-    pub skipped_ext: usize,
     pub skipped_other: usize,
 }
 
-/// Extract template-compatible domain entries from `/routing/rules[*]/domain`.
-/// Rules relying on `geosite:`, `regexp:`, `ext:`, or keyword substrings cannot
-/// be represented directly by the PAC domain template and are counted as skipped.
+/// Extract template-compatible domain entries and `geosite:`/`ext:` tags from `/routing/rules[*]/domain`.
+/// Rules relying on `regexp:` or unrecognized inputs are counted as skipped.
 pub fn extract_domains_from_config(config: &Value) -> ExtractedConfigDomains {
     let mut out = ExtractedConfigDomains::default();
-    let mut seen = HashSet::new();
+    let mut seen_domains = HashSet::new();
+    let mut seen_geosites = HashSet::new();
     let Some(rules) = config.pointer("/routing/rules").and_then(Value::as_array) else {
         return out;
     };
@@ -121,16 +123,20 @@ pub fn extract_domains_from_config(config: &Value) -> ExtractedConfigDomains {
         for entry in entries.iter().filter_map(Value::as_str) {
             let trimmed = entry.trim();
             let lower = trimmed.to_ascii_lowercase();
-            if lower.starts_with("geosite:") {
-                out.skipped_geosite += 1;
+            if lower.starts_with("geosite:") || lower.starts_with("ext:") {
+                if let Some(tag) = normalize_geosite_spec(trimmed)
+                    && seen_geosites.insert(tag.to_ascii_lowercase())
+                {
+                    out.geosites.push(tag);
+                }
                 continue;
             }
             if lower.starts_with("regexp:") {
                 out.skipped_regexp += 1;
                 continue;
             }
-            if lower.starts_with("ext:") || lower.starts_with("ext-ip:") {
-                out.skipped_ext += 1;
+            if lower.starts_with("ext-ip:") {
+                out.skipped_other += 1;
                 continue;
             }
             // Bare entries without a prefix are keyword substrings in Xray native routing,
@@ -144,7 +150,7 @@ pub fn extract_domains_from_config(config: &Value) -> ExtractedConfigDomains {
             }
             match normalize_domain(trimmed) {
                 Ok(domain) => {
-                    if seen.insert(domain.to_ascii_lowercase()) {
+                    if seen_domains.insert(domain.to_ascii_lowercase()) {
                         out.domains.push(domain);
                     }
                 }
@@ -153,6 +159,34 @@ pub fn extract_domains_from_config(config: &Value) -> ExtractedConfigDomains {
         }
     }
     out
+}
+
+/// Validate and normalize a `geosite:<cat>[@attr]` or `ext:<file>:<tag>[@attr]` specification.
+pub fn normalize_geosite_spec(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("geosite:") {
+        let cat = rest.trim();
+        if cat.is_empty() {
+            return None;
+        }
+        return Some(format!("geosite:{cat}"));
+    }
+    if let Some(rest) = lower.strip_prefix("ext:") {
+        let (file, tag) = rest.split_once(':')?;
+        if file.trim().is_empty() || tag.trim().is_empty() {
+            return None;
+        }
+        // Preserve original file case from `input` in case of case-sensitive filesystems.
+        let orig_rest = trimmed.get(4..)?;
+        let (orig_file, orig_tag) = orig_rest.split_once(':')?;
+        return Some(format!(
+            "ext:{}:{}",
+            orig_file.trim(),
+            orig_tag.trim().to_ascii_lowercase()
+        ));
+    }
+    None
 }
 
 /// Validate and normalize a domain used by the built-in PAC template.
@@ -209,123 +243,26 @@ fn js_domain_set(entries: &BTreeSet<String>) -> String {
     out
 }
 
-/// Build a built-in template with an optional domain list.
-///
-/// Uses ES3-compatible object maps and dot-segment lookup so large domain lists
-/// stay compact, avoid deep `||` expression trees, and evaluate in O(labels).
-pub fn template(endpoint: SocketAddr, mode: PacTemplateMode, domains: &[String]) -> Result<String> {
-    let mut exact = BTreeSet::new();
-    let mut sub = BTreeSet::new();
-    let mut suffix = BTreeSet::new();
-    for domain in domains {
-        let value = normalize_domain(domain)?;
-        if let Some(full) = value.strip_prefix("full:") {
-            exact.insert(full.to_owned());
-        } else if let Some(wild) = value.strip_prefix("*.") {
-            sub.insert(wild.to_owned());
-        } else {
-            suffix.insert(value);
-        }
-    }
-
-    let empty = exact.is_empty() && sub.is_empty() && suffix.is_empty();
-    if mode == PacTemplateMode::All || empty {
-        let branch = match mode {
-            PacTemplateMode::All | PacTemplateMode::DirectList => {
-                format!("return \"PROXY {endpoint}\";")
-            }
-            PacTemplateMode::ProxyList => "return \"DIRECT\";".to_owned(),
-        };
-        return Ok(format!(
-            r#"function FindProxyForURL(url, host) {{
-    host = host.toLowerCase();
-    if (host === "localhost" || host === "127.0.0.1" || host === "::1" ||
-        isPlainHostName(host) || dnsDomainIs(host, ".lan") || dnsDomainIs(host, ".local")) {{
-        return "DIRECT";
-    }}
-    {branch}
-}}
-"#
-        ));
-    }
-
-    let mut globals = String::new();
-    let mut direct_checks = Vec::new();
-    let mut parent_checks = Vec::new();
-    if !exact.is_empty() {
-        globals.push_str(&format!("var __PAC_EXACT = {};\n", js_domain_set(&exact)));
-        direct_checks.push("__PAC_OWN.call(__PAC_EXACT, host)");
-    }
-    if !sub.is_empty() {
-        globals.push_str(&format!("var __PAC_SUB = {};\n", js_domain_set(&sub)));
-        parent_checks.push("__PAC_OWN.call(__PAC_SUB, parent)");
-    }
-    if !suffix.is_empty() {
-        globals.push_str(&format!("var __PAC_SUFFIX = {};\n", js_domain_set(&suffix)));
-        direct_checks.push("__PAC_OWN.call(__PAC_SUFFIX, host)");
-        parent_checks.push("__PAC_OWN.call(__PAC_SUFFIX, parent)");
-    }
-
-    let direct_expr = if direct_checks.is_empty() {
-        "false".to_owned()
-    } else {
-        direct_checks.join(" || ")
-    };
-    let parent_loop = if parent_checks.is_empty() {
-        String::new()
-    } else {
-        let cond = parent_checks.join(" || ");
-        format!(
-            r#"    if (!matched) {{
-        var pos = host.indexOf(".");
-        while (pos !== -1) {{
-            var parent = host.substring(pos + 1);
-            if ({cond}) {{
-                matched = true;
-                break;
-            }}
-            pos = host.indexOf(".", pos + 1);
-        }}
-    }}
-"#
-        )
-    };
-    let (hit, miss) = match mode {
-        PacTemplateMode::ProxyList => (format!("\"PROXY {endpoint}\""), "\"DIRECT\"".to_owned()),
-        PacTemplateMode::DirectList => ("\"DIRECT\"".to_owned(), format!("\"PROXY {endpoint}\"")),
-        PacTemplateMode::All => unreachable!(),
-    };
-
-    Ok(format!(
-        r#"{globals}var __PAC_OWN = Object.prototype.hasOwnProperty;
-function __pacMatch(host) {{
-    var matched = {direct_expr};
-{parent_loop}    return matched;
-}}
-function FindProxyForURL(url, host) {{
-    host = host.toLowerCase();
-    if (host === "localhost" || host === "127.0.0.1" || host === "::1" ||
-        isPlainHostName(host) || dnsDomainIs(host, ".lan") || dnsDomainIs(host, ".local")) {{
-        return "DIRECT";
-    }}
-    if (__pacMatch(host)) {{
-        return {hit};
-    }}
-    return {miss};
-}}
-"#
-    ))
-}
-
-/// Built-in PAC template with the default "proxy everything" policy.
-pub fn default_template(endpoint: SocketAddr) -> String {
-    template(endpoint, PacTemplateMode::All, &[]).expect("default PAC template is valid")
+/// Compilation statistics for UI feedback and size diagnostics.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PacCompileStats {
+    pub domain_count: usize,
+    pub full_count: usize,
+    pub subdomain_count: usize,
+    pub keyword_count: usize,
+    pub folded_count: usize,
+    pub skipped_regex_count: usize,
+    pub resolved_geosites: Vec<String>,
+    pub missing_geosites: Vec<String>,
+    pub script_bytes: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GeneratedPac {
     pub script: String,
     pub notes: Vec<String>,
+    #[serde(default)]
+    pub stats: PacCompileStats,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -338,6 +275,319 @@ pub struct PacDecision {
     pub raw: String,
     /// All directives in order, normalized to `KIND [host:port]`.
     pub directives: Vec<String>,
+}
+
+#[derive(Default)]
+struct DomainMatchSets {
+    exact: BTreeSet<String>,
+    sub: BTreeSet<String>,
+    suffix: BTreeSet<String>,
+    keywords: BTreeSet<String>,
+}
+
+impl DomainMatchSets {
+    fn is_empty(&self) -> bool {
+        self.exact.is_empty()
+            && self.sub.is_empty()
+            && self.suffix.is_empty()
+            && self.keywords.is_empty()
+    }
+
+    fn insert_normalized_domain(&mut self, normalized: &str) {
+        if let Some(full) = normalized.strip_prefix("full:") {
+            self.exact.insert(full.to_owned());
+        } else if let Some(wild) = normalized.strip_prefix("*.") {
+            self.sub.insert(wild.to_owned());
+        } else {
+            self.suffix.insert(normalized.to_owned());
+        }
+    }
+
+    fn insert_resolved_geosite(&mut self, resolved: &xray_config::geodata::ResolvedGeoSite) {
+        for entry in &resolved.domains {
+            if let Some(full) = entry.strip_prefix("full:") {
+                self.exact.insert(full.to_owned());
+            } else {
+                self.suffix.insert(entry.to_owned());
+            }
+        }
+        for kw in &resolved.plain_keywords {
+            let trimmed = kw.trim().to_ascii_lowercase();
+            if !trimmed.is_empty() {
+                self.keywords.insert(trimmed);
+            }
+        }
+    }
+
+    /// Remove exact, subdomain, and suffix entries already covered by a broader parent suffix/wildcard.
+    fn fold(&mut self) -> usize {
+        let mut folded = 0;
+        let suffix_lookup: HashSet<String> = self.suffix.iter().cloned().collect();
+        let sub_lookup: HashSet<String> = self.sub.iter().cloned().collect();
+
+        let has_ancestor = |host: &str| {
+            let mut rest = host;
+            while let Some((_, parent)) = rest.split_once('.') {
+                if suffix_lookup.contains(parent) || sub_lookup.contains(parent) {
+                    return true;
+                }
+                rest = parent;
+            }
+            false
+        };
+
+        let before_suffix = self.suffix.len();
+        self.suffix.retain(|d| !has_ancestor(d));
+        folded += before_suffix - self.suffix.len();
+
+        let before_sub = self.sub.len();
+        self.sub
+            .retain(|d| !(suffix_lookup.contains(d) || has_ancestor(d)));
+        folded += before_sub - self.sub.len();
+
+        let before_exact = self.exact.len();
+        self.exact
+            .retain(|d| !(suffix_lookup.contains(d) || has_ancestor(d)));
+        folded += before_exact - self.exact.len();
+
+        folded
+    }
+
+    fn add_to_stats(&self, stats: &mut PacCompileStats, folded: usize) {
+        stats.domain_count += self.suffix.len();
+        stats.full_count += self.exact.len();
+        stats.subdomain_count += self.sub.len();
+        stats.keyword_count += self.keywords.len();
+        stats.folded_count += folded;
+    }
+
+    fn js_args_suffix(&self, prefix: &str, decls: &mut Vec<String>) -> String {
+        let mut bind = |name: &str, json: Option<String>| -> String {
+            match json {
+                Some(literal) => {
+                    let var_name = format!("{prefix}_{name}");
+                    decls.push(format!("var {var_name} = {literal};"));
+                    var_name
+                }
+                None => "null".to_owned(),
+            }
+        };
+        let exact_arg = bind(
+            "EXACT",
+            (!self.exact.is_empty()).then(|| js_domain_set(&self.exact)),
+        );
+        let sub_arg = bind(
+            "SUB",
+            (!self.sub.is_empty()).then(|| js_domain_set(&self.sub)),
+        );
+        let suffix_arg = bind(
+            "SUFFIX",
+            (!self.suffix.is_empty()).then(|| js_domain_set(&self.suffix)),
+        );
+        let kw_arg = bind(
+            "KW",
+            (!self.keywords.is_empty()).then(|| js_keyword_array(&self.keywords)),
+        );
+        format!("{exact_arg}, {sub_arg}, {suffix_arg}, {kw_arg}")
+    }
+}
+
+fn js_keyword_array(entries: &BTreeSet<String>) -> String {
+    let mut out = String::from("[");
+    for (idx, item) in entries.iter().enumerate() {
+        if idx > 0 {
+            out.push(',');
+        }
+        out.push_str(&string_literal(item));
+    }
+    out.push(']');
+    out
+}
+
+const PAC_MATCH_HELPER: &str = r#"var __PAC_OWN = Object.prototype.hasOwnProperty;
+function __pacMatchHost(host, exact, sub, suffix, keywords) {
+    if (exact && __PAC_OWN.call(exact, host)) {
+        return true;
+    }
+    if (suffix && __PAC_OWN.call(suffix, host)) {
+        return true;
+    }
+    if (sub || suffix) {
+        var pos = host.indexOf(".");
+        while (pos !== -1) {
+            var parent = host.substring(pos + 1);
+            if (sub && __PAC_OWN.call(sub, parent)) {
+                return true;
+            }
+            if (suffix && __PAC_OWN.call(suffix, parent)) {
+                return true;
+            }
+            pos = host.indexOf(".", pos + 1);
+        }
+    }
+    if (keywords) {
+        for (var i = 0; i < keywords.length; i++) {
+            if (host.indexOf(keywords[i]) !== -1) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+"#;
+
+const PAC_LAN_BYPASS: &str = "    if (host === \"localhost\" || host === \"127.0.0.1\" || host === \"::1\" ||\n        isPlainHostName(host) || dnsDomainIs(host, \".lan\") || dnsDomainIs(host, \".local\")) {\n        return \"DIRECT\";\n    }\n";
+
+fn compile_list_template(
+    endpoint: SocketAddr,
+    mode: PacMode,
+    geosites: &[String],
+    domains: &[String],
+    geo: Option<&GeoData>,
+) -> Result<GeneratedPac> {
+    let mut sets = DomainMatchSets::default();
+    let mut stats = PacCompileStats::default();
+    let mut notes = Vec::new();
+
+    for spec in geosites {
+        let Some(norm_spec) = normalize_geosite_spec(spec) else {
+            return Err(Error::new(
+                "PAC_GEOSITE_INVALID",
+                format!("无效的 GeoSite 规则：{spec}"),
+            ));
+        };
+        match geo.and_then(|g| g.resolve_domain_spec(&norm_spec)) {
+            Some(resolved) => {
+                sets.insert_resolved_geosite(&resolved);
+                if resolved.regex_count > 0 {
+                    stats.skipped_regex_count += resolved.regex_count;
+                    notes.push(format!(
+                        "{norm_spec} 包含 {} 条正则条目，PAC 已忽略正则并由 Xray 路由兜底",
+                        resolved.regex_count
+                    ));
+                }
+                stats.resolved_geosites.push(norm_spec);
+            }
+            None => {
+                stats.missing_geosites.push(norm_spec.clone());
+            }
+        }
+    }
+
+    if !stats.missing_geosites.is_empty() {
+        notes.push(format!(
+            "以下分类在当前 geosite.dat 中未找到（或资源未加载）：{}",
+            stats.missing_geosites.join("、")
+        ));
+    }
+
+    for domain in domains {
+        let value = normalize_domain(domain)?;
+        sets.insert_normalized_domain(&value);
+    }
+
+    let folded = sets.fold();
+    sets.add_to_stats(&mut stats, folded);
+
+    let script = if mode == PacMode::All || sets.is_empty() {
+        let branch = match mode {
+            PacMode::All | PacMode::DirectList => format!("return \"PROXY {endpoint}\";"),
+            PacMode::ProxyList => "return \"DIRECT\";".to_owned(),
+            PacMode::AutoRules | PacMode::Custom => unreachable!(),
+        };
+        format!(
+            "function FindProxyForURL(url, host) {{\n    host = host.toLowerCase();\n{PAC_LAN_BYPASS}    {branch}\n}}\n"
+        )
+    } else {
+        let mut decls = Vec::new();
+        let args = sets.js_args_suffix("__PAC", &mut decls);
+        let decl_block = decls.join("\n");
+        let (hit, miss) = match mode {
+            PacMode::ProxyList => (format!("\"PROXY {endpoint}\""), "\"DIRECT\"".to_owned()),
+            PacMode::DirectList => ("\"DIRECT\"".to_owned(), format!("\"PROXY {endpoint}\"")),
+            PacMode::All | PacMode::AutoRules | PacMode::Custom => unreachable!(),
+        };
+        let decl_section = if decl_block.is_empty() {
+            String::new()
+        } else {
+            format!("{decl_block}\n")
+        };
+        format!(
+            "{decl_section}{PAC_MATCH_HELPER}function FindProxyForURL(url, host) {{\n    host = host.toLowerCase();\n{PAC_LAN_BYPASS}    if (__pacMatchHost(host, {args})) {{\n        return {hit};\n    }}\n    return {miss};\n}}\n"
+        )
+    };
+
+    stats.script_bytes = script.len();
+    if stats.script_bytes > PAC_SIZE_WARNING_BYTES {
+        notes.push(format!(
+            "生成的 PAC 脚本体积为 {:.0} KiB（超过 512 KiB），建议改用「按路由规则自动生成」或精简分组",
+            stats.script_bytes as f64 / 1024.0
+        ));
+    }
+
+    Ok(GeneratedPac {
+        script,
+        notes,
+        stats,
+    })
+}
+
+/// Build a built-in domain-list or proxy-all template without GeoData expansion.
+pub fn template(endpoint: SocketAddr, mode: PacMode, domains: &[String]) -> Result<String> {
+    if matches!(mode, PacMode::AutoRules | PacMode::Custom) {
+        return Err(Error::new(
+            "PAC_MODE_UNSUPPORTED",
+            "该 PAC 模式需要通过完整编译器生成",
+        ));
+    }
+    compile_list_template(endpoint, mode, &[], domains, None).map(|g| g.script)
+}
+
+/// Built-in PAC template with the default "proxy everything except LAN" policy.
+pub fn default_template(endpoint: SocketAddr) -> String {
+    compile_list_template(endpoint, PacMode::All, &[], &[], None)
+        .expect("default PAC template is valid")
+        .script
+}
+
+/// Compile a user's `PacDraft` against the active config and loaded `GeoData`.
+pub fn compile_draft(
+    config: &Value,
+    endpoint: SocketAddr,
+    draft: &PacDraft,
+    geo: Option<&GeoData>,
+) -> Result<GeneratedPac> {
+    match draft.mode {
+        PacMode::AutoRules => Ok(generate_with_geo(config, endpoint, geo)),
+        PacMode::All | PacMode::DirectList | PacMode::ProxyList => {
+            compile_list_template(endpoint, draft.mode, &draft.geosites, &draft.domains, geo)
+        }
+        PacMode::Custom => {
+            if draft.script.trim().is_empty() {
+                return Err(Error::new(
+                    "PAC_SCRIPT_REQUIRED",
+                    "请先输入自定义 PAC 脚本内容",
+                ));
+            }
+            validate(&draft.script)?;
+            let mut notes = compat_notes(&draft.script);
+            let script_bytes = draft.script.len();
+            if script_bytes > PAC_SIZE_WARNING_BYTES {
+                notes.push(format!(
+                    "自定义 PAC 脚本体积为 {:.0} KiB（超过 512 KiB）",
+                    script_bytes as f64 / 1024.0
+                ));
+            }
+            Ok(GeneratedPac {
+                script: draft.script.clone(),
+                notes,
+                stats: PacCompileStats {
+                    script_bytes,
+                    ..Default::default()
+                },
+            })
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -360,30 +610,74 @@ fn string_literal(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into())
 }
 
-fn domain_condition(pattern: &str) -> Option<String> {
-    let pattern = pattern.trim().to_ascii_lowercase();
-    if pattern.is_empty() {
+fn compile_domain_patterns(
+    patterns: &[String],
+    geo: Option<&GeoData>,
+    stats: &mut PacCompileStats,
+    notes: &mut Vec<String>,
+) -> Option<(DomainMatchSets, bool)> {
+    let mut sets = DomainMatchSets::default();
+    let mut partial_regex = false;
+    for raw in patterns {
+        let pattern = raw.trim();
+        if pattern.is_empty() {
+            return None;
+        }
+        let lower = pattern.to_ascii_lowercase();
+        if let Some(full) = lower.strip_prefix("full:") {
+            let host = full.trim_start_matches('.').trim_end_matches('.');
+            if host.is_empty() {
+                return None;
+            }
+            sets.exact.insert(host.to_owned());
+        } else if let Some(suffix) = lower.strip_prefix("domain:") {
+            let suffix = suffix.trim_start_matches('.').trim_end_matches('.');
+            if suffix.is_empty() {
+                return None;
+            }
+            sets.suffix.insert(suffix.to_owned());
+        } else if let Some(kw) = lower.strip_prefix("keyword:") {
+            let kw = kw.trim();
+            if kw.is_empty() {
+                return None;
+            }
+            sets.keywords.insert(kw.to_owned());
+        } else if lower.starts_with("geosite:") || lower.starts_with("ext:") {
+            let norm = normalize_geosite_spec(pattern)?;
+            match geo.and_then(|g| g.resolve_domain_spec(&norm)) {
+                Some(resolved) => {
+                    sets.insert_resolved_geosite(&resolved);
+                    if resolved.regex_count > 0 {
+                        partial_regex = true;
+                        stats.skipped_regex_count += resolved.regex_count;
+                    }
+                    if !stats.resolved_geosites.contains(&norm) {
+                        stats.resolved_geosites.push(norm);
+                    }
+                }
+                None => {
+                    if !stats.missing_geosites.contains(&norm) {
+                        stats.missing_geosites.push(norm.clone());
+                        notes.push(format!(
+                            "规则中的 {norm} 无法展开（geosite.dat 未加载或缺少该分组）"
+                        ));
+                    }
+                    return None;
+                }
+            }
+        } else if lower.contains(':') {
+            // regexp: and other native prefixes cannot be expressed reliably in PAC.
+            return None;
+        } else {
+            sets.keywords.insert(lower);
+        }
+    }
+    let folded = sets.fold();
+    sets.add_to_stats(stats, folded);
+    if sets.is_empty() {
         return None;
     }
-    if let Some(full) = pattern.strip_prefix("full:") {
-        return Some(format!("host === {}", string_literal(full)));
-    }
-    if let Some(suffix) = pattern.strip_prefix("domain:") {
-        let suffix = suffix.trim_start_matches('.');
-        return Some(format!(
-            "(host === {p} || dnsDomainIs(host, {d}))",
-            p = string_literal(suffix),
-            d = string_literal(&format!(".{suffix}"))
-        ));
-    }
-    if pattern.contains(':') {
-        // regexp:, geosite:, ext: and other native prefixes need data or a regex engine.
-        return None;
-    }
-    Some(format!(
-        "(host.indexOf({}) !== -1)",
-        string_literal(&pattern)
-    ))
+    Some((sets, partial_regex))
 }
 
 fn domain_rule(rule: &Value) -> Option<(Vec<String>, Action)> {
@@ -413,7 +707,6 @@ fn domain_rule(rule: &Value) -> Option<(Vec<String>, Action)> {
     if patterns.is_empty() {
         return None;
     }
-    // The outbound protocol is resolved by the caller; a balancer always proxies.
     let action = if balancer.is_some() {
         Action::Proxy
     } else {
@@ -422,14 +715,23 @@ fn domain_rule(rule: &Value) -> Option<(Vec<String>, Action)> {
     Some((patterns, action))
 }
 
-/// Generate a conservative PAC script from the native routing rules.
+/// Generate a conservative PAC script from native routing rules without GeoData.
+pub fn generate(config: &Value, endpoint: SocketAddr) -> GeneratedPac {
+    generate_with_geo(config, endpoint, None)
+}
+
+/// Generate a conservative PAC script from native routing rules with optional GeoData expansion.
 ///
 /// Only rules whose complete match condition is a domain list are compiled.
 /// A direct decision is emitted only while every preceding rule is also
-/// expressible; otherwise traffic falls through to PROXY and Xray applies the
-/// full native rule set. This may under-direct, but it never leaks traffic that
-/// a native proxy/block rule would have captured.
-pub fn generate(config: &Value, endpoint: SocketAddr) -> GeneratedPac {
+/// safely expressible; otherwise traffic falls through to PROXY and Xray applies
+/// the full native rule set. This may under-direct, but never leaks traffic
+/// that a native proxy/block rule would have captured.
+pub fn generate_with_geo(
+    config: &Value,
+    endpoint: SocketAddr,
+    geo: Option<&GeoData>,
+) -> GeneratedPac {
     let proxy = format!("PROXY {endpoint}");
     let protocols: std::collections::BTreeMap<&str, &str> = config
         .get("outbounds")
@@ -445,6 +747,7 @@ pub fn generate(config: &Value, endpoint: SocketAddr) -> GeneratedPac {
         .collect();
     let default_tag = config.pointer("/outbounds/0/tag").and_then(Value::as_str);
     let mut notes = vec![];
+    let mut stats = PacCompileStats::default();
     let initial_direct = default_tag
         .and_then(|tag| protocols.get(tag).copied())
         .is_some_and(|protocol| protocol == "freedom");
@@ -454,15 +757,15 @@ pub fn generate(config: &Value, endpoint: SocketAddr) -> GeneratedPac {
         .cloned()
         .unwrap_or_default();
 
-    // Resolve rule action and expressibility up front.
     struct Rule {
         index: usize,
-        patterns: Vec<String>,
-        conditions: Option<Vec<String>>,
+        sets: Option<DomainMatchSets>,
         action: Action,
         expressible: bool,
+        has_unexpressible_regex: bool,
         catch_all: bool,
     }
+
     let mut resolved = vec![];
     for (index, rule) in rules.iter().enumerate() {
         let map = match rule.as_object() {
@@ -489,51 +792,58 @@ pub fn generate(config: &Value, endpoint: SocketAddr) -> GeneratedPac {
             && !map.contains_key("inboundTag")
             && !map.contains_key("protocol")
             && !map.contains_key("attrs");
-        let (patterns, conditions, expressible) = match domain_rule(rule) {
-            Some((patterns, _)) if catch_all => (patterns, Some(vec![]), false),
-            Some((patterns, _)) => {
-                let conditions: Option<Vec<String>> =
-                    patterns.iter().map(|p| domain_condition(p)).collect();
-                (patterns, conditions, true)
+
+        let (sets, expressible, has_unexpressible_regex) = match domain_rule(rule) {
+            Some((patterns, _)) if !catch_all => {
+                match compile_domain_patterns(&patterns, geo, &mut stats, &mut notes) {
+                    Some((sets, partial_regex)) => {
+                        if partial_regex {
+                            notes.push(format!(
+                                "规则 {} 的 geosite 包含正则条目，PAC 忽略正则并由 Xray 路由兜底",
+                                index + 1
+                            ));
+                        }
+                        (Some(sets), true, partial_regex)
+                    }
+                    None => (None, false, false),
+                }
             }
-            None => (vec![], None, false),
+            _ => (None, false, false),
         };
-        let conditions = if catch_all { Some(vec![]) } else { conditions };
-        let expressible = expressible && conditions.is_some();
+
         resolved.push(Rule {
             index,
-            patterns,
-            conditions,
+            sets,
             action,
             expressible,
+            has_unexpressible_regex,
             catch_all,
         });
     }
 
-    // A direct default is only safe when no preceding proxy/block rule is lost.
+    // A direct default is only safe when no preceding proxy/block rule has unexpressible parts.
     let mut default_direct = initial_direct;
     if default_direct
-        && resolved
-            .iter()
-            .any(|rule| !rule.expressible && rule.action == Action::Proxy)
+        && resolved.iter().any(|rule| {
+            (!rule.expressible || rule.has_unexpressible_regex) && rule.action == Action::Proxy
+        })
     {
         default_direct = false;
         notes.push(
-            "存在无法用 PAC 表达的前序代理/阻断规则，默认改为 PROXY，由 Xray 保留原生路由".into(),
+            "存在无法用 PAC 完整表达的前序代理/阻断规则，默认改为 PROXY，由 Xray 保留原生路由"
+                .into(),
         );
     }
 
-    let mut blocks = vec![];
-    // When the default is DIRECT, a proxy/block rule must be emitted. When the
-    // default is PROXY, a later DIRECT rule is only safe while every preceding
-    // rule is also a DIRECT decision; otherwise the earlier rule takes precedence
-    // in Xray and PAC must not bypass it.
+    let mut decls = Vec::new();
+    let mut blocks: Vec<(String, &'static str)> = Vec::new();
     let mut direct_allowed = true;
     let mut catch_all_action = if default_direct {
         Action::Direct
     } else {
         Action::Proxy
     };
+
     for rule in &resolved {
         if rule.catch_all {
             if rule.action == Action::Direct && direct_allowed {
@@ -567,16 +877,18 @@ pub fn generate(config: &Value, endpoint: SocketAddr) -> GeneratedPac {
             }
             continue;
         }
-        let conditions = rule.conditions.as_ref().unwrap();
-        let condition = if conditions.is_empty() {
-            "true".to_owned()
-        } else {
-            format!("({})", conditions.join(" || "))
+
+        let sets = rule.sets.as_ref().unwrap();
+        let make_condition = |decls: &mut Vec<String>, rule_idx: usize| {
+            let args = sets.js_args_suffix(&format!("__PAC_R{rule_idx}"), decls);
+            format!("__pacMatchHost(host, {args})")
         };
+
         match (default_direct, rule.action) {
             (false, Action::Direct) => {
                 if direct_allowed {
-                    blocks.push((condition, "DIRECT", rule.patterns.clone()));
+                    let cond = make_condition(&mut decls, rule.index);
+                    blocks.push((cond, "DIRECT"));
                 } else {
                     notes.push(format!(
                         "规则 {} 的直连位于无法用 PAC 保留的代理/阻断规则之后，保留 PROXY",
@@ -585,18 +897,31 @@ pub fn generate(config: &Value, endpoint: SocketAddr) -> GeneratedPac {
                 }
             }
             (false, Action::Proxy) => {
-                // Default is already PROXY; this rule also blocks later DIRECT entries.
+                // Default is already PROXY; this rule blocks later DIRECT entries because
+                // later rules in Xray cannot override an earlier proxy/block match.
                 direct_allowed = false;
             }
             (true, Action::Proxy) => {
-                blocks.push((condition, "PROXY", rule.patterns.clone()));
-                direct_allowed = false;
+                let cond = make_condition(&mut decls, rule.index);
+                blocks.push((cond, "PROXY"));
+                if rule.has_unexpressible_regex {
+                    direct_allowed = false;
+                }
             }
             (true, Action::Direct) => {}
         }
     }
 
     let mut script = String::new();
+    if !decls.is_empty() {
+        for decl in decls {
+            script.push_str(&decl);
+            script.push('\n');
+        }
+    }
+    if !blocks.is_empty() {
+        script.push_str(PAC_MATCH_HELPER);
+    }
     script.push_str("function FindProxyForURL(url, host) {\n");
     script.push_str("    host = host.toLowerCase();\n");
     script.push_str(
@@ -604,7 +929,7 @@ pub fn generate(config: &Value, endpoint: SocketAddr) -> GeneratedPac {
     );
     script.push_str("        return \"DIRECT\";\n");
     script.push_str("    }\n");
-    for (condition, result, _) in &blocks {
+    for (condition, result) in &blocks {
         let value = match *result {
             "DIRECT" => "DIRECT".to_owned(),
             _ => proxy.clone(),
@@ -620,7 +945,18 @@ pub fn generate(config: &Value, endpoint: SocketAddr) -> GeneratedPac {
         proxy
     };
     script.push_str(&format!("    return {};\n}}\n", string_literal(&fallback)));
-    GeneratedPac { script, notes }
+    stats.script_bytes = script.len();
+    if stats.script_bytes > PAC_SIZE_WARNING_BYTES {
+        notes.push(format!(
+            "生成的 PAC 脚本体积为 {:.0} KiB（超过 512 KiB）",
+            stats.script_bytes as f64 / 1024.0
+        ));
+    }
+    GeneratedPac {
+        script,
+        notes,
+        stats,
+    }
 }
 
 fn native_unsupported(name: &str) -> boa_engine::JsError {

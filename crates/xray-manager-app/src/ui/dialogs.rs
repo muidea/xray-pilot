@@ -636,17 +636,13 @@ impl App {
             line(ui, "PAC 服务端口", &draft.port.to_string());
             line(
                 ui,
-                "PAC 脚本",
-                if draft.template {
-                    match draft.template_mode {
-                        xray_model::PacTemplateMode::All => "内置默认模板（全部代理）",
-                        xray_model::PacTemplateMode::ProxyList => "内置模板（仅代理清单）",
-                        xray_model::PacTemplateMode::DirectList => "内置模板（清单直连）",
-                    }
-                } else if draft.generated || draft.script.trim().is_empty() {
-                    "按当前配置自动生成"
-                } else {
-                    "自定义脚本"
+                "PAC 策略",
+                match draft.mode {
+                    xray_model::PacMode::AutoRules => "按路由规则自动生成（支持 GeoSite）",
+                    xray_model::PacMode::DirectList => "选中 GeoSite 与域名直连，其余代理",
+                    xray_model::PacMode::ProxyList => "仅代理选中 GeoSite 与域名，其余直连",
+                    xray_model::PacMode::All => "全部代理（本地/局域网直连）",
+                    xray_model::PacMode::Custom => "自定义 PAC 脚本",
                 },
             );
         }

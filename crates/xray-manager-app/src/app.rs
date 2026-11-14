@@ -101,6 +101,7 @@ pub struct App {
     exit: bool,
     shutdown_requested: bool,
     wakeup: Option<crate::wakeup::Wakeup>,
+    activation: Option<crate::single_instance::ActivationHandle>,
     history: Vec<Generation>,
     failed_request: Option<String>,
     #[cfg(windows)]
@@ -159,7 +160,12 @@ where
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>, root: PathBuf, background: bool) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        root: PathBuf,
+        background: bool,
+        activation: Option<crate::single_instance::ActivationHandle>,
+    ) -> Self {
         let (tx, requests) = mpsc::sync_channel::<Request>(MAX_PENDING);
         let (responses, rx) = mpsc::channel();
         let worker_root = root.clone();
@@ -239,6 +245,10 @@ impl App {
             }
         });
         let mut app = Self::with_channels(root, tx, rx);
+        if let Some(handle) = &activation {
+            handle.attach_wakeup(wakeup.clone());
+        }
+        app.activation = activation;
         app.wakeup = Some(wakeup.clone());
         app.ui.persistence = true;
         app.dependency_repaint = Some(cc.egui_ctx.clone());
@@ -258,15 +268,22 @@ impl App {
         #[cfg(windows)]
         {
             app.tray = crate::tray::Tray::new(wakeup).ok();
-            if background && app.tray.is_some() {
+            let open_requested = app
+                .activation
+                .as_ref()
+                .is_some_and(crate::single_instance::ActivationHandle::take_open);
+            if background && app.tray.is_some() && !open_requested {
                 // `eframe` always reveals the viewport after rendering frame 1; cloak via DWM until frame 2 hides it.
                 app.ui.background_hide = ui::BackgroundHide::HideAfterFirstFrame;
                 if let Some(wakeup) = &app.wakeup {
                     wakeup.set_cloaked(true);
                 }
-            } else if app.tray.is_none() {
+            } else if app.tray.is_none() || open_requested {
                 cc.egui_ctx
                     .send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                if open_requested {
+                    cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
             }
         }
         #[cfg(not(windows))]
@@ -322,6 +339,7 @@ impl App {
             exit: false,
             shutdown_requested: false,
             wakeup: None,
+            activation: None,
             history: vec![],
             failed_request: None,
             #[cfg(windows)]
@@ -491,9 +509,43 @@ impl App {
         self.ui.workspace.pac.insert(self.profile_id.clone(), draft);
         self.save_workspace();
     }
-    fn note_core_running(&mut self, running: bool) {
-        if running && !self.ui.workspace.last_core_running {
-            self.ui.workspace.last_core_running = true;
+    pub(in crate::app) fn note_applied_proxy(&mut self, mode: ProxyMode, pac: Option<&PacDraft>) {
+        let mut changed = self.ui.workspace.last_proxy_mode != mode;
+        self.ui.workspace.last_proxy_mode = mode;
+        let next_pac = (mode == ProxyMode::Pac).then(|| pac.cloned()).flatten();
+        if self.ui.workspace.last_pac != next_pac {
+            self.ui.workspace.last_pac = next_pac;
+            changed = true;
+        }
+        if changed {
+            self.save_workspace();
+        }
+    }
+    pub(in crate::app) fn sync_restore_state(&mut self, running: bool, clear_when_stopped: bool) {
+        if !running {
+            if clear_when_stopped && self.ui.workspace.last_core_running {
+                self.ui.workspace.last_core_running = false;
+                self.save_workspace();
+            }
+            return;
+        }
+        let mut changed = !self.ui.workspace.last_core_running;
+        self.ui.workspace.last_core_running = true;
+        if let Some(generation) = self.status.as_ref().and_then(|s| s.generation.as_ref()) {
+            let mode = generation.proxy_mode;
+            let profile_id = generation.candidate.profile_id.clone();
+            if self.ui.workspace.last_proxy_mode != mode {
+                self.ui.workspace.last_proxy_mode = mode;
+                changed = true;
+            }
+            if mode == ProxyMode::Pac && self.ui.workspace.last_pac.is_none() {
+                self.ui.workspace.last_pac = Some(self.pac_draft_for(&profile_id));
+                changed = true;
+            } else if mode != ProxyMode::Pac && self.ui.workspace.last_pac.take().is_some() {
+                changed = true;
+            }
+        }
+        if changed {
             self.save_workspace();
         }
     }
@@ -512,18 +564,52 @@ impl App {
         let Some(status) = self.status.as_ref() else {
             return;
         };
-        if status.core_state != "Stopped" || status.recovery_required || status.generation.is_none()
-        {
+        if status.core_state != "Stopped" || status.recovery_required {
             return;
         }
+        let Some(generation) = status.generation.as_ref() else {
+            return;
+        };
+        let http_inbound_tag = generation.http_inbound_tag.clone();
+        let profile_id = generation.candidate.profile_id.clone();
+        let mode = self.ui.workspace.last_proxy_mode;
+        let (message, command) = match mode {
+            ProxyMode::Direct => ("正在恢复上次 Core 运行状态…", Command::RestartCore),
+            ProxyMode::Global => (
+                "正在恢复上次 Core 运行与全局代理…",
+                Command::SetProxyMode {
+                    mode,
+                    http_inbound_tag,
+                    pac: None,
+                },
+            ),
+            ProxyMode::Pac => {
+                let pac = self
+                    .ui
+                    .workspace
+                    .last_pac
+                    .clone()
+                    .unwrap_or_else(|| self.pac_draft_for(&profile_id));
+                (
+                    "正在恢复上次 Core 运行与 PAC 自动代理…",
+                    Command::SetProxyMode {
+                        mode,
+                        http_inbound_tag,
+                        pac: Some(pac),
+                    },
+                )
+            }
+        };
         self.ui.restore_attempted = true;
-        self.message = "正在恢复上次 Core 运行状态…".into();
-        self.send(Command::RestartCore);
+        self.message = message.into();
+        self.send_command(command, true);
     }
     fn send(&mut self, command: Command) {
-        if matches!(command, Command::StopCore) && self.ui.workspace.last_core_running {
-            self.ui.workspace.last_core_running = false;
-            self.save_workspace();
+        self.send_command(command, false);
+    }
+    fn send_command(&mut self, command: Command, allow_stopped_proxy_mode: bool) {
+        if matches!(command, Command::StopCore) {
+            self.sync_restore_state(false, true);
         }
         if command.is_write() && self.busy {
             self.message = "请等待当前操作完成".into();
@@ -572,7 +658,10 @@ impl App {
             self.message = "请等待读取配置，或先处理草稿冲突".into();
             return;
         }
-        if matches!(command, Command::SetProxyMode { .. }) && !self.is_running() {
+        if !allow_stopped_proxy_mode
+            && matches!(command, Command::SetProxyMode { .. })
+            && !self.is_running()
+        {
             self.message = "请先启动 Core，再切换系统代理接管方式。".into();
             return;
         }
@@ -755,7 +844,7 @@ impl App {
                             let generation = status.generation.as_ref().map(|g| g.id.clone());
                             let running = status.core_state == "Running";
                             self.status = Some(status);
-                            self.note_core_running(running);
+                            self.sync_restore_state(running, false);
                             self.maybe_restore_core();
                             if let Some(generation_id) = generation {
                                 if self
@@ -912,11 +1001,14 @@ impl App {
                         }
                         self.refresh_profiles();
                     }
-                    Command::ApplyProfile { .. } => {
+                    Command::ApplyProfile {
+                        proxy_mode, pac, ..
+                    } => {
                         self.applied_draft(
                             &pending.context.profile,
                             pending.submitted_json.as_deref(),
                         );
+                        self.note_applied_proxy(proxy_mode, pac.as_ref());
                         self.clear_request_failure();
                         self.ui.onboarding = false;
                         self.add_event("信息", "配置已应用", response.request_id.clone());
@@ -947,7 +1039,15 @@ impl App {
                         );
                         self.send(Command::GetStatus);
                     }
-                    Command::StopCore | Command::RestartCore | Command::SetProxyMode { .. } => {
+                    Command::StopCore | Command::RestartCore => {
+                        self.clear_request_failure();
+                        let label = ui::command_name(&command);
+                        self.message = format!("{label}已完成，正在刷新状态。");
+                        self.add_event("信息", format!("{label}已完成"), response.request_id);
+                        self.send(Command::GetStatus);
+                    }
+                    Command::SetProxyMode { mode, ref pac, .. } => {
+                        self.note_applied_proxy(mode, pac.as_ref());
                         self.clear_request_failure();
                         let label = ui::command_name(&command);
                         self.message = format!("{label}已完成，正在刷新状态。");
@@ -980,7 +1080,8 @@ impl App {
         self.ui.pac_domain_kind_filter = Default::default();
         self.ui.pac_selected_domains.clear();
         self.ui.pac_batch_report = None;
-        self.ui.pac_template_key = None;
+        self.ui.pac_compile_key = None;
+        self.ui.pac_compile_stats = Default::default();
         self.ui.allow_dynamic = false;
         self.invalidate_candidate();
         self.history.clear();
@@ -1058,7 +1159,6 @@ impl App {
         }
     }
     /// Uncloaks (if still in background startup), reveals, and focuses the main viewport.
-    #[cfg(any(windows, test))]
     pub(super) fn reveal_window(&mut self, ctx: &egui::Context) {
         self.ui.background_hide = ui::BackgroundHide::None;
         if let Some(wakeup) = &self.wakeup {
@@ -1211,6 +1311,13 @@ impl eframe::App for App {
             }
         }
         self.advance_background_hide(ctx);
+        if self
+            .activation
+            .as_ref()
+            .is_some_and(crate::single_instance::ActivationHandle::take_open)
+        {
+            self.reveal_window(ctx);
+        }
         self.advance_shutdown();
         if self.exit {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);

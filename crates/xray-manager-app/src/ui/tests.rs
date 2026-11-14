@@ -2020,9 +2020,8 @@ fn pac_draft_is_per_profile_persisted_and_can_be_tested() {
     app.ui.page = Page::Pac;
     let mut draft = app.pac_draft();
     assert_eq!(draft.port, xray_model::DEFAULT_PAC_PORT);
-    assert!(draft.template);
-    draft.template = false;
-    draft.generated = false;
+    assert_eq!(draft.mode, xray_model::PacMode::AutoRules);
+    draft.mode = xray_model::PacMode::Custom;
     draft.script = "function FindProxyForURL(){ return 'DIRECT'; }".into();
     draft.port = 18081;
     app.save_pac_draft(draft.clone());
@@ -2055,23 +2054,19 @@ fn proxy_mode_switch_uses_the_running_profile_pac_draft() {
     app.ui.workspace.pac.insert(
         "work".into(),
         PacDraft {
-            generated: false,
-            template: false,
-            template_mode: Default::default(),
-            domains: Vec::new(),
+            mode: xray_model::PacMode::Custom,
             script: "function FindProxyForURL(){ return 'DIRECT'; }".into(),
             port: 18080,
+            ..Default::default()
         },
     );
     app.ui.workspace.pac.insert(
         "other".into(),
         PacDraft {
-            generated: false,
-            template: false,
-            template_mode: Default::default(),
-            domains: Vec::new(),
+            mode: xray_model::PacMode::Custom,
             script: "function FindProxyForURL(){ return 'PROXY 127.0.0.1:1'; }".into(),
             port: 18081,
+            ..Default::default()
         },
     );
     app.profile_id = "other".into();
@@ -2095,12 +2090,14 @@ fn pac_endpoint_refreshes_after_config_adds_or_renames_an_http_inbound() {
 fn pac_template_domain_list_is_saved_per_profile() {
     let mut app = app();
     let mut draft = app.pac_draft();
-    assert_eq!(draft.template_mode, xray_model::PacTemplateMode::All);
-    draft.template_mode = xray_model::PacTemplateMode::ProxyList;
+    assert_eq!(draft.mode, xray_model::PacMode::AutoRules);
+    draft.mode = xray_model::PacMode::ProxyList;
+    draft.geosites = vec!["geosite:google".into()];
     draft.domains = vec!["example.com".into(), "*.internal.test".into()];
     app.save_pac_draft(draft);
     let loaded = app.pac_draft();
-    assert_eq!(loaded.template_mode, xray_model::PacTemplateMode::ProxyList);
+    assert_eq!(loaded.mode, xray_model::PacMode::ProxyList);
+    assert_eq!(loaded.geosites, ["geosite:google"]);
     assert_eq!(loaded.domains, ["example.com", "*.internal.test"]);
 }
 
@@ -2129,6 +2126,162 @@ fn explicit_stop_clears_the_restore_intent() {
     app.ui.workspace.last_core_running = true;
     app.send(Command::StopCore);
     assert!(!app.ui.workspace.last_core_running);
+}
+
+#[test]
+fn pac_proxy_mode_is_persisted_across_shutdown_and_restored_on_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let (tx, requests) = mpsc::sync_channel(MAX_PENDING);
+    let (_responses, rx) = mpsc::channel();
+    let mut app = App::with_channels(dir.path().to_path_buf(), tx, rx);
+    app.ui.persistence = true;
+    app.ui.connected = true;
+    app.ui.settings_loaded = true;
+    app.settings.restore_last_state = true;
+    let json = default_config();
+    let revision = hash(json.as_bytes());
+    let applied_pac = xray_model::PacDraft {
+        mode: xray_model::PacMode::ProxyList,
+        geosites: vec!["geosite:google".into()],
+        domains: vec!["example.com".into()],
+        script: String::new(),
+        port: 17890,
+    };
+    app.note_applied_proxy(ProxyMode::Pac, Some(&applied_pac));
+    app.status = Some(Status {
+        generation: Some(Generation {
+            id: "generation-pac".into(),
+            transaction_id: "tx-pac".into(),
+            request_id: "req-pac".into(),
+            candidate: Candidate {
+                id: "cand-1".into(),
+                digest: "digest-1".into(),
+                profile_id: "work".into(),
+                base_revision: revision.clone(),
+                revision,
+                config_path: "config.json".into(),
+                core: CoreIdentity {
+                    path: "frozen/core".into(),
+                    sha256: "sha".into(),
+                    version: "Xray test".into(),
+                },
+                resources: Resources {
+                    id: "resources".into(),
+                    root: "frozen/resources".into(),
+                    files: vec![],
+                    complete: true,
+                    notes: vec![],
+                    dynamic: vec![],
+                },
+            },
+            proxy_mode: ProxyMode::Pac,
+            http_inbound_tag: "http-in".into(),
+            running: true,
+            pac: None,
+        }),
+        core_state: "Running".into(),
+        proxy_state: "ManagedPac".into(),
+        runtime_instance_id: Some("instance".into()),
+        supervisor_epoch: "epoch".into(),
+        last_error: None,
+        recovery_required: false,
+        winhttp: None,
+        listener_state: "Ready".into(),
+        pac_state: "Ready".into(),
+        auto_connect_notice: None,
+    });
+    // Unapplied draft changes for the profile must not override the last applied PAC config.
+    app.profile_id = "work".into();
+    app.save_pac_draft(xray_model::PacDraft {
+        domains: vec!["unapplied.example".into()],
+        ..Default::default()
+    });
+    app.request_exit(ExitKind::Shutdown);
+    assert!(app.shutdown_requested);
+    drop(requests);
+
+    // Simulate next launch where stop_generation wrote proxy_mode: Direct, running: false.
+    let (tx2, requests2) = mpsc::sync_channel(MAX_PENDING);
+    let (_responses2, rx2) = mpsc::channel();
+    let mut restored = App::with_channels(dir.path().to_path_buf(), tx2, rx2);
+    restored.ui.persistence = true;
+    restored.ui.workspace = crate::workspace::Workspace::load(dir.path()).unwrap();
+    restored.ui.connected = true;
+    restored.ui.settings_loaded = true;
+    restored.settings.restore_last_state = true;
+    let mut stopped = app.status.unwrap();
+    stopped.core_state = "Stopped".into();
+    stopped.proxy_state = "Released".into();
+    stopped.pac_state = "Stopped".into();
+    if let Some(generation) = stopped.generation.as_mut() {
+        generation.proxy_mode = ProxyMode::Direct;
+        generation.running = false;
+        generation.pac = None;
+    }
+    restored.status = Some(stopped);
+    // Simulate a status poll arriving with Stopped before restore fires; it must not clear intent.
+    restored.sync_restore_state(false, false);
+    restored.maybe_restore_core();
+    assert!(restored.ui.restore_attempted);
+    let request = requests2.try_recv().unwrap();
+    match request.command {
+        Command::SetProxyMode {
+            mode,
+            http_inbound_tag,
+            pac,
+        } => {
+            assert_eq!(mode, ProxyMode::Pac);
+            assert_eq!(http_inbound_tag, "http-in");
+            assert_eq!(pac, Some(applied_pac));
+        }
+        other => panic!("expected SetProxyMode(Pac), got {other:?}"),
+    }
+}
+
+#[test]
+fn global_proxy_mode_is_restored_on_startup_while_manual_stopped_switch_stays_blocked() {
+    let mut app = app();
+    let (tx, requests) = mpsc::sync_channel(MAX_PENDING);
+    app.tx = tx;
+    app.ui.connected = true;
+    app.ui.settings_loaded = true;
+    app.settings.restore_last_state = true;
+    if let Some(status) = app.status.as_mut()
+        && let Some(generation) = status.generation.as_mut()
+    {
+        generation.proxy_mode = ProxyMode::Global;
+    }
+    app.sync_restore_state(true, false);
+    app.request_exit(ExitKind::Shutdown);
+
+    app.shutdown_requested = false;
+    if let Some(status) = app.status.as_mut() {
+        status.core_state = "Stopped".into();
+        if let Some(generation) = status.generation.as_mut() {
+            generation.proxy_mode = ProxyMode::Direct;
+            generation.running = false;
+        }
+    }
+    // Manual SetProxyMode while Stopped remains blocked.
+    app.send(Command::SetProxyMode {
+        mode: ProxyMode::Global,
+        http_inbound_tag: "http-in".into(),
+        pac: None,
+    });
+    assert!(requests.try_recv().is_err());
+
+    // Automatic startup restore dispatches SetProxyMode(Global) cleanly.
+    app.maybe_restore_core();
+    assert!(app.ui.restore_attempted);
+    let request = requests.try_recv().unwrap();
+    assert!(matches!(
+        request.command,
+        Command::SetProxyMode {
+            mode: ProxyMode::Global,
+            pac: None,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -2238,7 +2391,7 @@ fn selecting_proxy_list_mode_persists_direct_template() {
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
-                    egui::vec2(1100.0, 760.0),
+                    egui::vec2(1100.0, 900.0),
                 )),
                 events,
                 ..Default::default()
@@ -2247,7 +2400,7 @@ fn selecting_proxy_list_mode_persists_direct_template() {
         )
     };
     let first = frame(&mut app, vec![]);
-    let mode = text_bounds(&first, "全部代理（本地/局域网直连）").center();
+    let mode = text_bounds(&first, "按当前路由规则自动生成（推荐）").center();
     let click = |pos| {
         vec![
             egui::Event::PointerMoved(pos),
@@ -2267,23 +2420,22 @@ fn selecting_proxy_list_mode_persists_direct_template() {
     };
     frame(&mut app, click(mode));
     let opened = frame(&mut app, vec![]);
-    let choice = text_bounds(&opened, "仅代理清单中的域名").center();
+    let choice = text_bounds(&opened, "仅代理选中 GeoSite 与域名，其余直连").center();
     frame(&mut app, click(choice));
     frame(&mut app, vec![]);
     let draft = app.pac_draft();
-    assert_eq!(draft.template_mode, xray_model::PacTemplateMode::ProxyList);
-    assert!(draft.template);
+    assert_eq!(draft.mode, xray_model::PacMode::ProxyList);
     assert!(draft.domains.is_empty());
     assert!(draft.script.contains("return \"DIRECT\""));
+    assert!(app.ui.pac_checked);
 }
 
 #[test]
-fn adding_a_domain_reactivates_and_saves_the_template() {
+fn adding_a_domain_compiles_and_saves_proxy_list_script() {
     let mut app = app();
     app.ui.page = Page::Pac;
     let mut draft = app.pac_draft();
-    draft.template = false;
-    draft.generated = true;
+    draft.mode = xray_model::PacMode::ProxyList;
     draft.script = "function FindProxyForURL(){ return 'PROXY 127.0.0.1:1'; }".into();
     app.save_pac_draft(draft);
     app.ui.pac_domain_input = "example.com".into();
@@ -2294,7 +2446,7 @@ fn adding_a_domain_reactivates_and_saves_the_template() {
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
-                    egui::vec2(1100.0, 760.0),
+                    egui::vec2(1100.0, 900.0),
                 )),
                 events,
                 ..Default::default()
@@ -2304,48 +2456,45 @@ fn adding_a_domain_reactivates_and_saves_the_template() {
     };
     let output = frame(&mut app, vec![]);
     let add = text_bounds(&output, "添加").center();
-    let events = vec![
-        egui::Event::PointerMoved(add),
-        egui::Event::PointerButton {
-            pos: add,
-            button: egui::PointerButton::Primary,
-            pressed: true,
-            modifiers: egui::Modifiers::NONE,
-        },
-        egui::Event::PointerButton {
-            pos: add,
-            button: egui::PointerButton::Primary,
-            pressed: false,
-            modifiers: egui::Modifiers::NONE,
-        },
-    ];
-    frame(&mut app, events);
+    frame(&mut app, pointer_click(add));
     frame(&mut app, vec![]);
     let saved = app.pac_draft();
-    assert!(saved.template);
-    assert!(!saved.generated);
-    assert_eq!(saved.template_mode, xray_model::PacTemplateMode::ProxyList);
+    assert_eq!(saved.mode, xray_model::PacMode::ProxyList);
     assert_eq!(saved.domains, ["example.com"]);
     assert!(saved.script.contains(r#"return "PROXY"#));
     assert!(saved.script.contains(r#"return "DIRECT""#));
+    assert!(app.ui.pac_checked);
 }
 
 #[test]
-fn pac_page_exposes_numbered_workflow_steps() {
+fn pac_page_shows_streamlined_sections_and_geosite_chips() {
+    let asset_dir = tempfile::tempdir().unwrap();
+    let geosite_bytes = xray_config::geodata::test_encoder::encode_geosite_list(&[
+        ("cn", &[(2, "baidu.com", &[][..])][..]),
+        ("google", &[(2, "google.com", &[][..])][..]),
+    ]);
+    std::fs::write(asset_dir.path().join("geosite.dat"), geosite_bytes).unwrap();
+
     let mut app = app();
+    app.asset_root = asset_dir.path().display().to_string();
     app.ui.page = Page::Pac;
     let ctx = egui::Context::default();
     configure(&ctx);
-    let output = ctx.run(
-        egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(1100.0, 1600.0),
-            )),
-            ..Default::default()
-        },
-        |ctx| app.render(ctx),
-    );
+    let frame = |app: &mut App, events| {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1100.0, 1200.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| app.render(ctx),
+        )
+    };
+    // Default AutoRules mode hides Card 2 custom list for simplicity.
+    let output = frame(&mut app, vec![]);
     let labels: Vec<&str> = output
         .shapes
         .iter()
@@ -2354,18 +2503,33 @@ fn pac_page_exposes_numbered_workflow_steps() {
             _ => None,
         })
         .collect();
-    for step in [
-        "步骤 1 · 选择代理范围",
-        "步骤 2 · 添加代理域名",
-        "步骤 3 · 生成并检查模板",
-        "步骤 4 · 执行 FindProxyForURL 测试",
-        "步骤 5 · 应用到运行版本",
-    ] {
-        assert!(labels.contains(&step), "missing {step}");
-    }
-    assert!(labels.contains(&"生成并检查模板"));
-    assert!(labels.contains(&"测试当前模板"));
-    assert!(labels.contains(&"检查并预览 PAC 应用"));
+    assert!(labels.contains(&"1 · 分流模式与 GeoSite"));
+    assert!(labels.contains(&"测试与一键应用"));
+    assert!(!labels.contains(&"2 · 自定义域名清单"));
+    assert!(labels.contains(&"检查并应用 PAC"));
+
+    // Switching to DirectList shows Card 2 & quick GeoSite chips from geosite.dat!
+    let mut draft = app.pac_draft();
+    draft.mode = xray_model::PacMode::DirectList;
+    app.save_pac_draft(draft);
+    let list_output = frame(&mut app, vec![]);
+    let chip = text_bounds(&list_output, "国内常见 (cn)").center();
+    frame(&mut app, pointer_click(chip));
+    frame(&mut app, vec![]);
+    let updated = app.pac_draft();
+    assert_eq!(updated.geosites, vec!["geosite:cn"]);
+    assert_eq!(
+        xray_pac::evaluate(&updated.script, "https://www.baidu.com/")
+            .unwrap()
+            .kind,
+        "DIRECT"
+    );
+    assert_eq!(
+        xray_pac::evaluate(&updated.script, "https://example.org/")
+            .unwrap()
+            .kind,
+        "PROXY"
+    );
 }
 
 #[test]
@@ -2467,6 +2631,9 @@ fn pointer_click(pos: egui::Pos2) -> Vec<egui::Event> {
 fn pac_batch_dialog_imports_and_replaces_domains_with_error_protection() {
     let mut app = app();
     app.ui.page = Page::Pac;
+    let mut draft = app.pac_draft();
+    draft.mode = xray_model::PacMode::ProxyList;
+    app.save_pac_draft(draft);
     app.ui.dialog = Some(Dialog::PacBatch);
     app.ui.pac_batch_input =
         "# comment\nexample.com, *.sub.example.net\nfull:api.example.org\n".into();
@@ -2498,7 +2665,7 @@ fn pac_batch_dialog_imports_and_replaces_domains_with_error_protection() {
         draft.domains,
         vec!["example.com", "*.sub.example.net", "full:api.example.org"]
     );
-    assert_eq!(draft.template_mode, xray_model::PacTemplateMode::ProxyList);
+    assert_eq!(draft.mode, xray_model::PacMode::ProxyList);
 
     // Invalid-only replacement preserves existing domains and reports error.
     assert!(!app.apply_pac_batch("bad/domain", true));
@@ -2515,7 +2682,7 @@ fn pac_large_domain_list_uses_bounded_virtualized_viewport_and_filters() {
     let mut app = app();
     app.ui.page = Page::Pac;
     let mut draft = app.pac_draft();
-    draft.template_mode = xray_model::PacTemplateMode::ProxyList;
+    draft.mode = xray_model::PacMode::ProxyList;
     draft.domains = (0..2000)
         .map(|i| match i % 3 {
             0 => format!("site{i}.example.com"),
@@ -2562,12 +2729,12 @@ fn pac_large_domain_list_uses_bounded_virtualized_viewport_and_filters() {
         rendered_domains > 0 && rendered_domains < 40,
         "expected virtualized slice, got {rendered_domains}"
     );
-    // Bounded scroll area keeps Step 3–5 reachable without stretching the page.
-    let step3 = text_bounds(&output, "步骤 3 · 生成并检查模板");
+    // Bounded scroll area keeps apply card reachable without stretching the page.
+    let apply_section = text_bounds(&output, "测试与一键应用");
     assert!(
-        step3.top() < 1100.0,
-        "step 3 pushed too far down: {}",
-        step3.top()
+        apply_section.top() < 1100.0,
+        "apply section pushed too far down: {}",
+        apply_section.top()
     );
 
     // Search + kind filter + bulk selection removal.
@@ -2588,9 +2755,12 @@ fn pac_large_domain_list_uses_bounded_virtualized_viewport_and_filters() {
 }
 
 #[test]
-fn pac_extract_from_config_skips_geosite_and_explains_boundary() {
+fn pac_extract_from_config_imports_both_geosite_and_domains() {
     let mut app = app();
     app.ui.page = Page::Pac;
+    let mut draft = app.pac_draft();
+    draft.mode = xray_model::PacMode::DirectList;
+    app.save_pac_draft(draft);
     app.editor = r#"{
         "inbounds": [{"tag": "http-in", "listen": "127.0.0.1", "port": 10809, "protocol": "http"}],
         "outbounds": [{"tag": "direct", "protocol": "freedom"}],
@@ -2619,9 +2789,8 @@ fn pac_extract_from_config_skips_geosite_and_explains_boundary() {
     frame(&mut app, pointer_click(extract));
     frame(&mut app, vec![]);
     let draft = app.pac_draft();
+    assert_eq!(draft.geosites, vec!["geosite:cn"]);
     assert_eq!(draft.domains, vec!["example.com", "full:api.example.org"]);
-    assert!(app.message.contains("geosite"));
-    assert!(app.message.contains("geosite.dat"));
 }
 
 #[test]
@@ -2629,7 +2798,7 @@ fn pac_clear_all_requires_confirmation_and_empties_list() {
     let mut app = app();
     app.ui.page = Page::Pac;
     let mut draft = app.pac_draft();
-    draft.template_mode = xray_model::PacTemplateMode::ProxyList;
+    draft.mode = xray_model::PacMode::ProxyList;
     draft.domains = vec!["a.example.com".into(), "b.example.com".into()];
     app.save_pac_draft(draft);
     let ctx = egui::Context::default();
@@ -2648,7 +2817,7 @@ fn pac_clear_all_requires_confirmation_and_empties_list() {
         )
     };
     let output = frame(&mut app, vec![]);
-    let clear = text_bounds(&output, "清空全部").center();
+    let clear = text_bounds(&output, "清空清单").center();
     frame(&mut app, pointer_click(clear));
     for _ in 0..3 {
         let _ = frame(&mut app, vec![]);
@@ -2836,4 +3005,18 @@ fn proxy_lease_conflict_shows_confirmable_resolution_while_recovery_required_doe
         status.last_error = Some(Error::new("STARTUP_CONFLICT", "External task changed"));
     }
     assert!(!app.can_save_settings());
+}
+
+#[test]
+fn log_rows_show_local_timestamps_for_operations_and_localize_utc_prefixes() {
+    let mut app = app();
+    app.add_event("信息", "saved", "req-1");
+    app.logs = vec!["[2026-11-14T04:04:50.5837401Z] core running".into()];
+
+    let rows = app.log_rows();
+    assert_eq!(rows.len(), 2);
+    assert!(rows[0].1.starts_with("[操作 / 信息] [20"));
+    assert!(rows[0].1.contains("saved\nrequest_id: req-1"));
+    assert!(rows[1].1.starts_with("[Core] [2026-11-"));
+    assert!(!rows[1].1.contains("5837401Z]"));
 }

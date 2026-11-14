@@ -670,3 +670,108 @@ async fn official_failed_starts_and_successful_restarts_share_budget_on_windows(
     assert_eq!(s.last_error.as_ref().unwrap().code, "CORE_CRASH_LOOP");
     call(&mut s, Command::StopCore).await.unwrap();
 }
+
+#[tokio::test]
+async fn legacy_pac_draft_operation_verifies_without_recovery_required() {
+    let tmp = tempfile::tempdir().unwrap();
+    let s = Supervisor::with_backend(tmp.path(), FakeProxy)
+        .await
+        .unwrap();
+    let caller = s.caller();
+    let op_store = operations::OperationStore::new(tmp.path());
+    drop(s);
+
+    let req_id = "legacy-rc23-apply-req".to_string();
+    let tx_id = xray_model::id();
+    let legacy_request = json!({
+        "protocol_version": 1,
+        "request_id": req_id,
+        "expected_generation": null,
+        "command": {
+            "operation": "ApplyProfile",
+            "payload": {
+                "candidate_id": "cand-1",
+                "candidate_digest": "abc123",
+                "proxy_mode": "Pac",
+                "http_inbound_tag": "http-in",
+                "pac": {
+                    "generated": false,
+                    "template": true,
+                    "template_mode": "All",
+                    "domains": ["example.com"],
+                    "script": "",
+                    "port": 18080
+                }
+            }
+        }
+    });
+    let digest = xray_model::canonical_hash(&legacy_request).unwrap();
+    let mut identity = json!({
+        "caller": caller,
+        "request_id": req_id,
+        "digest": digest,
+        "transaction_id": tx_id,
+        "checksum": ""
+    });
+    identity["checksum"] = json!(xray_model::canonical_hash(&identity).unwrap());
+    write_json(&op_store.identity_path(&caller, &req_id), &identity).unwrap();
+
+    let mut record = json!({
+        "caller": caller,
+        "request": legacy_request,
+        "digest": digest,
+        "transaction_id": tx_id,
+        "response": {
+            "request_id": req_id,
+            "result": { "Ok": { "generation": "g1" } }
+        },
+        "recovery_required": false,
+        "evidence_version": 2,
+        "record_hash": ""
+    });
+    record["record_hash"] = json!(xray_model::canonical_hash(&record).unwrap());
+    let op_path = op_store.path(&caller, &req_id);
+    write_json(&op_path, &record).unwrap();
+
+    // Reopening against the rc.23 evidence must succeed without OPERATION_RECOVERY_REQUIRED.
+    let mut s = Supervisor::with_backend(tmp.path(), FakeProxy)
+        .await
+        .unwrap();
+    assert!(!s.blocked, "unexpected error: {:?}", s.last_error);
+    let view = call(
+        &mut s,
+        Command::GetOperation {
+            request_id: req_id.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(view["digest"], digest);
+
+    // Archiving and reloading the legacy operation must preserve raw evidence and digest consistency.
+    drop(s);
+    let loaded = op_store.get(&caller, &req_id).unwrap().unwrap();
+    let archived = loaded.archive().unwrap();
+    fs::write(&op_path, &archived).unwrap();
+    let s = Supervisor::with_backend(tmp.path(), FakeProxy)
+        .await
+        .unwrap();
+    assert!(
+        !s.blocked,
+        "unexpected error after archive: {:?}",
+        s.last_error
+    );
+    drop(s);
+
+    // Tampering a legacy dropped field inside raw JSON must still be caught as corruption.
+    record["request"]["command"]["payload"]["pac"]["template_mode"] = json!("BypassCn");
+    write_json(&op_path, &record).unwrap();
+    let s = Supervisor::with_backend(tmp.path(), FakeProxy)
+        .await
+        .unwrap();
+    assert!(s.blocked);
+    assert_eq!(
+        s.last_error.as_ref().unwrap().code,
+        "OPERATION_RECOVERY_REQUIRED"
+    );
+}

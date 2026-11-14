@@ -26,6 +26,14 @@ mod settings;
 #[path = "ui/tests.rs"]
 mod tests;
 
+#[derive(Clone, Debug)]
+pub(super) struct GeoDataCache {
+    pub asset_root: String,
+    pub stamp: (u64, Option<std::time::SystemTime>),
+    pub data: xray_config::geodata::GeoData,
+    pub categories: Vec<xray_config::geodata::GeoSiteCategorySummary>,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum Page {
     #[default]
@@ -123,6 +131,7 @@ pub(super) struct Failure {
 #[derive(Clone)]
 struct Event {
     level: &'static str,
+    timestamp: String,
     message: String,
     request: String,
     at: Instant,
@@ -194,12 +203,10 @@ pub(super) struct UiState {
     pub pac_batch_input: String,
     pub pac_batch_replace: bool,
     pub pac_batch_report: Option<String>,
-    pub pac_template_key: Option<(
-        String,
-        std::net::SocketAddr,
-        xray_model::PacTemplateMode,
-        u64,
-    )>,
+    pub pac_geosite_search: String,
+    pub pac_compile_key: Option<(String, std::net::SocketAddr, xray_model::PacMode, u64)>,
+    pub pac_compile_stats: xray_pac::PacCompileStats,
+    pub geodata_cache: Option<GeoDataCache>,
     pub restore_attempted: bool,
     pub background_hide: BackgroundHide,
     pub exit_choice: ExitKind,
@@ -287,7 +294,10 @@ impl Default for UiState {
             pac_batch_input: String::new(),
             pac_batch_replace: false,
             pac_batch_report: None,
-            pac_template_key: None,
+            pac_geosite_search: String::new(),
+            pac_compile_key: None,
+            pac_compile_stats: Default::default(),
+            geodata_cache: None,
             restore_attempted: false,
             background_hide: BackgroundHide::None,
             exit_choice: ExitKind::Gui,
@@ -632,6 +642,7 @@ impl App {
             0,
             Event {
                 level,
+                timestamp: xray_runtime::local_timestamp(),
                 message: message.into(),
                 request: request.into(),
                 at: Instant::now(),
@@ -879,12 +890,8 @@ impl App {
             return;
         }
         if matches!(kind, ExitKind::Shutdown) {
-            if let Some(status) = &self.status {
-                let running = status.core_state == "Running";
-                if self.ui.workspace.last_core_running != running {
-                    self.ui.workspace.last_core_running = running;
-                    self.save_workspace();
-                }
+            if let Some(running) = self.status.as_ref().map(|s| s.core_state == "Running") {
+                self.sync_restore_state(running, true);
             }
             self.shutdown_requested = true;
         } else if self.drafts_ready_for_exit(kind) {
@@ -1199,9 +1206,12 @@ impl App {
         if success {
             self.clear_request_failure();
             match uncertain.command {
-                Command::ApplyProfile { .. } => {
+                Command::ApplyProfile {
+                    proxy_mode, pac, ..
+                } => {
                     // The captured JSON, rather than today's selected editor, was applied.
                     self.applied_draft(&uncertain.profile, uncertain.json.as_deref());
+                    self.note_applied_proxy(proxy_mode, pac.as_ref());
                     self.invalidate_candidate();
                     self.ui.onboarding = false;
                     self.refresh_profiles();
@@ -1210,6 +1220,11 @@ impl App {
                             profile_id: uncertain.profile,
                         });
                     }
+                }
+                Command::SetProxyMode { mode, pac, .. } => {
+                    self.note_applied_proxy(mode, pac.as_ref());
+                    self.invalidate_candidate();
+                    self.refresh_profiles();
                 }
                 Command::CreateProfile { profile_id, .. } => {
                     self.send(Command::GetProfile { profile_id });

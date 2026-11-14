@@ -135,12 +135,10 @@ async fn pac_apply_publishes_immutable_script_sets_proxy_and_releases_cleanly() 
             proxy_mode: ProxyMode::Pac,
             http_inbound_tag: "http-in".into(),
             pac: Some(PacDraft {
-                generated: false,
-                template: false,
-                template_mode: Default::default(),
-                domains: Vec::new(),
+                mode: xray_model::PacMode::Custom,
                 script: script.into(),
                 port: pac_port,
+                ..Default::default()
             }),
         },
     )
@@ -169,7 +167,7 @@ async fn pac_apply_publishes_immutable_script_sets_proxy_and_releases_cleanly() 
 }
 
 #[tokio::test]
-async fn empty_pac_script_auto_generates_from_native_domain_rules() {
+async fn default_pac_draft_auto_generates_from_native_domain_rules() {
     let _guard = serial().await;
     let tmp = tempfile::tempdir().unwrap();
     let proxy = FakeProxy(Arc::new(Mutex::new(ProxySnapshot::default())));
@@ -186,12 +184,9 @@ async fn empty_pac_script_auto_generates_from_native_domain_rules() {
             proxy_mode: ProxyMode::Pac,
             http_inbound_tag: "http-in".into(),
             pac: Some(PacDraft {
-                generated: false,
-                template: false,
-                template_mode: Default::default(),
-                domains: Vec::new(),
-                script: String::new(),
+                mode: xray_model::PacMode::AutoRules,
                 port: pac_port,
+                ..Default::default()
             }),
         },
     )
@@ -208,7 +203,12 @@ async fn empty_pac_script_auto_generates_from_native_domain_rules() {
         .clone();
     let body = http_get(&url).await;
     let script = body.split("\r\n\r\n").nth(1).unwrap_or_default();
-    assert!(script.contains("host === \"direct.example\""));
+    assert_eq!(
+        xray_pac::evaluate(script, "https://direct.example/")
+            .unwrap()
+            .kind,
+        "DIRECT"
+    );
     assert!(script.contains("return \"PROXY 127.0.0.1:"));
     send(&mut s, Command::StopCore).await.unwrap();
 }
@@ -230,12 +230,10 @@ async fn invalid_pac_never_changes_the_proxy_and_port_conflicts_fail_closed() {
             proxy_mode: ProxyMode::Pac,
             http_inbound_tag: "http-in".into(),
             pac: Some(PacDraft {
-                generated: false,
-                template: false,
-                template_mode: Default::default(),
-                domains: Vec::new(),
+                mode: xray_model::PacMode::Custom,
                 script: "not a pac".into(),
                 port: port(),
+                ..Default::default()
             }),
         },
     )
@@ -254,12 +252,10 @@ async fn invalid_pac_never_changes_the_proxy_and_port_conflicts_fail_closed() {
             proxy_mode: ProxyMode::Pac,
             http_inbound_tag: "http-in".into(),
             pac: Some(PacDraft {
-                generated: false,
-                template: false,
-                template_mode: Default::default(),
-                domains: Vec::new(),
+                mode: xray_model::PacMode::Custom,
                 script: "function FindProxyForURL(){return 'DIRECT';}".into(),
                 port: occupied_port,
+                ..Default::default()
             }),
         },
     )
@@ -287,12 +283,10 @@ async fn pac_startup_without_auto_connect_releases_even_if_the_service_is_rebuil
             proxy_mode: ProxyMode::Pac,
             http_inbound_tag: "http-in".into(),
             pac: Some(PacDraft {
-                generated: false,
-                template: false,
-                template_mode: Default::default(),
-                domains: Vec::new(),
+                mode: xray_model::PacMode::Custom,
                 script: "function FindProxyForURL(){return 'DIRECT';}".into(),
                 port: pac_port,
+                ..Default::default()
             }),
         },
     )
@@ -331,12 +325,10 @@ async fn pac_port_change_keeps_old_listener_through_commit_then_moves_service() 
             proxy_mode: ProxyMode::Pac,
             http_inbound_tag: "http-in".into(),
             pac: Some(PacDraft {
-                generated: false,
-                template: false,
-                template_mode: Default::default(),
-                domains: Vec::new(),
+                mode: xray_model::PacMode::Custom,
                 script: first_script.into(),
                 port: first_port,
+                ..Default::default()
             }),
         },
     )
@@ -358,12 +350,10 @@ async fn pac_port_change_keeps_old_listener_through_commit_then_moves_service() 
             mode: ProxyMode::Pac,
             http_inbound_tag: "http-in".into(),
             pac: Some(PacDraft {
-                generated: false,
-                template: false,
-                template_mode: Default::default(),
-                domains: Vec::new(),
+                mode: xray_model::PacMode::Custom,
                 script: "function FindProxyForURL(){ return 'PROXY 127.0.0.1:20809'; }".into(),
                 port: second_port,
+                ..Default::default()
             }),
         },
     )
@@ -403,12 +393,10 @@ async fn same_port_keeps_previous_revision_available_until_release() {
             proxy_mode: ProxyMode::Pac,
             http_inbound_tag: "http-in".into(),
             pac: Some(PacDraft {
-                generated: false,
-                template: false,
-                template_mode: Default::default(),
-                domains: Vec::new(),
+                mode: xray_model::PacMode::Custom,
                 script: "function FindProxyForURL(){ return 'DIRECT'; }".into(),
                 port: pac_port,
+                ..Default::default()
             }),
         },
     )
@@ -429,12 +417,10 @@ async fn same_port_keeps_previous_revision_available_until_release() {
             mode: ProxyMode::Pac,
             http_inbound_tag: "http-in".into(),
             pac: Some(PacDraft {
-                generated: false,
-                template: false,
-                template_mode: Default::default(),
-                domains: Vec::new(),
+                mode: xray_model::PacMode::Custom,
                 script: "function FindProxyForURL(){ return 'PROXY 127.0.0.1:10809'; }".into(),
                 port: pac_port,
+                ..Default::default()
             }),
         },
     )
@@ -463,12 +449,10 @@ async fn failed_pac_candidate_restores_previous_publication_and_proxy() {
             proxy_mode: ProxyMode::Pac,
             http_inbound_tag: "http-in".into(),
             pac: Some(PacDraft {
-                generated: false,
-                template: false,
-                template_mode: Default::default(),
-                domains: Vec::new(),
+                mode: xray_model::PacMode::Custom,
                 script: "function FindProxyForURL(){ return 'DIRECT'; }".into(),
                 port: pac_port,
+                ..Default::default()
             }),
         },
     )
@@ -489,12 +473,10 @@ async fn failed_pac_candidate_restores_previous_publication_and_proxy() {
             proxy_mode: ProxyMode::Pac,
             http_inbound_tag: "http-in".into(),
             pac: Some(PacDraft {
-                generated: false,
-                template: false,
-                template_mode: Default::default(),
-                domains: Vec::new(),
+                mode: xray_model::PacMode::Custom,
                 script: "function FindProxyForURL(){ return 'PROXY 127.0.0.1:10809'; }".into(),
                 port: new_port,
+                ..Default::default()
             }),
         },
     )
@@ -538,12 +520,10 @@ async fn pac_auto_connect_reuses_committed_publication() {
             proxy_mode: ProxyMode::Pac,
             http_inbound_tag: "http-in".into(),
             pac: Some(PacDraft {
-                generated: false,
-                template: false,
-                template_mode: Default::default(),
-                domains: Vec::new(),
+                mode: xray_model::PacMode::Custom,
                 script: "function FindProxyForURL(){ return 'DIRECT'; }".into(),
                 port: pac_port,
+                ..Default::default()
             }),
         },
     )
@@ -579,12 +559,9 @@ async fn generated_pac_follows_http_inbound_port_changes() {
             proxy_mode: ProxyMode::Pac,
             http_inbound_tag: "http-in".into(),
             pac: Some(PacDraft {
-                generated: true,
-                template: false,
-                template_mode: Default::default(),
-                domains: Vec::new(),
-                script: String::new(),
+                mode: xray_model::PacMode::AutoRules,
                 port: pac_port,
+                ..Default::default()
             }),
         },
     )
@@ -603,12 +580,9 @@ async fn generated_pac_follows_http_inbound_port_changes() {
             proxy_mode: ProxyMode::Pac,
             http_inbound_tag: "http-in".into(),
             pac: Some(PacDraft {
-                generated: true,
-                template: false,
-                template_mode: Default::default(),
-                domains: Vec::new(),
-                script: String::new(),
+                mode: xray_model::PacMode::AutoRules,
                 port: pac_port,
+                ..Default::default()
             }),
         },
     )
@@ -639,12 +613,9 @@ async fn builtin_template_is_used_without_manual_script_editing() {
             proxy_mode: ProxyMode::Pac,
             http_inbound_tag: "http-in".into(),
             pac: Some(PacDraft {
-                generated: false,
-                template: true,
-                template_mode: Default::default(),
-                domains: Vec::new(),
-                script: String::new(),
+                mode: xray_model::PacMode::All,
                 port: pac_port,
+                ..Default::default()
             }),
         },
     )
@@ -697,12 +668,10 @@ async fn builtin_template_domain_list_limits_which_hosts_use_the_proxy() {
             proxy_mode: ProxyMode::Pac,
             http_inbound_tag: "http-in".into(),
             pac: Some(PacDraft {
-                generated: false,
-                template: true,
-                template_mode: xray_model::PacTemplateMode::ProxyList,
+                mode: xray_model::PacMode::ProxyList,
                 domains: vec!["example.com".into()],
-                script: String::new(),
                 port: pac_port,
+                ..Default::default()
             }),
         },
     )
@@ -753,12 +722,9 @@ async fn empty_proxy_list_directs_all_regular_hosts() {
             proxy_mode: ProxyMode::Pac,
             http_inbound_tag: "http-in".into(),
             pac: Some(PacDraft {
-                generated: false,
-                template: true,
-                template_mode: xray_model::PacTemplateMode::ProxyList,
-                domains: Vec::new(),
-                script: String::new(),
+                mode: xray_model::PacMode::ProxyList,
                 port: pac_port,
+                ..Default::default()
             }),
         },
     )
@@ -786,6 +752,95 @@ async fn empty_proxy_list_directs_all_regular_hosts() {
             .unwrap()
             .kind,
         "DIRECT"
+    );
+    send(&mut s, Command::StopCore).await.unwrap();
+}
+
+#[tokio::test]
+async fn autorules_and_direct_list_expand_geosite_from_asset_root() {
+    let _guard = serial().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let proxy = FakeProxy(Arc::new(Mutex::new(ProxySnapshot::default())));
+    let mut s = setup(&tmp, proxy).await;
+    let geosite_bytes = xray_config::geodata::test_encoder::encode_geosite_list(&[
+        ("cn", &[(2, "baidu.com", &[][..])][..]),
+        ("apple-cn", &[(2, "apple.com", &[][..])][..]),
+    ]);
+    std::fs::write(s.store.root.join("geosite.dat"), geosite_bytes).unwrap();
+    let core = fixture(tmp.path());
+    let http_port = port();
+    // 1) AutoRules with geosite:cn in routing rules
+    let geo_config = serde_json::json!({
+        "inbounds": [{"tag": "http-in", "listen": "127.0.0.1", "port": http_port, "protocol": "http"}],
+        "outbounds": [{"tag": "proxy", "protocol": "vless"}, {"tag": "direct", "protocol": "freedom"}],
+        "routing": {"rules": [{"type": "field", "domain": ["geosite:cn"], "outboundTag": "direct"}]}
+    })
+    .to_string();
+    let c1 = candidate(&mut s, &core, &geo_config).await;
+    let pac_port = port();
+    send(
+        &mut s,
+        Command::ApplyProfile {
+            candidate_id: c1.id,
+            candidate_digest: c1.digest,
+            proxy_mode: ProxyMode::Pac,
+            http_inbound_tag: "http-in".into(),
+            pac: Some(PacDraft {
+                mode: xray_model::PacMode::AutoRules,
+                port: pac_port,
+                ..Default::default()
+            }),
+        },
+    )
+    .await
+    .unwrap();
+    let body = http_get(&s.generation.as_ref().unwrap().pac.as_ref().unwrap().url).await;
+    let script = body.split("\r\n\r\n").nth(1).unwrap_or_default();
+    assert_eq!(
+        xray_pac::evaluate(script, "https://www.baidu.com/")
+            .unwrap()
+            .kind,
+        "DIRECT"
+    );
+    assert_eq!(
+        xray_pac::evaluate(script, "https://www.google.com/")
+            .unwrap()
+            .kind,
+        "PROXY"
+    );
+
+    // 2) DirectList using geosite:apple-cn even when config routing rules are empty (falls back to asset_root)
+    let plain_c = candidate(&mut s, &core, &config(http_port)).await;
+    send(
+        &mut s,
+        Command::ApplyProfile {
+            candidate_id: plain_c.id,
+            candidate_digest: plain_c.digest,
+            proxy_mode: ProxyMode::Pac,
+            http_inbound_tag: "http-in".into(),
+            pac: Some(PacDraft {
+                mode: xray_model::PacMode::DirectList,
+                geosites: vec!["geosite:apple-cn".into()],
+                port: pac_port,
+                ..Default::default()
+            }),
+        },
+    )
+    .await
+    .unwrap();
+    let body2 = http_get(&s.generation.as_ref().unwrap().pac.as_ref().unwrap().url).await;
+    let script2 = body2.split("\r\n\r\n").nth(1).unwrap_or_default();
+    assert_eq!(
+        xray_pac::evaluate(script2, "https://www.apple.com/")
+            .unwrap()
+            .kind,
+        "DIRECT"
+    );
+    assert_eq!(
+        xray_pac::evaluate(script2, "https://www.google.com/")
+            .unwrap()
+            .kind,
+        "PROXY"
     );
     send(&mut s, Command::StopCore).await.unwrap();
 }

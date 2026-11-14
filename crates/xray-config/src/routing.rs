@@ -16,11 +16,18 @@ fn and(a: Match, b: Match) -> Match {
         Match::Yes
     }
 }
-fn domain(pattern: &str, host: &str) -> Match {
+fn domain(pattern: &str, host: &str, geo: Option<&crate::geodata::GeoData>) -> Match {
     let host = host.to_ascii_lowercase();
     let p = pattern.to_ascii_lowercase();
     if host.is_empty() {
         return Match::Unknown;
+    }
+    if p.starts_with("geosite:") || p.starts_with("ext:") {
+        return match geo.and_then(|g| g.matches_domain_spec(&p, &host)) {
+            Some(true) => Match::Yes,
+            Some(false) => Match::No,
+            None => Match::Unknown,
+        };
     }
     if let Some(p) = p.strip_prefix("full:") {
         return if host == p { Match::Yes } else { Match::No };
@@ -57,10 +64,18 @@ fn any(values: &Value, mut check: impl FnMut(&str) -> Match) -> Match {
     }
     result
 }
-fn ip_match(pattern: &str, target: Option<&str>) -> Match {
+fn ip_match(pattern: &str, target: Option<&str>, geo: Option<&crate::geodata::GeoData>) -> Match {
     let Some(ip) = target.and_then(|s| s.parse::<std::net::IpAddr>().ok()) else {
         return Match::Unknown;
     };
+    let lower = pattern.to_ascii_lowercase();
+    if lower.starts_with("geoip:") || lower.starts_with("ext:") {
+        return match geo.and_then(|g| g.matches_ip_spec(pattern, ip)) {
+            Some(true) => Match::Yes,
+            Some(false) => Match::No,
+            None => Match::Unknown,
+        };
+    }
     let (address, bits) = if let Some((address, prefix)) = pattern.split_once('/') {
         let Ok(bits) = prefix.parse::<u32>() else {
             return Match::Unknown;
@@ -117,6 +132,13 @@ fn port_match(value: &Value, port: u16) -> Match {
     if unknown { Match::Unknown } else { Match::No }
 }
 pub fn simulate(config: &Value, context: &RouteContext) -> RouteResult {
+    simulate_with_geo(config, context, None)
+}
+pub fn simulate_with_geo(
+    config: &Value,
+    context: &RouteContext,
+    geo: Option<&crate::geodata::GeoData>,
+) -> RouteResult {
     let result = |state: &str, index, outbound, reason: String| RouteResult {
         kind: "StaticSimulation".into(),
         match_state: state.into(),
@@ -158,7 +180,7 @@ pub fn simulate(config: &Value, context: &RouteContext) -> RouteResult {
                 let m = match key.as_str() {
                     "type" if value.as_str() == Some("field") => Match::Yes,
                     "outboundTag" | "ruleTag" => Match::Yes,
-                    "domain" => any(value, |s| domain(s, &context.host)),
+                    "domain" => any(value, |s| domain(s, &context.host, geo)),
                     "inboundTag" => context
                         .inbound_tag
                         .as_deref()
@@ -180,11 +202,11 @@ pub fn simulate(config: &Value, context: &RouteContext) -> RouteResult {
                         .port
                         .map(|port| port_match(value, port))
                         .unwrap_or(Match::Unknown),
-                    "ip" => any(value, |s| ip_match(s, context.target_ip.as_deref())),
+                    "ip" => any(value, |s| ip_match(s, context.target_ip.as_deref(), geo)),
                     "source" => context
                         .source_ip
                         .as_deref()
-                        .map(|source| any(value, |s| ip_match(s, Some(source))))
+                        .map(|source| any(value, |s| ip_match(s, Some(source), geo)))
                         .unwrap_or(Match::Unknown),
                     "sourcePort" => context
                         .source_port
@@ -375,5 +397,51 @@ mod extended_tests {
             ),
             Some("a".into())
         );
+    }
+
+    #[test]
+    fn geosite_and_geoip_rules_resolve_when_geodata_is_provided() {
+        use crate::geodata::{
+            GeoData, GeoIpIndex, GeoSiteIndex,
+            test_encoder::{encode_geoip_list, encode_geosite_list},
+        };
+        let site =
+            GeoSiteIndex::parse(&encode_geosite_list(&[("cn", &[(2, "baidu.com", &[])])])).unwrap();
+        let ip = GeoIpIndex::parse(&encode_geoip_list(&[(
+            "cn",
+            &[(&[223, 5, 5, 0], 24)],
+            false,
+        )]))
+        .unwrap();
+        let geo = GeoData::from_indexes(Some(site), Some(ip));
+        let config = serde_json::json!({
+            "outbounds": [{"tag":"proxy","protocol":"vless"},{"tag":"direct","protocol":"freedom"}],
+            "routing": {"rules":[
+                {"type":"field","domain":["geosite:cn"],"outboundTag":"direct"},
+                {"type":"field","ip":["geoip:cn"],"outboundTag":"direct"}
+            ]}
+        });
+        let hit_site = simulate_with_geo(
+            &config,
+            &RouteContext {
+                host: "www.baidu.com".into(),
+                ..Default::default()
+            },
+            Some(&geo),
+        );
+        assert_eq!(hit_site.match_state, "MatchKnown");
+        assert_eq!(hit_site.expected_outbound.as_deref(), Some("direct"));
+
+        let hit_ip = simulate_with_geo(
+            &config,
+            &RouteContext {
+                host: "example.com".into(),
+                target_ip: Some("223.5.5.5".into()),
+                ..Default::default()
+            },
+            Some(&geo),
+        );
+        assert_eq!(hit_ip.match_state, "MatchKnown");
+        assert_eq!(hit_ip.expected_outbound.as_deref(), Some("direct"));
     }
 }
