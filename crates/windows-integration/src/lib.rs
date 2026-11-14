@@ -149,10 +149,11 @@ impl<B: ProxyBackend> ProxyController<B> {
             && lease.state != LeaseState::Released
             && (lease.state == LeaseState::Conflict || current != lease.expected)
         {
+            let detail = Self::conflict_detail(&current, lease);
             self.conflict()?;
             return Err(Error::new(
                 "PROXY_LEASE_CONFLICT",
-                "System proxy changed outside this manager",
+                format!("System proxy changed outside this manager ({detail})"),
             ));
         }
         if self
@@ -199,6 +200,45 @@ impl<B: ProxyBackend> ProxyController<B> {
         }
         self.persist()
     }
+    fn snapshot_summary(s: &ProxySnapshot) -> String {
+        format!(
+            "flags={:#x} server={:?} bypass={:?} pac_url={:?}",
+            s.flags, s.server, s.bypass, s.pac_url
+        )
+    }
+    fn conflict_detail(current: &ProxySnapshot, lease: &Lease) -> String {
+        format!(
+            "state={:?}; current=({}); expected=({}); root=({})",
+            lease.state,
+            Self::snapshot_summary(current),
+            Self::snapshot_summary(&lease.expected),
+            Self::snapshot_summary(&lease.root)
+        )
+    }
+    /// Resolves a `Conflict` lease by preserving the external system proxy as the new baseline without writing WinINet.
+    pub fn acknowledge_conflict(&mut self) -> Result<ProxySnapshot> {
+        self.ensure_healthy()?;
+        let Some(lease) = self.lease.as_ref() else {
+            return Err(Error::new(
+                "INVALID_OPERATION",
+                "No proxy lease is currently in conflict",
+            ));
+        };
+        if lease.state != LeaseState::Conflict {
+            return Err(Error::new(
+                "INVALID_OPERATION",
+                "Proxy lease is not in conflict state",
+            ));
+        }
+        let current = self.backend.read()?;
+        let l = self.lease.as_mut().unwrap();
+        l.root = current.clone();
+        l.expected = current.clone();
+        l.pending = None;
+        l.state = LeaseState::Released;
+        self.persist()?;
+        Ok(current)
+    }
     /// Startup safety always releases an owned setting, including a write completed before bookkeeping.
     pub fn release(&mut self) -> Result<()> {
         self.ensure_healthy()?;
@@ -220,10 +260,11 @@ impl<B: ProxyBackend> ProxyController<B> {
                 .as_ref()
                 .is_some_and(|p| current == p.target || current == p.before);
         if !known || lease.state == LeaseState::Conflict {
+            let detail = Self::conflict_detail(&current, &lease);
             self.conflict()?;
             return Err(Error::new(
                 "PROXY_LEASE_CONFLICT",
-                "External system proxy settings preserved",
+                format!("External system proxy settings preserved ({detail})"),
             ));
         }
         self.lease.as_mut().unwrap().pending = Some(Transition {
@@ -256,10 +297,17 @@ impl<B: ProxyBackend> ProxyController<B> {
                 current == l.expected || l.pending.as_ref().is_some_and(|p| current == p.target)
             });
             if !recognized {
+                let detail = self
+                    .lease
+                    .as_ref()
+                    .map(|l| Self::conflict_detail(&current, l))
+                    .unwrap_or_else(|| Self::snapshot_summary(&current));
                 self.conflict()?;
                 return Err(Error::new(
                     "PROXY_LEASE_CONFLICT",
-                    "External system proxy settings preserved during compensation",
+                    format!(
+                        "External system proxy settings preserved during compensation ({detail})"
+                    ),
                 ));
             }
             // Persist compensation intent before the Windows write, preserving the root snapshot.
@@ -491,5 +539,39 @@ mod tests {
         let proxy = ProxyController::open(proxy.backend, tmp.path()).unwrap();
         assert!(proxy.recovery_error().is_none());
         assert_eq!(proxy.state(), "Released");
+    }
+
+    #[test]
+    fn acknowledging_conflict_preserves_external_proxy_and_allows_reopening() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut proxy = ProxyController::open(Fake(ProxySnapshot::default()), tmp.path()).unwrap();
+        proxy
+            .transition(global("127.0.0.1:10809".parse().unwrap()))
+            .unwrap();
+        let external = ProxySnapshot {
+            flags: 3,
+            server: "external:8888".into(),
+            bypass: "<local>".into(),
+            pac_url: String::new(),
+        };
+        proxy.backend.0 = external.clone();
+        let err = proxy.release().unwrap_err();
+        assert_eq!(err.code, "PROXY_LEASE_CONFLICT");
+        assert!(err.message.contains("external:8888"));
+        assert_eq!(proxy.state(), "Conflict");
+
+        let preserved = proxy.acknowledge_conflict().unwrap();
+        assert_eq!(preserved, external);
+        assert_eq!(proxy.backend.0, external);
+        assert_eq!(proxy.state(), "Released");
+
+        let mut reopened = ProxyController::open(proxy.backend, tmp.path()).unwrap();
+        assert!(reopened.recovery_error().is_none());
+        assert_eq!(reopened.state(), "Released");
+        reopened
+            .transition(global("127.0.0.1:20809".parse().unwrap()))
+            .unwrap();
+        reopened.release().unwrap();
+        assert_eq!(reopened.backend.0, external);
     }
 }

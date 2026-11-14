@@ -188,9 +188,18 @@ impl<B: ProxyBackend> Supervisor<B> {
             // Invalid manager metadata must not prevent cleanup of an independently recorded lease.
             let cleanup = supervisor.proxy.release();
             supervisor.blocked = true;
-            supervisor.last_error = Some(cleanup.err().unwrap_or(e));
+            let err = cleanup.err().unwrap_or(e);
+            xray_runtime::log(
+                &supervisor.logs,
+                format!("Startup recovery blocked: {}: {}", err.code, err.message),
+            );
+            supervisor.last_error = Some(err);
         } else if let Err(e) = supervisor.recover().await {
             supervisor.blocked = true;
+            xray_runtime::log(
+                &supervisor.logs,
+                format!("Startup recovery blocked: {}: {}", e.code, e.message),
+            );
             supervisor.last_error = Some(e);
         }
         Ok(supervisor)
@@ -370,7 +379,9 @@ impl<B: ProxyBackend> Supervisor<B> {
     pub async fn handle(&mut self, request: Request) -> Response {
         let request_id = request.request_id.clone();
         let result = self.dispatch(request).await;
-        if let Err(e) = &result {
+        if let Err(e) = &result
+            && !(self.blocked && self.last_error.is_some() && e.code == "RECOVERY_REQUIRED")
+        {
             self.last_error = Some(e.clone());
         }
         Response { request_id, result }
@@ -534,12 +545,26 @@ impl<B: ProxyBackend> Supervisor<B> {
                 ))
             });
         }
-        if !self.blocked && !matches!(request.command, Command::StopCore | Command::Shutdown) {
+        let allow_settings_during_recovery =
+            matches!(request.command, Command::SaveSettings { .. })
+                && (!self.blocked || self.can_save_settings_during_recovery().unwrap_or(false));
+        if !self.blocked
+            && !matches!(
+                request.command,
+                Command::StopCore | Command::Shutdown | Command::ResolveProxyConflict
+            )
+        {
             // New identities also require an intact evidence set, including legacy orphan journals.
             let audit = self.operations.all();
             self.operation_read(audit)?;
         }
-        if self.blocked && !matches!(request.command, Command::StopCore | Command::Shutdown) {
+        if self.blocked
+            && !matches!(
+                request.command,
+                Command::StopCore | Command::Shutdown | Command::ResolveProxyConflict
+            )
+            && !allow_settings_during_recovery
+        {
             return Err(Error::new(
                 "RECOVERY_REQUIRED",
                 "Unresolved recovery; inspect status and repair before writing",
@@ -590,6 +615,7 @@ impl<B: ProxyBackend> Supervisor<B> {
                     | Command::SetProxyMode { .. }
                     | Command::RestartCore
                     | Command::StopCore
+                    | Command::ResolveProxyConflict
                     | Command::Shutdown
             )
         {
@@ -837,6 +863,9 @@ impl<B: ProxyBackend> Supervisor<B> {
                 }
                 self.settings = settings.clone();
                 Ok(json!({"saved":true}))
+            }
+            Command::ResolveProxyConflict => {
+                self.resolve_proxy_conflict(&op.request.request_id).await
             }
             _ => Err(Error::new(
                 "INVALID_OPERATION",
@@ -1213,6 +1242,10 @@ impl<B: ProxyBackend> Supervisor<B> {
             return Err(e);
         }
         if let Err(e) = proxy_result {
+            xray_runtime::log(
+                &self.logs,
+                format!("StopCore proxy release blocked: {}: {}", e.code, e.message),
+            );
             self.blocked = true;
             self.last_error = Some(e);
         }
@@ -1300,6 +1333,98 @@ impl<B: ProxyBackend> Supervisor<B> {
                 || self.startup.pending(&op.transaction_id)?
                 || self.pending_effect(op)?,
         )
+    }
+
+    fn can_save_settings_during_recovery(&mut self) -> Result<bool> {
+        if optional_json::<String>(&self.store.root.join("runtime/installation.json"))?.is_none() {
+            return Ok(false);
+        }
+        let _ = optional_json::<Settings>(&self.store.root.join("config/manager.json"))?;
+        if self.startup.recover().is_err() {
+            return Ok(false);
+        }
+        for entry in fs::read_dir(self.store.root.join("runtime/transactions"))? {
+            let dir = entry?.path();
+            let settings_journal = dir.join("settings.json");
+            if settings_journal.exists()
+                && let Some(tx) = dir.file_name().and_then(|n| n.to_str())
+                && self.startup.pending(tx)?
+            {
+                return Ok(false);
+            }
+        }
+        for op in self.operations.all()? {
+            if matches!(op.request.command, Command::SaveSettings { .. })
+                && (op.recovery_required || op.response.is_none())
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn verify_non_proxy_recovery_clean(&mut self, current_request_id: &str) -> Result<()> {
+        if optional_json::<String>(&self.store.root.join("runtime/installation.json"))?.is_none() {
+            return Err(Error::new(
+                "INSTALLATION_ID_MISSING",
+                "Restore installation.json to preserve request deduplication",
+            ));
+        }
+        let _ = optional_json::<Settings>(&self.store.root.join("config/manager.json"))?;
+        let _ = optional_json::<Generation>(&self.store.root.join("runtime/active-manifest.json"))?;
+        self.startup.recover()?;
+        self.settings = optional_json::<Settings>(&self.store.root.join("config/manager.json"))?
+            .unwrap_or_default();
+        for entry in fs::read_dir(self.store.root.join("runtime/transactions"))? {
+            let path = entry?.path().join("journal.json");
+            if path.exists() && !read_json::<Journal>(&path)?.settled {
+                return Err(Error::new(
+                    "RECOVERY_REQUIRED",
+                    "Unsettled runtime journal remains; repair before clearing proxy conflict",
+                ));
+            }
+        }
+        for op in self.operations.all()? {
+            if op.request.request_id != current_request_id
+                && (op.recovery_required || op.response.is_none())
+            {
+                return Err(Error::new(
+                    "RECOVERY_REQUIRED",
+                    "Pending recovery operation remains; resolve it before clearing proxy conflict",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    async fn resolve_proxy_conflict(&mut self, current_request_id: &str) -> Result<Value> {
+        if let Some(err) = self.proxy.recovery_error() {
+            return Err(err.clone());
+        }
+        if self.proxy.state() != "Conflict" {
+            return Err(Error::new(
+                "INVALID_OPERATION",
+                "Proxy lease is not in conflict state",
+            ));
+        }
+        self.verify_non_proxy_recovery_clean(current_request_id)?;
+        let preserved = self.proxy.acknowledge_conflict()?;
+        if self.core.is_none() && matches!(self.proxy.state().as_str(), "Released" | "Unmanaged") {
+            self.prune_pac_servers(&[]).await;
+        }
+        self.blocked = false;
+        self.last_error = None;
+        xray_runtime::log(
+            &self.logs,
+            format!(
+                "Proxy lease conflict acknowledged; external system proxy preserved (flags={:#x})",
+                preserved.flags
+            ),
+        );
+        Ok(json!({
+            "resolved": true,
+            "proxy_state": self.proxy.state(),
+        }))
     }
     async fn recover(&mut self) -> Result<()> {
         self.logs.set_context(Some(format!(

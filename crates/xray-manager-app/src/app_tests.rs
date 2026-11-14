@@ -864,6 +864,42 @@ fn recovery_allows_safe_stop_but_blocks_normal_writes() {
 }
 
 #[test]
+fn proxy_conflict_recovery_allows_resolve_and_save_settings_while_blocking_core_writes() {
+    let mut h = Harness::new();
+    let mut s = status(None);
+    s.recovery_required = true;
+    s.proxy_state = "Conflict".into();
+    s.last_error = Some(Error::new("PROXY_LEASE_CONFLICT", "External change"));
+    h.app.status = Some(s);
+
+    h.app.send(Command::RestartCore);
+    h.app.send(Command::SetProxyMode {
+        mode: ProxyMode::Global,
+        http_inbound_tag: "http-in".into(),
+        pac: None,
+    });
+    assert!(!h.requests.try_iter().any(|r| r.command.is_write()));
+
+    let resolve = h.send(Command::ResolveProxyConflict);
+    assert!(matches!(resolve.command, Command::ResolveProxyConflict));
+    h.app.busy = false;
+
+    let mut settings = h.app.settings.clone();
+    settings.start_on_logon = false;
+    let save = h.send(Command::SaveSettings { settings });
+    assert!(matches!(save.command, Command::SaveSettings { .. }));
+    h.app.busy = false;
+
+    if let Some(status) = h.app.status.as_mut() {
+        status.last_error = Some(Error::new("STARTUP_CONFLICT", "External task changed"));
+    }
+    h.app.send(Command::SaveSettings {
+        settings: h.app.settings.clone(),
+    });
+    assert!(!h.requests.try_iter().any(|r| r.command.is_write()));
+}
+
+#[test]
 fn deleting_a_profile_does_not_clear_a_different_editors_draft() {
     let mut h = Harness::new();
     let deletion = h.send(Command::DeleteProfile {

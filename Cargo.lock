@@ -4397,7 +4397,7 @@ checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
 name = "windows-integration"
-version = "0.1.1-rc.21"
+version = "0.1.1-rc.22"
 dependencies = [
  "serde",
  "serde_json",
@@ -4750,7 +4750,7 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
 name = "xray-config"
-version = "0.1.1-rc.21"
+version = "0.1.1-rc.22"
 dependencies = [
  "fs2",
  "serde",
@@ -4762,7 +4762,7 @@ dependencies = [
 
 [[package]]
 name = "xray-manager-app"
-version = "0.1.1-rc.21"
+version = "0.1.1-rc.22"
 dependencies = [
  "eframe",
  "raw-window-handle",
@@ -4783,7 +4783,7 @@ dependencies = [
 
 [[package]]
 name = "xray-model"
-version = "0.1.1-rc.21"
+version = "0.1.1-rc.22"
 dependencies = [
  "serde",
  "serde_json",
@@ -4793,7 +4793,7 @@ dependencies = [
 
 [[package]]
 name = "xray-pac"
-version = "0.1.1-rc.21"
+version = "0.1.1-rc.22"
 dependencies = [
  "boa_engine",
  "serde",
@@ -4805,7 +4805,7 @@ dependencies = [
 
 [[package]]
 name = "xray-runtime"
-version = "0.1.1-rc.21"
+version = "0.1.1-rc.22"
 dependencies = [
  "base64",
  "serde_json",
@@ -4818,7 +4818,7 @@ dependencies = [
 
 [[package]]
 name = "xray-supervisor"
-version = "0.1.1-rc.21"
+version = "0.1.1-rc.22"
 dependencies = [
  "flate2",
  "serde",

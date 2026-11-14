@@ -20,7 +20,7 @@ impl App {
                 SettingsTab::Core => self.core_settings(ui),
                 SettingsTab::Startup => {
                     ui.label(RichText::new("启动行为").strong().size(18.0));
-                    ui.add_enabled_ui(self.write_blocker().is_none(), |ui| {
+                    ui.add_enabled_ui(self.can_save_settings(), |ui| {
                         ui.checkbox(
                             &mut self.settings.start_on_logon,
                             "登录 Windows 后自启（隐藏到系统托盘）",
@@ -123,11 +123,20 @@ impl App {
                 SettingsTab::Core | SettingsTab::Startup
             ) {
                 ui.separator();
-                if primary(ui, "保存设置", self.write_blocker().is_none()) {
+                if primary(ui, "保存设置", self.can_save_settings()) {
                     self.settings.core_path = self.core_path.clone().into();
                     self.send(Command::SaveSettings {
                         settings: self.settings.clone(),
                     });
+                }
+                if self.status.as_ref().is_some_and(|s| s.recovery_required)
+                    && self.can_save_settings()
+                {
+                    ui.label(
+                        RichText::new("当前处于安全恢复状态，仍可修改并保存启动或路径设置（如取消开机自启）；运行变更请先处理恢复。")
+                            .small()
+                            .weak(),
+                    );
                 }
                 ui.label(
                     RichText::new("保存设置不会替换运行中的 Core；请重新检查配置并确认应用。")
@@ -141,7 +150,7 @@ impl App {
         }
     }
     pub(in crate::app) fn core_settings(&mut self, ui: &mut egui::Ui) {
-        let enabled = self.write_blocker().is_none();
+        let enabled = self.can_save_settings();
         ui.label(RichText::new("Core 与依赖").strong().size(18.0));
         ui.label("从官方来源准备 Xray Core、geoip.dat 与 geosite.dat，校验后按版本管理。");
         ui.hyperlink_to(

@@ -77,6 +77,7 @@ pub(super) enum Action {
     Proxy(ProxyMode),
     AdoptDraft(String),
     ClearPacDomains(String),
+    ResolveProxyConflict,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ExitKind {
@@ -480,6 +481,7 @@ pub(super) fn command_name(command: &Command) -> &'static str {
         Command::SaveSettings { .. } => "保存设置",
         Command::StopCore => "停止 Core",
         Command::RestartCore => "重启 Core",
+        Command::ResolveProxyConflict => "解除代理冲突",
         Command::SetProxyMode { .. } => "切换系统代理",
         Command::Shutdown => "退出程序",
         Command::TestRoute { .. } | Command::TestRunningRoute { .. } => "路由静态预测",
@@ -496,7 +498,7 @@ fn error_advice(code: &str) -> &'static str {
             "存在未完成的恢复，请检查状态和证据；不要覆盖其他程序的设置。"
         }
         "PROXY_CONFLICT" | "PROXY_OWNERSHIP_CONFLICT" | "PROXY_LEASE_CONFLICT" => {
-            "系统代理已被其他程序修改，请先核对代理归属。"
+            "系统代理已被其他程序或系统设置修改。请检查差异后选择“保留当前系统代理并解除冲突”，不会覆盖当前外部设置。"
         }
         "GENERATION_CONFLICT" | "REVISION_CONFLICT" => {
             "运行版本或已保存配置已变化，请刷新状态并重新检查。"
@@ -571,6 +573,45 @@ impl App {
         } else {
             None
         }
+    }
+
+    pub(super) fn can_resolve_proxy_conflict(&self) -> bool {
+        self.ui.connected
+            && !self.busy
+            && self.ui.uncertain.is_none()
+            && !self.shutdown_requested
+            && self.status.as_ref().is_some_and(|s| {
+                s.recovery_required
+                    && s.proxy_state == "Conflict"
+                    && !s.last_error.as_ref().is_some_and(|e| {
+                        matches!(
+                            e.code.as_str(),
+                            "PROXY_RECOVERY_REQUIRED"
+                                | "OPERATION_RECOVERY_REQUIRED"
+                                | "STARTUP_CONFLICT"
+                                | "SETTINGS_CONFLICT"
+                        )
+                    })
+            })
+    }
+
+    pub(super) fn can_save_settings(&self) -> bool {
+        self.ui.connected
+            && !self.busy
+            && self.ui.uncertain.is_none()
+            && !self.shutdown_requested
+            && !self.status.as_ref().is_some_and(|s| {
+                s.recovery_required
+                    && s.last_error.as_ref().is_some_and(|e| {
+                        matches!(
+                            e.code.as_str(),
+                            "STARTUP_CONFLICT"
+                                | "SETTINGS_CONFLICT"
+                                | "INSTALLATION_ID_MISSING"
+                                | "OPERATION_RECOVERY_REQUIRED"
+                        )
+                    })
+            })
     }
     pub(super) fn add_event(
         &mut self,

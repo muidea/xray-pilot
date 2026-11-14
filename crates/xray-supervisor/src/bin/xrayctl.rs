@@ -60,6 +60,7 @@ async fn run() -> Result<()> {
         "logs" => Command::GetLogs,
         "stop" => Command::StopCore,
         "start" => Command::RestartCore,
+        "resolve-proxy-conflict" => Command::ResolveProxyConflict,
         "shutdown" => Command::Shutdown,
         "operation" | "operation-details" => Command::GetOperation {
             request_id: positional.get(1).cloned().unwrap_or_default(),
@@ -77,7 +78,7 @@ async fn run() -> Result<()> {
         _ => {
             return Err(xray_model::Error::new(
                 "INVALID_ARGUMENT",
-                "Commands: maintenance [--apply] [--retain-days DAYS] [--compress-operations], status, profiles [AFTER], logs, start, stop, shutdown, operation ID, operation-details ID, request (JSON from stdin)",
+                "Commands: maintenance [--apply] [--retain-days DAYS] [--compress-operations], status, profiles [AFTER], logs, start, stop, resolve-proxy-conflict, shutdown, operation ID, operation-details ID, request (JSON from stdin)",
             ));
         }
     };

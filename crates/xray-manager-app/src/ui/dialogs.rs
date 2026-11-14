@@ -79,6 +79,11 @@ impl Action {
                 "将移除当前配置 PAC 模板中的全部域名，并立即更新草稿；运行版本需在步骤 5 应用后才会变化。",
                 "确认清空",
             ),
+            Action::ResolveProxyConflict => (
+                "保留当前系统代理并解除冲突？",
+                "本程序不会修改或覆盖当前 Windows 系统代理设置，仅放弃恢复先前保存的旧根快照并重新以当前系统代理作为基准，从而恢复正常操作与自启能力。",
+                "保留当前设置并解除",
+            ),
         }
     }
 }
@@ -533,6 +538,7 @@ impl App {
             }
             Action::Stop => self.send(Command::StopCore),
             Action::Restart => self.send(Command::RestartCore),
+            Action::ResolveProxyConflict => self.send(Command::ResolveProxyConflict),
             Action::Proxy(mode) => self.send(Command::SetProxyMode {
                 mode,
                 http_inbound_tag: self.runtime_http_tag(),

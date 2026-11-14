@@ -221,6 +221,11 @@ impl App {
                     {
                         self.ui.dialog = Some(Dialog::Confirm(Action::Stop));
                     }
+                    if self.can_resolve_proxy_conflict()
+                        && ui.button("保留当前系统代理并解除冲突…").clicked()
+                    {
+                        self.ui.dialog = Some(Dialog::Confirm(Action::ResolveProxyConflict));
+                    }
                 });
                 if let Some(error) = self.status.as_ref().and_then(|s| s.last_error.as_ref()) {
                     egui::CollapsingHeader::new("恢复证据与技术详情").show(ui, |ui| {

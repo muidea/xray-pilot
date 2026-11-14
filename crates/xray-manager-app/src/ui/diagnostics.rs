@@ -60,6 +60,11 @@ impl App {
                     });
                 }
             }
+            if self.can_resolve_proxy_conflict()
+                && ui.button("保留当前系统代理并解除冲突…").clicked()
+            {
+                self.ui.dialog = Some(Dialog::Confirm(Action::ResolveProxyConflict));
+            }
             line(
                 ui,
                 "本地入口",

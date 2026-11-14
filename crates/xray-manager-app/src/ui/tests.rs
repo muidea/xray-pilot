@@ -2748,3 +2748,92 @@ fn logs_copy_buttons_and_session_log_export_helpers_work() {
         Some("older line\nnewer line\n")
     );
 }
+
+#[test]
+fn proxy_lease_conflict_shows_confirmable_resolution_while_recovery_required_does_not() {
+    let (tx, requests) = mpsc::sync_channel(MAX_PENDING);
+    let (_responses, rx) = mpsc::channel();
+    let mut base = app();
+    let status = base.status.take().unwrap();
+    let mut app = App::with_channels("unused-ui-test".into(), tx, rx);
+    app.ui.connected = true;
+    app.ui.setup_initialized = true;
+    app.ui.onboarding = false;
+    app.status = Some(Status {
+        core_state: "Stopped".into(),
+        proxy_state: "Conflict".into(),
+        recovery_required: true,
+        last_error: Some(Error::new(
+            "PROXY_LEASE_CONFLICT",
+            "External system proxy settings preserved",
+        )),
+        ..status
+    });
+    assert!(app.can_resolve_proxy_conflict());
+
+    let ctx = egui::Context::default();
+    configure(&ctx);
+    let frame = |app: &mut App, events| {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1100.0, 900.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| app.render(ctx),
+        )
+    };
+
+    let output = frame(&mut app, vec![]);
+    let resolve_btn = text_bounds(&output, "保留当前系统代理并解除冲突…").center();
+    frame(&mut app, pointer_click(resolve_btn));
+    for _ in 0..3 {
+        let _ = frame(&mut app, vec![]);
+    }
+    let modal = frame(&mut app, vec![]);
+    assert!(matches!(
+        app.ui.dialog,
+        Some(Dialog::Confirm(Action::ResolveProxyConflict))
+    ));
+    let confirm = text_bounds(&modal, "保留当前设置并解除").center();
+    frame(&mut app, pointer_click(confirm));
+    assert!(
+        requests
+            .try_iter()
+            .any(|r| matches!(r.command, Command::ResolveProxyConflict))
+    );
+    app.busy = false;
+
+    if let Some(status) = app.status.as_mut() {
+        status.proxy_state = "RecoveryRequired".into();
+        status.last_error = Some(Error::new("PROXY_RECOVERY_REQUIRED", "Broken lease"));
+    }
+    assert!(!app.can_resolve_proxy_conflict());
+    assert!(app.can_save_settings());
+
+    app.settings.start_on_logon = true;
+    app.ui.page = Page::Settings;
+    app.ui.settings_tab = SettingsTab::Startup;
+    let output = frame(&mut app, vec![]);
+    let toggle = text_bounds(&output, "登录 Windows 后自启（隐藏到系统托盘）").center();
+    frame(&mut app, pointer_click(toggle));
+    assert!(!app.settings.start_on_logon);
+    let output = frame(&mut app, vec![]);
+    let save = text_bounds(&output, "保存设置").center();
+    frame(&mut app, pointer_click(save));
+    assert!(requests.try_iter().any(|r| {
+        matches!(
+            r.command,
+            Command::SaveSettings { ref settings } if !settings.start_on_logon
+        )
+    }));
+    app.busy = false;
+
+    if let Some(status) = app.status.as_mut() {
+        status.last_error = Some(Error::new("STARTUP_CONFLICT", "External task changed"));
+    }
+    assert!(!app.can_save_settings());
+}

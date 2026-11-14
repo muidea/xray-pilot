@@ -293,6 +293,8 @@ pub enum Command {
     },
     StopCore,
     RestartCore,
+    /// Explicitly acknowledges an external proxy lease conflict without overwriting Windows settings.
+    ResolveProxyConflict,
     SetProxyMode {
         mode: ProxyMode,
         http_inbound_tag: String,

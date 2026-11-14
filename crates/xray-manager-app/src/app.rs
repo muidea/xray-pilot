@@ -464,12 +464,16 @@ impl App {
             return;
         }
         if command.is_write() {
-            let safe_stop = matches!(command, Command::StopCore | Command::Shutdown);
+            let safe_recovery = matches!(
+                command,
+                Command::StopCore | Command::Shutdown | Command::ResolveProxyConflict
+            ) || (matches!(command, Command::SaveSettings { .. })
+                && self.can_save_settings());
+            let shutdown_safe = matches!(command, Command::StopCore | Command::Shutdown);
             if !self.ui.connected
                 || self.ui.uncertain.is_some()
-                || (!safe_stop
-                    && (self.shutdown_requested
-                        || self.status.as_ref().is_some_and(|s| s.recovery_required)))
+                || (!shutdown_safe && self.shutdown_requested)
+                || (!safe_recovery && self.status.as_ref().is_some_and(|s| s.recovery_required))
             {
                 self.message = self.write_blocker().unwrap_or("当前状态暂不能变更").into();
                 return;
@@ -864,6 +868,17 @@ impl App {
                         self.accept_saved_settings(settings, pending.asset_root);
                         self.message = "设置已保存；运行中的 Core 保持原版本。".into();
                         self.add_event("信息", "设置已保存", response.request_id);
+                        self.send(Command::GetStatus);
+                    }
+                    Command::ResolveProxyConflict => {
+                        self.clear_request_failure();
+                        self.message =
+                            "已保留当前系统代理设置并解除冲突，可重新检查或启动 Core。".into();
+                        self.add_event(
+                            "信息",
+                            "已保留外部系统代理并解除租约冲突",
+                            response.request_id,
+                        );
                         self.send(Command::GetStatus);
                     }
                     Command::StopCore | Command::RestartCore | Command::SetProxyMode { .. } => {

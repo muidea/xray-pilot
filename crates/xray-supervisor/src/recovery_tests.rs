@@ -777,3 +777,102 @@ async fn failed_core_validation_keeps_raw_diagnostics_in_session_logs_only() {
         );
     }
 }
+
+#[tokio::test]
+async fn resolve_proxy_conflict_preserves_external_proxy_and_unblocks_supervisor() {
+    let (tmp, mut s, proxy, c) = setup().await;
+    s.proxy
+        .transition(global("127.0.0.1:10809".parse().unwrap()))
+        .unwrap();
+    let external = ProxySnapshot {
+        flags: 3,
+        server: "external-proxy:8888".into(),
+        bypass: "<local>".into(),
+        pac_url: String::new(),
+    };
+    *proxy.0.lock().unwrap() = external.clone();
+    send(&mut s, Command::StopCore).await.unwrap();
+    assert!(s.blocked);
+    assert_eq!(s.last_error.as_ref().unwrap().code, "PROXY_LEASE_CONFLICT");
+    assert_eq!(s.proxy.state(), "Conflict");
+    drop(s);
+
+    // Even after restart (including auto-start recovery), conflict keeps writes blocked until resolved.
+    let mut s = Supervisor::with_backend(&tmp.path().join("data"), proxy.clone())
+        .await
+        .unwrap();
+    assert!(s.blocked);
+    assert_eq!(s.proxy.state(), "Conflict");
+    assert_eq!(proxy.read().unwrap(), external);
+    assert_eq!(
+        send(&mut s, apply(&c)).await.unwrap_err().code,
+        "RECOVERY_REQUIRED"
+    );
+
+    // User can still disable auto-start via SaveSettings while proxy lease conflict is pending.
+    send(
+        &mut s,
+        Command::SaveSettings {
+            settings: Settings {
+                start_on_logon: false,
+                ..Settings::default()
+            },
+        },
+    )
+    .await
+    .unwrap();
+    assert!(!s.settings.start_on_logon);
+    assert!(s.blocked);
+    assert_eq!(s.last_error.as_ref().unwrap().code, "PROXY_LEASE_CONFLICT");
+
+    send(&mut s, Command::ResolveProxyConflict).await.unwrap();
+    assert!(!s.blocked);
+    assert!(s.last_error.is_none());
+    assert_eq!(s.proxy.state(), "Released");
+    assert_eq!(proxy.read().unwrap(), external);
+
+    // Normal writes and proxy release work again using the preserved external proxy as root.
+    send(&mut s, apply(&c)).await.unwrap();
+    assert!(s.core.is_some());
+    send(&mut s, Command::StopCore).await.unwrap();
+    assert_eq!(proxy.read().unwrap(), external);
+}
+
+#[tokio::test]
+async fn resolve_proxy_conflict_refuses_when_non_proxy_recovery_or_corrupted_evidence_exists() {
+    let (tmp, mut s, proxy, _c) = setup().await;
+    s.proxy
+        .transition(global("127.0.0.1:10809".parse().unwrap()))
+        .unwrap();
+    *proxy.0.lock().unwrap() = ProxySnapshot {
+        flags: 3,
+        server: "external:80".into(),
+        ..Default::default()
+    };
+    send(&mut s, Command::StopCore).await.unwrap();
+    assert!(s.blocked);
+
+    // Corrupt manager settings: ResolveProxyConflict must refuse and keep blocked = true.
+    let manager_path = tmp.path().join("data/config/manager.json");
+    let original_settings = fs::read(&manager_path).unwrap_or_default();
+    fs::write(&manager_path, b"{").unwrap();
+    assert!(send(&mut s, Command::ResolveProxyConflict).await.is_err());
+    assert!(s.blocked);
+    if original_settings.is_empty() {
+        let _ = fs::remove_file(&manager_path);
+    } else {
+        fs::write(&manager_path, original_settings).unwrap();
+    }
+
+    // Corrupt proxy lease evidence: ResolveProxyConflict must refuse with PROXY_RECOVERY_REQUIRED.
+    drop(s);
+    fs::write(tmp.path().join("data/runtime/proxy-lease.json"), b"{").unwrap();
+    let mut s = Supervisor::with_backend(&tmp.path().join("data"), proxy)
+        .await
+        .unwrap();
+    let err = send(&mut s, Command::ResolveProxyConflict)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, "PROXY_RECOVERY_REQUIRED");
+    assert!(s.blocked);
+}
