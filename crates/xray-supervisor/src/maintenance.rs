@@ -881,12 +881,9 @@ mod pac_cleanup_tests {
             fs::create_dir_all(&dir).unwrap();
             fs::write(dir.join("proxy.pac"), "script").unwrap();
             let old = SystemTime::now() - Duration::from_secs(10 * 86400);
-            let file = fs::OpenOptions::new()
+            fs::OpenOptions::new()
                 .write(true)
                 .open(dir.join("proxy.pac"))
-                .unwrap();
-            file.set_modified(old).unwrap();
-            fs::File::open(dir.join("proxy.pac"))
                 .unwrap()
                 .set_modified(old)
                 .unwrap();
