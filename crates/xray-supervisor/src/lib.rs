@@ -84,6 +84,10 @@ pub struct Supervisor<B: ProxyBackend> {
     effect_fault: Option<EffectFault>,
 }
 impl Supervisor<SystemProxy> {
+    /// Initializes supervisor state and acquires the data directory lock before running recovery.
+    pub fn prepare(root: &Path) -> Result<(Self, bool)> {
+        Self::prepare_with_backends(root, SystemProxy, Box::new(SystemStartup))
+    }
     pub async fn open(root: &Path) -> Result<Self> {
         Self::with_backend(root, SystemProxy).await
     }
@@ -97,6 +101,29 @@ impl<B: ProxyBackend> Supervisor<B> {
         backend: B,
         startup_backend: Box<dyn StartupBackend>,
     ) -> Result<Self> {
+        let (mut supervisor, needs_recover) =
+            Self::prepare_with_backends(root, backend, startup_backend)?;
+        if needs_recover {
+            supervisor.finish_open().await;
+        }
+        Ok(supervisor)
+    }
+    /// Runs startup recovery and optional auto-connect after `prepare_with_backends`.
+    pub(crate) async fn finish_open(&mut self) {
+        if let Err(e) = self.recover().await {
+            self.blocked = true;
+            xray_runtime::log(
+                &self.logs,
+                format!("Startup recovery blocked: {}: {}", e.code, e.message),
+            );
+            self.last_error = Some(e);
+        }
+    }
+    pub(crate) fn prepare_with_backends(
+        root: &Path,
+        backend: B,
+        startup_backend: Box<dyn StartupBackend>,
+    ) -> Result<(Self, bool)> {
         let store = Store::open(root)?;
         let lock = store.lock()?;
         let logs = xray_runtime::logs_with_file(store.root.join("logs/supervisor.log"))
@@ -184,7 +211,7 @@ impl<B: ProxyBackend> Supervisor<B> {
             #[cfg(test)]
             effect_fault: None,
         };
-        if let Some(e) = initial_error {
+        let needs_recover = if let Some(e) = initial_error {
             // Invalid manager metadata must not prevent cleanup of an independently recorded lease.
             let cleanup = supervisor.proxy.release();
             supervisor.blocked = true;
@@ -194,15 +221,11 @@ impl<B: ProxyBackend> Supervisor<B> {
                 format!("Startup recovery blocked: {}: {}", err.code, err.message),
             );
             supervisor.last_error = Some(err);
-        } else if let Err(e) = supervisor.recover().await {
-            supervisor.blocked = true;
-            xray_runtime::log(
-                &supervisor.logs,
-                format!("Startup recovery blocked: {}: {}", e.code, e.message),
-            );
-            supervisor.last_error = Some(e);
-        }
-        Ok(supervisor)
+            false
+        } else {
+            true
+        };
+        Ok((supervisor, needs_recover))
     }
     fn check_legacy_proxy_evidence(
         store: &Store,

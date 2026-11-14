@@ -106,6 +106,58 @@ pub struct App {
     #[cfg(windows)]
     tray: Option<crate::tray::Tray>,
 }
+const SUPERVISOR_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+const SUPERVISOR_EXIT_GRACE: Duration = Duration::from_secs(3);
+const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+trait SpawnHandle {
+    fn has_exited(&mut self) -> bool;
+}
+
+impl SpawnHandle for std::process::Child {
+    fn has_exited(&mut self) -> bool {
+        matches!(self.try_wait(), Ok(Some(_)) | Err(_))
+    }
+}
+
+/// Ensures the background supervisor IPC endpoint is accepting requests before sending initial commands.
+fn ensure_supervisor_ready<P, S>(
+    mut probe: P,
+    mut spawn: S,
+    startup_timeout: Duration,
+    exit_grace: Duration,
+    poll_interval: Duration,
+) -> bool
+where
+    P: FnMut() -> bool,
+    S: FnMut() -> Option<Box<dyn SpawnHandle>>,
+{
+    if probe() {
+        return true;
+    }
+    let mut child = spawn();
+    let deadline = Instant::now() + startup_timeout;
+    let mut exited_at = child.is_none().then(Instant::now);
+    while Instant::now() < deadline {
+        std::thread::sleep(poll_interval);
+        if probe() {
+            return true;
+        }
+        if let Some(proc) = child.as_mut()
+            && proc.has_exited()
+        {
+            child = None;
+            exited_at.get_or_insert_with(Instant::now);
+        }
+        if let Some(at) = exited_at
+            && at.elapsed() >= exit_grace
+        {
+            break;
+        }
+    }
+    false
+}
+
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, root: PathBuf, background: bool) -> Self {
         let (tx, requests) = mpsc::sync_channel::<Request>(MAX_PENDING);
@@ -117,12 +169,8 @@ impl App {
         let worker_wakeup = wakeup.clone();
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Runtime::new().unwrap();
-            let ping = Request::new(Command::GetStatus, None);
-            if runtime
-                .block_on(xray_supervisor::ipc::call(&worker_root, &ping))
-                .is_err()
-            {
-                let exe = std::env::current_exe().unwrap();
+            let spawn_supervisor = || -> Option<Box<dyn SpawnHandle>> {
+                let exe = std::env::current_exe().ok()?;
                 let mut cmd = std::process::Command::new(exe);
                 cmd.arg("--supervisor").arg("--data-dir").arg(&worker_root);
                 #[cfg(windows)]
@@ -130,42 +178,60 @@ impl App {
                     use std::os::windows::process::CommandExt;
                     cmd.creation_flags(0x08000000);
                 }
-                let _ = cmd.spawn();
-                for _ in 0..40 {
-                    if runtime
-                        .block_on(xray_supervisor::ipc::call(&worker_root, &ping))
-                        .is_ok()
-                    {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-            }
+                cmd.spawn()
+                    .ok()
+                    .map(|c| Box::new(c) as Box<dyn SpawnHandle>)
+            };
+            let ping = || {
+                let req = Request::new(Command::GetStatus, None);
+                runtime
+                    .block_on(xray_supervisor::ipc::call(&worker_root, &req))
+                    .is_ok()
+            };
+            let mut last_ready = ensure_supervisor_ready(
+                ping,
+                spawn_supervisor,
+                SUPERVISOR_STARTUP_TIMEOUT,
+                SUPERVISOR_EXIT_GRACE,
+                SUPERVISOR_POLL_INTERVAL,
+            );
+            let mut last_spawn_wait = Instant::now();
             while let Ok(request) = requests.recv() {
                 let command = request.command.clone();
-                let response =
-                    match runtime.block_on(xray_supervisor::ipc::call(&worker_root, &request)) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            if matches!(command, Command::GetStatus)
-                                && e.code == "IO_ERROR"
-                                && let Ok(exe) = std::env::current_exe()
-                            {
-                                let mut cmd = std::process::Command::new(exe);
-                                cmd.arg("--supervisor").arg("--data-dir").arg(&worker_root);
-                                #[cfg(windows)]
-                                {
-                                    use std::os::windows::process::CommandExt;
-                                    cmd.creation_flags(0x08000000);
-                                }
-                                let _ = cmd.spawn();
-                            }
-                            Response {
-                                request_id: request.request_id,
-                                result: Err(Error::new("CONNECTION_LOST", e.to_string())),
-                            }
+                let mut result =
+                    runtime.block_on(xray_supervisor::ipc::call(&worker_root, &request));
+                if matches!(&result, Err(e) if e.code == "IO_ERROR")
+                    && matches!(command, Command::GetStatus)
+                    && (last_ready || last_spawn_wait.elapsed() >= Duration::from_secs(5))
+                {
+                    last_ready = ensure_supervisor_ready(
+                        ping,
+                        spawn_supervisor,
+                        SUPERVISOR_STARTUP_TIMEOUT,
+                        SUPERVISOR_EXIT_GRACE,
+                        SUPERVISOR_POLL_INTERVAL,
+                    );
+                    last_spawn_wait = Instant::now();
+                    if last_ready {
+                        result =
+                            runtime.block_on(xray_supervisor::ipc::call(&worker_root, &request));
+                    }
+                }
+                if result.is_ok() {
+                    last_ready = true;
+                }
+                let response = match result {
+                    Ok(r) => r,
+                    Err(e) => {
+                        if matches!(command, Command::GetStatus) {
+                            last_ready = false;
                         }
-                    };
+                        Response {
+                            request_id: request.request_id,
+                            result: Err(Error::new("CONNECTION_LOST", e.to_string())),
+                        }
+                    }
+                };
                 if responses.send((command, response)).is_err() {
                     break;
                 }
@@ -639,7 +705,7 @@ impl App {
                     if error.code == "CONNECTION_LOST" {
                         self.ui.connected = false;
                     }
-                    self.fail(error.clone(), response.request_id.clone());
+                    self.fail_command(&command, error.clone(), response.request_id.clone());
                     if matches!(command, Command::GetProfile { .. })
                         && pending.context.epoch == self.view_epoch
                     {

@@ -155,7 +155,38 @@ struct Dispatch {
 
 // Only this task owns the state machine. Connection tasks never hold it while waiting for I/O.
 pub async fn serve(root: &Path) -> Result<()> {
-    serve_supervisor(Supervisor::open(root).await?).await
+    let (supervisor, needs_recover) = Supervisor::prepare(root)?;
+    serve_prepared(supervisor, needs_recover).await
+}
+#[cfg(windows)]
+type PeerStream = tokio::net::windows::named_pipe::NamedPipeServer;
+#[cfg(not(windows))]
+type PeerStream = tokio::net::UnixStream;
+
+fn admit_connection(
+    mut io: PeerStream,
+    slots: &std::sync::Arc<tokio::sync::Semaphore>,
+    tx: &tokio::sync::mpsc::Sender<Dispatch>,
+    connections: &mut tokio::task::JoinSet<()>,
+) {
+    let Ok(permit) = slots.clone().try_acquire_owned() else {
+        // Bounded admission also bounds request buffers and response-waiting tasks.
+        return;
+    };
+    let dispatch = tx.clone();
+    connections.spawn(async move {
+        let slot = std::sync::Arc::new(permit);
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            if verify_peer(io.as_raw_handle(), true).is_err() {
+                return;
+            }
+        }
+        connection(&mut io, dispatch, slot.clone()).await;
+        #[cfg(windows)]
+        let _ = io.disconnect();
+    });
 }
 async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
     io: &mut S,
@@ -191,8 +222,15 @@ async fn connection<S: AsyncRead + AsyncWrite + Unpin>(
         let _ = tokio::time::timeout(IO_TIMEOUT, io.read_u8()).await;
     }
 }
+#[cfg(test)]
 async fn serve_supervisor<B: windows_integration::ProxyBackend + 'static>(
+    supervisor: Supervisor<B>,
+) -> Result<()> {
+    serve_prepared(supervisor, false).await
+}
+async fn serve_prepared<B: windows_integration::ProxyBackend + 'static>(
     mut supervisor: Supervisor<B>,
+    needs_recover: bool,
 ) -> Result<()> {
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(300));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -235,6 +273,36 @@ async fn serve_supervisor<B: windows_integration::ProxyBackend + 'static>(
     };
     #[cfg(windows)]
     let mut server = create_pipe(true)?;
+    if needs_recover {
+        let recover = supervisor.finish_open();
+        tokio::pin!(recover);
+        loop {
+            tokio::select! {
+                _ = &mut recover => break,
+                Some(_) = connections.join_next(), if !connections.is_empty() => {},
+                accepted = async {
+                    #[cfg(not(windows))]
+                    { Ok::<_, Error>(listener.accept().await?.0) }
+                    #[cfg(windows)]
+                    {
+                        server.connect().await?;
+                        // Own the pipe name continuously; each accepted client gets a fresh instance.
+                        Ok::<_, Error>(std::mem::replace(&mut server, create_pipe(false)?))
+                    }
+                } => {
+                    match accepted {
+                        Ok(io) => admit_connection(io, &slots, &tx, &mut connections),
+                        Err(e) => {
+                            connections.abort_all();
+                            #[cfg(not(windows))]
+                            let _ = std::fs::remove_file(&path);
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+        }
+    }
     while !supervisor.shutdown {
         tokio::select! {
             biased;
@@ -254,23 +322,7 @@ async fn serve_supervisor<B: windows_integration::ProxyBackend + 'static>(
                     Ok::<_, Error>(std::mem::replace(&mut server, create_pipe(false)?))
                 }
             } => {
-                let mut io = accepted?;
-                let Ok(permit) = slots.clone().try_acquire_owned() else {
-                    // Bounded admission also bounds request buffers and response-waiting tasks.
-                    continue;
-                };
-                let dispatch = tx.clone();
-                connections.spawn(async move {
-                    let slot = std::sync::Arc::new(permit);
-                    #[cfg(windows)]
-                    {
-                        use std::os::windows::io::AsRawHandle;
-                        if verify_peer(io.as_raw_handle(), true).is_err() { return; }
-                    }
-                    connection(&mut io, dispatch, slot.clone()).await;
-                    #[cfg(windows)]
-                    let _ = io.disconnect();
-                });
+                admit_connection(accepted?, &slots, &tx, &mut connections);
             }
         }
     }

@@ -230,3 +230,96 @@ async fn core_exit_releases_global_proxy_while_an_idle_client_is_connected() {
     drop(idle);
     shutdown(&root, task).await;
 }
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn serve_accepts_status_while_auto_connect_recovery_is_in_progress() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let core = tmp.path().join("fixture-core");
+    let script = include_str!("../tests/fixtures/core.py").replace(
+        "if \"-test\" in sys.argv:\n    sys.exit(0)",
+        "if \"-test\" in sys.argv:\n    __import__('time').sleep(0.35)\n    sys.exit(0)",
+    );
+    std::fs::write(&core, script).unwrap();
+    std::fs::set_permissions(&core, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let data = tmp.path().join("data");
+    let backend = Fake(Arc::new(Mutex::new(ProxySnapshot::default())));
+    let mut s = Supervisor::with_backend(&data, backend.clone())
+        .await
+        .unwrap();
+    let p = s
+        .handle(Request::new(
+            Command::CreateProfile {
+                profile_id: "p".into(),
+                json: "{}".into(),
+            },
+            None,
+        ))
+        .await
+        .result
+        .unwrap();
+    let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = reserved.local_addr().unwrap().port();
+    drop(reserved);
+    let config = serde_json::json!({"inbounds":[{"tag":"http-in","protocol":"http","listen":"127.0.0.1","port":port,"settings":{}}],"outbounds":[{"tag":"direct","protocol":"freedom"}]}).to_string();
+    let c: xray_model::Candidate = serde_json::from_value(
+        s.handle(Request::new(
+            Command::ValidateDraft {
+                profile_id: "p".into(),
+                expected_revision: p["revision"].as_str().unwrap().into(),
+                json: config,
+                core_path: core,
+                asset_root: tmp.path().into(),
+                allow_dynamic: false,
+            },
+            None,
+        ))
+        .await
+        .result
+        .unwrap(),
+    )
+    .unwrap();
+    s.handle(Request::new(
+        Command::ApplyProfile {
+            candidate_id: c.id,
+            candidate_digest: c.digest,
+            proxy_mode: xray_model::ProxyMode::Direct,
+            http_inbound_tag: "http-in".into(),
+            pac: None,
+        },
+        None,
+    ))
+    .await
+    .result
+    .unwrap();
+    s.handle(Request::new(
+        Command::SaveSettings {
+            settings: xray_model::Settings {
+                connect_on_start: true,
+                ..Default::default()
+            },
+        },
+        s.generation.as_ref().map(|g| g.id.clone()),
+    ))
+    .await
+    .result
+    .unwrap();
+    drop(s);
+
+    let (prepared, needs_recover) = Supervisor::prepare_with_backends(
+        &data,
+        backend,
+        Box::new(windows_integration::SystemStartup),
+    )
+    .unwrap();
+    assert!(needs_recover);
+    let root = prepared.store.root.clone();
+    let task = tokio::spawn(serve_prepared(prepared, needs_recover));
+
+    // Give the spawned task a brief tick to bind the socket, well shorter than the 350ms -test delay.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let status = ping(&root).await;
+    assert_eq!(status["core_state"], "Running");
+    shutdown(&root, task).await;
+}

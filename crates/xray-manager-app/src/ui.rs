@@ -492,8 +492,17 @@ pub(super) fn command_name(command: &Command) -> &'static str {
     }
 }
 fn error_advice(code: &str) -> &'static str {
+    error_advice_for(code, true)
+}
+fn error_advice_for(code: &str, is_write: bool) -> &'static str {
     match code {
-        "CONNECTION_LOST" | "IPC_TIMEOUT" => "后台响应中断，请先查询原操作结果，再进行其他变更。",
+        "CONNECTION_LOST" | "IPC_TIMEOUT" => {
+            if is_write {
+                "后台响应中断，请先查询原操作结果，再进行其他变更。"
+            } else {
+                "后台服务尚未就绪或连接已断开，请稍候或点击刷新状态。"
+            }
+        }
         "RECOVERY_REQUIRED" | "OPERATION_RECOVERY_REQUIRED" | "PROXY_RECOVERY_REQUIRED" => {
             "存在未完成的恢复，请检查状态和证据；不要覆盖其他程序的设置。"
         }
@@ -631,7 +640,15 @@ impl App {
         self.ui.events.truncate(300);
     }
     pub(super) fn fail(&mut self, error: Error, request: String) {
-        self.message = error_advice(&error.code).into();
+        let advice = error_advice(&error.code);
+        self.fail_with_advice(error, request, advice);
+    }
+    pub(super) fn fail_command(&mut self, command: &Command, error: Error, request: String) {
+        let advice = error_advice_for(&error.code, command.is_write());
+        self.fail_with_advice(error, request, advice);
+    }
+    fn fail_with_advice(&mut self, error: Error, request: String, advice: &str) {
+        self.message = advice.into();
         self.add_event(
             "错误",
             format!("{} · {}", self.message, error),

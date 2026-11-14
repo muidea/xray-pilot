@@ -1,6 +1,6 @@
 # 验证说明
 
-本包为 **v0.1.1-rc.22 Windows x64 本地验证版**，修复外部系统代理冲突（`PROXY_LEASE_CONFLICT`）下的快照诊断、用户确认解除（保留当前系统代理）以及恢复期内无法取消/保存开机自启的问题，并包含日志单条/筛选/会话日志复制与导出、开机自启后台驻留系统托盘、PAC 批量域名管理与大列表虚拟滚动、持久化日志、WinHTTP 只读诊断、Dynamic 依赖、Mixed 入站、路由冲突提示和 TCP 延迟探测。构建版本、源码提交和文件指纹见 `VERSION.txt` 与 `SOURCE-MANIFEST.json`；本地验证包可能记录 `source_dirty=true`，不能作为已发布版本。
+本包为 **v0.1.1-rc.23 Windows x64 本地验证版**，在上一版基础上修复开机自启冷启动时界面先于后台 Supervisor 管道就绪触发 `CONNECTION_LOST (os error 2)` 的竞态，并包含外部系统代理冲突（`PROXY_LEASE_CONFLICT`）快照诊断/显式确认解除、冲突期内取消开机自启、日志单条/筛选/会话日志复制与导出、开机自启后台驻留系统托盘、PAC 批量域名管理与大列表虚拟滚动等全部改进。构建版本、源码提交和文件指纹见 `VERSION.txt` 与 `SOURCE-MANIFEST.json`；本地验证包可能记录 `source_dirty=true`，不能作为已发布版本。
 
 文件名统一采用 `xray-pilot-<版本>-windows-x64.zip`，验证版本使用 `rc.N` 预发布版本号。每轮内容不同的对外交付使用新的版本号。本包由 Linux 交叉构建 Windows GNU 目标，用于功能验证；正式发布前仍需 MSVC CI 和签核。验证包只附带本说明和 `docs/发布说明.md`，设计、评审、交接和历史收口文档保留在源码仓库，不随验证包分发。
 

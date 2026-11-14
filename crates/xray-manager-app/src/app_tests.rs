@@ -1294,3 +1294,66 @@ fn tray_open_cancels_pending_background_hide_and_reveals_window() {
     assert!(commands.contains(&ViewportCommand::Focus));
     assert!(!commands.contains(&ViewportCommand::Visible(false)));
 }
+
+#[test]
+fn ensure_supervisor_ready_waits_for_live_supervisor_and_fails_fast_on_exit() {
+    struct MockSpawn {
+        exited: bool,
+    }
+    impl SpawnHandle for MockSpawn {
+        fn has_exited(&mut self) -> bool {
+            self.exited
+        }
+    }
+
+    let mut probes = 0usize;
+    let mut spawns = 0usize;
+    let ready = ensure_supervisor_ready(
+        || {
+            probes += 1;
+            probes >= 4
+        },
+        || {
+            spawns += 1;
+            Some(Box::new(MockSpawn { exited: false }))
+        },
+        Duration::from_millis(500),
+        Duration::from_millis(50),
+        Duration::from_millis(5),
+    );
+    assert!(ready);
+    assert_eq!(spawns, 1);
+
+    let failed = ensure_supervisor_ready(
+        || false,
+        || Some(Box::new(MockSpawn { exited: true })),
+        Duration::from_secs(5),
+        Duration::from_millis(20),
+        Duration::from_millis(5),
+    );
+    assert!(!failed);
+}
+
+#[test]
+fn connection_lost_advice_distinguishes_read_startup_polls_from_writes() {
+    let mut h = Harness::new();
+    h.app.fail_command(
+        &Command::GetStatus,
+        Error::new("CONNECTION_LOST", "os error 2"),
+        "req-read".into(),
+    );
+    assert_eq!(
+        h.app.message,
+        "后台服务尚未就绪或连接已断开，请稍候或点击刷新状态。"
+    );
+
+    h.app.fail_command(
+        &Command::RestartCore,
+        Error::new("CONNECTION_LOST", "os error 2"),
+        "req-write".into(),
+    );
+    assert_eq!(
+        h.app.message,
+        "后台响应中断，请先查询原操作结果，再进行其他变更。"
+    );
+}
